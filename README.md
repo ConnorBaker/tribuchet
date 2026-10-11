@@ -203,6 +203,38 @@ Compared to the NixOS module the agents get no delegated cgroup, so
 volume is only a cache. The daemon garbage-collects it via the
 `min-free` and `max-free` settings baked into the image.
 
+## Prometheus metrics
+
+Set `metrics-listen = "127.0.0.1:7438"` in `hub.toml` and the hub serves
+`/metrics` there, over plain HTTP. Every path returns the same page.
+
+| metric | type | labels | meaning |
+|---|---|---|---|
+| `tribuchet_builds_submitted_total` | counter | | builds accepted for scheduling |
+| `tribuchet_builds_dispatched_total` | counter | | builds handed to a worker |
+| `tribuchet_builds_declined_total` | counter | | builds declined because no capable worker registered in time |
+| `tribuchet_builds_requeued_total` | counter | | builds requeued after a worker session was lost |
+| `tribuchet_builds_failed_total` | counter | | builds that ended in failure |
+| `tribuchet_builds_succeeded_total` | counter | | builds that completed |
+| `tribuchet_queue_depth` | gauge | | builds waiting for a worker |
+| `tribuchet_system_builds` | gauge | system, state = queued, running | builds in each state |
+| `tribuchet_system_slots` | gauge | system | build slots of connected workers. A worker serving several systems counts in each. Free slots are `slots - running` |
+| `tribuchet_workers_connected` | gauge | | workers with an open session |
+| `tribuchet_workers_for_system` | gauge | system | connected workers advertising a system |
+| `tribuchet_builder_up` | gauge | worker, system | 1 per connected worker and system |
+| `tribuchet_queue_seconds` | histogram | system | time a build waited for a worker, per attempt |
+| `tribuchet_build_seconds` | histogram | system | wall time of a build on its worker |
+| `tribuchet_build_cpu_seconds` | histogram | system | CPU time of a build |
+| `tribuchet_build_peak_memory_bytes` | histogram | system | peak memory of a build |
+| `tribuchet_worker_messages_total` | counter | type | messages received from workers |
+| `tribuchet_worker_message_bytes_total` | counter | type | encoded bytes of those messages |
+
+The CPU and memory histograms skip a build the worker could not measure.
+With a build cgroup (Linux namespace builds) they cover the whole build.
+Without one (macOS, direct-exec builds) CPU counts only the builder and the
+processes it waited for, and peak memory is a lower bound. A build killed
+at its memory limit reports that limit.
+
 ## Fixed-output network policy
 
 On Linux workers with `/dev/net/tun`, fixed-output builds run in a

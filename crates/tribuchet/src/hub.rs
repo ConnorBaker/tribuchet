@@ -158,6 +158,9 @@ async fn route_loop(
             Ok(Some(WorkerMessage { msg: Some(m) })) => m,
             Ok(Some(WorkerMessage { msg: None })) => continue,
         };
+        state
+            .metrics
+            .count_msg(relay::msg_name(&m), m.encoded_len());
         if let worker_message::Msg::RequestJob(r) = &m {
             capacity.store(r.capacity, Ordering::SeqCst);
             state.notify.notify_waiters();
@@ -321,6 +324,9 @@ async fn worker_loop(
             ))
             .await;
         Metrics::inc(&state.metrics.dispatched);
+        state
+            .metrics
+            .observe_queue(&job.req.system, job.queued_at.elapsed());
         let in_rx = router.register(&job.id);
         tokio::spawn(supervise_job(
             state.clone(),
@@ -348,6 +354,7 @@ async fn supervise_job(
     in_rx: mpsc::Receiver<worker_message::Msg>,
     sess: Arc<WorkerSession>,
 ) {
+    let _running = state.metrics.running(&job.req.system);
     let mut dispatched = false;
     let res = run_job(&state, &job, &out_tx, in_rx, sess, &mut dispatched).await;
     router.unregister(&job.id);

@@ -118,6 +118,7 @@ pub(super) async fn run_job(
             worker_message::Msg::Need(n) => staging.handle_need(n, out_tx).await?,
             worker_message::Msg::Result(res) => {
                 if let Some(u) = &res.usage {
+                    state.metrics.observe_usage(&job.req.system, u);
                     tracing::info!(
                         id = job.id,
                         key = job.key,

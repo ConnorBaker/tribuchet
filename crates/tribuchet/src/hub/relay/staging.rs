@@ -416,7 +416,7 @@ pub(super) async fn stream_tmp_dir(
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
 
     use super::*;
     use crate::hub::state::Replay;
@@ -472,6 +472,7 @@ mod tests {
             replay: Arc::new(Replay::default()),
             listing: Mutex::default(),
             attempts: 0,
+            queued_at: Instant::now(),
         }
     }
 

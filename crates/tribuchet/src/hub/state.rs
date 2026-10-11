@@ -54,6 +54,8 @@ pub(super) struct Job {
     /// Times the job went back to the queue after its worker session
     /// died; capped so a crash-looping build cannot bounce forever.
     pub(super) attempts: u32,
+    /// When the job last entered the queue, for the queue-wait histogram.
+    pub(super) queued_at: Instant,
 }
 
 impl Job {
@@ -303,6 +305,7 @@ impl HubState {
     /// (the next attempt re-streams them from the start).
     pub(super) async fn requeue(self: &Arc<Self>, mut job: Job) {
         job.attempts += 1;
+        job.queued_at = Instant::now();
         for path in job.req.outputs.values() {
             job.replay
                 .publish(attach_event::Event::OutputRestart(path.clone()))
@@ -396,6 +399,7 @@ mod tests {
             replay,
             listing: StdMutex::default(),
             attempts: 0,
+            queued_at: Instant::now(),
         }
     }
 
