@@ -69,6 +69,14 @@ message StartReply {
 // Sent on the Start/Adopt connection when the builder exits.
 message ExitNotice {
   int32 exit_code = 1;
+  // Milliseconds from the agent spawning the builder to reaping it.
+  uint64 wall_ms = 2;
+  // From the build cgroup after the builder exited, or from wait4 rusage
+  // and a memory sampler where there is none. 0 when unknown. Not kept
+  // across an agent restart, so Adopt after one reports 0.
+  uint64 cpu_usec = 3;
+  uint64 peak_memory_bytes = 4;
+  bool oom_killed = 5;
 }
 
 // Reattach to the build after a worker restart.

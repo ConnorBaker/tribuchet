@@ -18,8 +18,8 @@ use std::fmt::Write as _;
 #[cfg(target_os = "macos")]
 use sandbox_proto::agent::SCRATCH_DIR_PARAM;
 use sandbox_proto::agent::{
-    AdoptRequest, CleanupRequest, FinishRequest, KillRequest, ShutdownRequest, StartRequest,
-    StatusRequest, call, reply,
+    AdoptRequest, CleanupRequest, ExitNotice, FinishRequest, KillRequest, ShutdownRequest,
+    StartRequest, StatusRequest, call, reply,
 };
 use sandbox_proto::framing;
 
@@ -209,12 +209,12 @@ impl AgentBuild {
     }
 
     /// Block until the agent reports the builder's exit.
-    pub(super) fn wait_exit(&self) -> Result<i32> {
+    pub(super) fn wait_exit(&self) -> Result<ExitNotice> {
         let (reply, _) = framing::recv_reply(&self.conn)?;
         let reply::Reply::Exit(notice) = reply else {
             return Err(err_msg(format!("unexpected agent reply {reply:?}")));
         };
-        Ok(notice.exit_code)
+        Ok(notice)
     }
 }
 
@@ -362,7 +362,9 @@ mod tests {
             .open(&log_path)?;
         let build = AgentBuild::start(&socket, &req, &fs::File::open(&pack_path)?, &log_w)?;
         assert!(build.pid > 0);
-        assert_eq!(build.wait_exit()?, 0);
+        let exit = build.wait_exit()?;
+        assert_eq!(exit.exit_code, 0);
+        assert!(exit.peak_memory_bytes > 0, "no memory reported");
 
         let log = fs::read_to_string(&log_path)?;
         assert!(log.contains("built"), "log: {log}");
@@ -421,7 +423,7 @@ mod tests {
             .append(true)
             .open(dir_path.join("build.log"))?;
         let build = AgentBuild::start(&socket, &req, &fs::File::open(&pack_path)?, &log_w)?;
-        assert_eq!(build.wait_exit()?, 0);
+        assert_eq!(build.wait_exit()?.exit_code, 0);
         assert!(!outside.exists());
         finish(&socket, build_id)?;
         assert_eq!(fs::read_to_string(output.join("file"))?, "data\n");

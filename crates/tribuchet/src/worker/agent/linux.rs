@@ -445,6 +445,31 @@ pub(super) fn peer_uid(conn: &UnixStream) -> Result<u32> {
     Ok(socket_peercred(conn).map_err(io::Error::from)?.uid.as_raw())
 }
 
+/// Linux reads the build cgroup instead of sampling. The returned
+/// function gives the sampled peak, always 0 here.
+pub(super) fn sample_memory() -> impl FnOnce() -> u64 {
+    || 0
+}
+
+/// CPU microseconds and peak memory bytes of the build. The cgroup covers
+/// every process of the build. Only namespace builds have one, so a
+/// direct-exec build, or a host without a delegated cgroup, falls back to
+/// the reaped builder's rusage.
+pub(super) fn usage(confinement: &Confinement, build_id: &str, rusage: (u64, u64)) -> (u64, u64) {
+    let Some(base) = &confinement.cgroup_base else {
+        return rusage;
+    };
+    let u = cgroup::usage(&base.join(format!("build-{build_id}")));
+    (
+        if u.cpu_usec > 0 { u.cpu_usec } else { rusage.0 },
+        if u.peak_memory_bytes > 0 {
+            u.peak_memory_bytes
+        } else {
+            rusage.1
+        },
+    )
+}
+
 /// Whether the build cgroup's memory.max OOM-killed the build.
 pub(super) fn oom_killed(confinement: &Confinement, build_id: &str) -> bool {
     let Some(base) = &confinement.cgroup_base else {

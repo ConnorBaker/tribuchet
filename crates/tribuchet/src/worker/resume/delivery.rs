@@ -16,7 +16,9 @@ use crate::chunker::parse_hashes;
 use crate::chunkstore::Hash;
 use crate::errors::{Result, chain, err_msg};
 use crate::fsutil::io_ctx;
-use crate::proto::{BuildResult, ChunkFrame, Manifest, PathInfoMsg, WorkerMessage, worker_message};
+use crate::proto::{
+    BuildResult, BuildUsage, ChunkFrame, Manifest, PathInfoMsg, WorkerMessage, worker_message,
+};
 use crate::worker::build::ActiveBuild;
 use crate::worker::logtail::LogTail;
 use crate::worker::{WorkerCtx, msg, remove_build_dir};
@@ -101,8 +103,41 @@ impl ResumableBuild {
     }
 }
 
+/// What a build used; all 0 when unknown (adopted after an agent restart,
+/// no cgroup, setup failure).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(in crate::worker) struct Usage {
+    pub(in crate::worker) wall_ms: u64,
+    pub(in crate::worker) cpu_usec: u64,
+    pub(in crate::worker) peak_memory_bytes: u64,
+    pub(in crate::worker) oom_killed: bool,
+}
+
+impl From<sandbox_proto::agent::ExitNotice> for Usage {
+    fn from(n: sandbox_proto::agent::ExitNotice) -> Self {
+        Self {
+            wall_ms: n.wall_ms,
+            cpu_usec: n.cpu_usec,
+            peak_memory_bytes: n.peak_memory_bytes,
+            oom_killed: n.oom_killed,
+        }
+    }
+}
+
+impl From<Usage> for BuildUsage {
+    fn from(u: Usage) -> Self {
+        Self {
+            wall_ms: u.wall_ms,
+            cpu_usec: u.cpu_usec,
+            peak_memory_bytes: u.peak_memory_bytes,
+            oom_killed: u.oom_killed,
+        }
+    }
+}
+
 pub(in crate::worker) struct FinishedBuild {
     pub(in crate::worker) exit_code: i32,
+    pub(in crate::worker) usage: Usage,
     pub(in crate::worker) error: String,
     pub(in crate::worker) outputs: Vec<PackedOutput>,
     /// Recursive-nix closure-delta paths the builder registered with
@@ -185,6 +220,7 @@ fn persist_finished(key: &str, build_id: &str, fin: &FinishedBuild) {
         dedupe_key: key.to_string(),
         build_id: build_id.to_string(),
         exit_code: fin.exit_code,
+        usage: fin.usage,
         error: fin.error.clone(),
         outputs: fin.outputs.clone(),
         extras: fin.extras.clone(),
@@ -213,6 +249,7 @@ pub(in crate::worker) fn execute_to_finished(
             tracing::error!("build execution failed: {e}");
             FinishedBuild {
                 exit_code: 1,
+                usage: Usage::default(),
                 error: e,
                 outputs: vec![],
                 extras: vec![],
@@ -232,6 +269,7 @@ fn deliver(
     out_tx.blocking_send(msg(worker_message::Msg::Result(BuildResult {
         build_id: build_id.into(),
         exit_code: fin.exit_code,
+        usage: Some(fin.usage.into()),
         extras: fin
             .extras
             .iter()

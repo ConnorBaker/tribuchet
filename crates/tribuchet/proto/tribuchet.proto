@@ -189,6 +189,22 @@ message BuildResult {
   // store via AddToStoreNar. Attach receives an AddedPath event per
   // registered extra.
   repeated Manifest extras = 5; // with info
+  // What the build used on the worker; all 0 when unknown.
+  BuildUsage usage = 6;
+}
+
+message BuildUsage {
+  // Milliseconds from the builder's spawn to its exit, measured by the
+  // agent.
+  uint64 wall_ms = 1;
+  // CPU time, user plus system. Covers the whole build with a cgroup.
+  // Otherwise only the descendants the builder waited for.
+  uint64 cpu_usec = 2;
+  // memory.peak of the build's cgroup. Without one it is a lower bound.
+  // A build killed at memory.max reports the limit, so treat it as
+  // censored when oom_killed.
+  uint64 peak_memory_bytes = 3;
+  bool oom_killed = 4;
 }
 
 // Local service between `tribuchet attach` and the hub, served on a unix

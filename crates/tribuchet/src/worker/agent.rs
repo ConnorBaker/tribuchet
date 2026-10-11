@@ -57,6 +57,9 @@ mod platform;
 #[cfg(target_os = "macos")]
 #[path = "agent/darwin.rs"]
 mod platform;
+mod rusage;
+#[cfg(any(target_os = "macos", test))]
+mod sampler;
 #[cfg(target_os = "linux")]
 pub use platform::{FS_HELPER_ARG, fs_helper_stage};
 
@@ -94,8 +97,11 @@ struct Build {
     outputs: Vec<String>,
     /// Exit code once the wait thread reaped the builder. Kept in
     /// agent memory only: the build can write everything on disk here.
-    exit: Arc<(Mutex<Option<i32>>, Condvar)>,
+    exit: Arc<ExitState>,
 }
+
+/// The builder's exit code and what it used, published by the wait thread.
+type ExitState = (Mutex<Option<ExitNotice>>, Condvar);
 
 struct Agent {
     state_dir: PathBuf,
@@ -288,7 +294,7 @@ fn handle_start(
         let (child, sandbox_root) =
             platform::spawn_builder(&agent.confinement, &req, &scratch_root, &build_dir, &log_w)?;
         let pid = child.id().cast_signed();
-        let exit = Arc::new((Mutex::new(None), Condvar::new()));
+        let exit: Arc<ExitState> = Arc::new((Mutex::new(None), Condvar::new()));
         reap_on_exit(
             agent.clone(),
             req.build_id.clone(),
@@ -327,7 +333,7 @@ fn handle_adopt(agent: &Arc<Agent>, conn: &UnixStream, req: &AdoptRequest) -> Re
             _ => return Ok(framing::send_error(conn, ERROR_UNKNOWN_BUILD)?),
         }
     };
-    let exit_code = *exit.0.lock().unwrap();
+    let exit_code = exit.0.lock().unwrap().as_ref().map(|e| e.exit_code);
     framing::send_reply(
         conn,
         reply::Reply::Adopt(AdoptReply {
@@ -430,21 +436,41 @@ fn reap_on_exit(
     build_id: String,
     mut child: Child,
     mut log: fs::File,
-    exit: Arc<(Mutex<Option<i32>>, Condvar)>,
+    exit: Arc<ExitState>,
 ) {
+    let started = Instant::now();
     thread::spawn(move || {
-        let code = match child.wait() {
-            Ok(status) => status
+        let finish_sampling = platform::sample_memory();
+        let reaped = rusage::reap(&mut child);
+        let sampled = finish_sampling();
+        let code = match &reaped {
+            Ok(r) => r
+                .status
                 .code()
-                .unwrap_or_else(|| 128 + status.signal().unwrap_or(1)),
+                .unwrap_or_else(|| 128 + r.status.signal().unwrap_or(1)),
             Err(_) => 1,
         };
-        if platform::oom_killed(&agent.confinement, &build_id) {
+        let oom_killed = platform::oom_killed(&agent.confinement, &build_id);
+        if oom_killed {
             tracing::warn!(id = build_id, "builder killed by the build memory limit");
             let _ = log.write_all(b"tribuchet: builder killed by the build memory limit\n");
         }
-        tracing::info!(code, "builder exited");
-        *exit.0.lock().unwrap() = Some(code);
+        let wall_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+        let (cpu_usec, peak_memory_bytes) = platform::usage(
+            &agent.confinement,
+            &build_id,
+            reaped
+                .as_ref()
+                .map_or((0, 0), |r| (r.cpu_usec, r.peak_memory_bytes.max(sampled))),
+        );
+        tracing::info!(code, wall_ms, cpu_usec, peak_memory_bytes, "builder exited");
+        *exit.0.lock().unwrap() = Some(ExitNotice {
+            exit_code: code,
+            wall_ms,
+            cpu_usec,
+            peak_memory_bytes,
+            oom_killed,
+        });
         exit.1.notify_all();
     });
 }
@@ -452,18 +478,13 @@ fn reap_on_exit(
 /// Send the exit notice on the leasing connection once the builder is
 /// reaped. A vanished worker just closes the connection; the exit code
 /// stays available for Adopt.
-fn notify_exit(conn: &UnixStream, exit: &(Mutex<Option<i32>>, Condvar)) -> Result<()> {
-    let mut code = exit.0.lock().unwrap();
-    while code.is_none() {
-        code = exit.1.wait(code).unwrap();
+fn notify_exit(conn: &UnixStream, exit: &ExitState) -> Result<()> {
+    let mut done = exit.0.lock().unwrap();
+    while done.is_none() {
+        done = exit.1.wait(done).unwrap();
     }
-    Ok(framing::send_reply(
-        conn,
-        reply::Reply::Exit(ExitNotice {
-            exit_code: code.unwrap(),
-        }),
-        &[],
-    )?)
+    let notice = done.clone().unwrap();
+    Ok(framing::send_reply(conn, reply::Reply::Exit(notice), &[])?)
 }
 
 /// Kill every process of the agent's uid except the agent itself:

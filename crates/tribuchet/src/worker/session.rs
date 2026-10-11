@@ -400,6 +400,7 @@ async fn fail_build(
             outputs: vec![],
             extras: vec![],
             error: err,
+            usage: None,
         })))
         .await?;
     Ok(())

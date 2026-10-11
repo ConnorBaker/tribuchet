@@ -107,3 +107,64 @@ pub(super) fn destroy(dir: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+/// What a build used, read from its cgroup after the builder exited and
+/// before the cgroup is destroyed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(super) struct Usage {
+    pub(super) cpu_usec: u64,
+    pub(super) peak_memory_bytes: u64,
+}
+
+/// `usage_usec` from a cpu.stat file.
+fn parse_cpu_usec(stat: &str) -> Option<u64> {
+    stat.lines()
+        .find_map(|l| l.strip_prefix("usage_usec "))?
+        .trim()
+        .parse()
+        .ok()
+}
+
+/// A field is 0 when its file is missing (memory.peak needs Linux 5.19).
+pub(super) fn usage(dir: &Path) -> Usage {
+    let read = |f: &str| fs::read_to_string(dir.join(f)).ok();
+    Usage {
+        cpu_usec: read("cpu.stat")
+            .and_then(|s| parse_cpu_usec(&s))
+            .unwrap_or(0),
+        peak_memory_bytes: read("memory.peak")
+            .and_then(|s| s.trim().parse().ok())
+            .unwrap_or(0),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn usage_reads_cpu_and_peak_memory_from_the_cgroup_files() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join("cpu.stat"),
+            "usage_usec 1234567\nuser_usec 1000000\nsystem_usec 234567\n",
+        )
+        .unwrap();
+        fs::write(dir.path().join("memory.peak"), "8110292992\n").unwrap();
+        assert_eq!(
+            usage(dir.path()),
+            Usage {
+                cpu_usec: 1_234_567,
+                peak_memory_bytes: 8_110_292_992
+            }
+        );
+    }
+
+    #[test]
+    fn usage_is_zero_where_the_kernel_has_no_such_file() {
+        let dir = tempfile::tempdir().unwrap();
+        assert_eq!(usage(dir.path()), Usage::default());
+        fs::write(dir.path().join("cpu.stat"), "nr_periods 0\n").unwrap();
+        assert_eq!(usage(dir.path()), Usage::default());
+    }
+}

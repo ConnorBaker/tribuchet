@@ -117,6 +117,18 @@ pub(super) async fn run_job(
             }
             worker_message::Msg::Need(n) => staging.handle_need(n, out_tx).await?,
             worker_message::Msg::Result(res) => {
+                if let Some(u) = &res.usage {
+                    tracing::info!(
+                        id = job.id,
+                        key = job.key,
+                        exit_code = res.exit_code,
+                        wall_ms = u.wall_ms,
+                        cpu_usec = u.cpu_usec,
+                        peak_memory_bytes = u.peak_memory_bytes,
+                        oom_killed = u.oom_killed,
+                        "build usage"
+                    );
+                }
                 if res.exit_code != 0 {
                     return publish_worker_failure(state, out_tx, job, &res).await;
                 }

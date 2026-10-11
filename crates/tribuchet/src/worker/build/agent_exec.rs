@@ -25,7 +25,7 @@ use crate::worker::caps::requires_uid_range;
 #[cfg(target_os = "macos")]
 use crate::worker::caps::requires_uid_range;
 use crate::worker::logtail::tail_log;
-use crate::worker::resume::{FinishedBuild, ResumeState};
+use crate::worker::resume::{FinishedBuild, ResumeState, Usage};
 use crate::worker::{WorkerCtx, agents, sandbox};
 
 impl ActiveBuild {
@@ -75,6 +75,7 @@ impl ActiveBuild {
         };
         FinishedBuild {
             exit_code,
+            usage: Usage::default(),
             error,
             outputs,
             extras,
@@ -271,15 +272,15 @@ pub(in crate::worker) fn supervise_agent(
         }
         thread::sleep(Duration::from_millis(200));
     }
-    let code = match waiter.join() {
-        Ok(Ok(code)) => code,
+    let (code, usage) = match waiter.join() {
+        Ok(Ok(n)) => (n.exit_code, n.into()),
         Ok(Err(e)) => {
             aborted.get_or_insert(format!("agent connection lost: {}", chain(&e)));
-            1
+            (1, Usage::default())
         }
         Err(_) => {
             aborted.get_or_insert("agent wait thread panicked".into());
-            1
+            (1, Usage::default())
         }
     };
     tracing::info!(id = st.build_id, exit_code = code, aborted = ?aborted, "builder finished");
@@ -319,6 +320,7 @@ pub(in crate::worker) fn supervise_agent(
     }
     FinishedBuild {
         exit_code,
+        usage,
         error,
         outputs,
         extras,

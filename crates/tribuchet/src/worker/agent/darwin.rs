@@ -4,15 +4,18 @@
 use std::ffi::CString;
 use std::fs;
 use std::io;
+use std::mem;
 use std::os::fd::OwnedFd;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command};
+use std::process::{self, Child, Command};
 use std::ptr;
+use std::time::Duration;
 
 use sandbox_proto::agent::{SCRATCH_DIR_PARAM, StartRequest};
 
+use super::sampler::PeakSampler;
 use super::{Build, Error, Options, make_readable, spawn_plain, stage_scratch};
 use crate::errors::{Result, err_ctx};
 use crate::fsutil::force_remove_dir_all;
@@ -117,6 +120,44 @@ pub(super) fn peer_uid(conn: &UnixStream) -> Result<u32> {
     Ok(uid.as_raw())
 }
 
+/// Sum of `ri_phys_footprint` over the processes of this uid except the
+/// agent. The agent runs one build, so these are the build's processes
+/// (plus a few leftovers its kill sweep has not yet caught).
+fn uid_footprint_bytes() -> u64 {
+    let agent = process::id().cast_signed();
+    own_uid_pids()
+        .into_iter()
+        .filter(|&pid| pid != agent)
+        .filter_map(|pid| {
+            // SAFETY: an all-zero rusage_info_v4 is a valid value. The call
+            // fills it in and the buffer outlives it.
+            let mut info: libc::rusage_info_v4 = unsafe { mem::zeroed() };
+            let rc = unsafe {
+                libc::proc_pid_rusage(
+                    pid,
+                    libc::RUSAGE_INFO_V4,
+                    (&raw mut info).cast::<libc::rusage_info_t>(),
+                )
+            };
+            (rc == 0).then_some(info.ri_phys_footprint)
+        })
+        .sum()
+}
+
+/// Sample the build's summed memory every 100 ms, because macOS has no cgroup.
+/// The returned function stops the sampler and gives the peak.
+pub(super) fn sample_memory() -> impl FnOnce() -> u64 {
+    let sampler = PeakSampler::start(Duration::from_millis(100), uid_footprint_bytes);
+    move || sampler.finish()
+}
+
+/// No per-build cgroup on macOS: the reaped builder's rusage, which covers
+/// the descendants it waited for. Its peak memory is the largest single
+/// process, a lower bound for the build.
+pub(super) fn usage(_confinement: &Confinement, _build_id: &str, rusage: (u64, u64)) -> (u64, u64) {
+    rusage
+}
+
 /// No per-build memory limit on macOS.
 pub(super) fn oom_killed(_confinement: &Confinement, _build_id: &str) -> bool {
     false
@@ -127,7 +168,7 @@ pub(super) fn oom_killed(_confinement: &Confinement, _build_id: &str) -> bool {
 pub(super) fn own_uid_pids() -> Vec<i32> {
     // From <libproc.h>; the libc crate binds proc_listpids but not the
     // filter constants.
-    const PROC_UID_ONLY: u32 = 2;
+    const PROC_UID_ONLY: u32 = 4;
     let uid = rustix::process::getuid().as_raw();
     // Sized generously instead of the size-probe round trip: the uid
     // runs one build plus the agent, and a truncated list only means
@@ -208,5 +249,26 @@ impl Seatbelt {
             unsafe { sandbox_free_error(err) };
         }
         Err(io::Error::other("sandbox_init_with_parameters failed"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::process::{Command, Stdio};
+    use std::thread;
+
+    #[test]
+    fn uid_footprint_counts_a_child_holding_memory() {
+        let mut child = Command::new("/usr/bin/perl")
+            .args(["-e", "$x = 'a' x (300 * 1024 * 1024); sleep 5"])
+            .stdout(Stdio::null())
+            .spawn()
+            .unwrap();
+        thread::sleep(Duration::from_millis(1500));
+        let bytes = uid_footprint_bytes();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(bytes > 250 << 20, "footprint {bytes}");
     }
 }
