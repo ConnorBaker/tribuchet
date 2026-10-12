@@ -12,7 +12,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -259,6 +259,7 @@ async fn worker_loop(
 ) {
     let caps = WorkerCaps {
         name: register.worker_name.clone(),
+        connected_at: Instant::now(),
         systems: register
             .caps
             .iter()

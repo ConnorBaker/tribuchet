@@ -206,7 +206,7 @@ volume is only a cache. The daemon garbage-collects it via the
 ## Prometheus metrics
 
 Set `metrics-listen = "127.0.0.1:7438"` in `hub.toml` and the hub serves
-`/metrics` there, over plain HTTP. Every path returns the same page.
+`/metrics` there, over plain HTTP.
 
 | metric | type | labels | meaning |
 |---|---|---|---|
@@ -219,7 +219,6 @@ Set `metrics-listen = "127.0.0.1:7438"` in `hub.toml` and the hub serves
 | `tribuchet_system_slots` | gauge | system | build slots of connected workers. A worker serving several systems counts in each. Free slots are `slots - running` |
 | `tribuchet_workers_connected` | gauge | | workers with an open session |
 | `tribuchet_workers_for_system` | gauge | system | connected workers advertising a system |
-| `tribuchet_builder_up` | gauge | worker, system | 1 per connected worker and system |
 | `tribuchet_queue_seconds` | histogram | system | time a build waited for a worker, per attempt. Its `_count` is the number of dispatches |
 | `tribuchet_build_seconds` | histogram | system | wall time of a build on its worker |
 | `tribuchet_build_cpu_seconds` | histogram | system | CPU time of a build |
@@ -227,11 +226,9 @@ Set `metrics-listen = "127.0.0.1:7438"` in `hub.toml` and the hub serves
 | `tribuchet_worker_messages_total` | counter | type | messages received from workers |
 | `tribuchet_worker_message_bytes_total` | counter | type | encoded bytes of those messages |
 
-The CPU and memory histograms skip a build the worker could not measure.
-With a build cgroup (Linux namespace builds) they cover the whole build.
-Without one (macOS, direct-exec builds) CPU counts only the builder and the
-processes it waited for, and peak memory is a lower bound. A build killed
-at its memory limit reports that limit.
+`GET /workers` on the same port lists the connected workers as indented
+JSON, sorted by name, with `name`, `systems` and their features, `max_jobs`
+and `connected_seconds`.
 
 ## Fixed-output network policy
 

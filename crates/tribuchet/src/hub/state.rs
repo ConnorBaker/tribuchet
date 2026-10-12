@@ -107,8 +107,9 @@ pub(super) struct HubState {
 
 #[derive(Clone)]
 pub(super) struct WorkerCaps {
-    /// Registered worker name, used as the hostname metrics label.
+    /// Registered worker name, listed on the metrics port's /workers page.
     pub(super) name: String,
+    pub(super) connected_at: Instant,
     /// system -> features the worker honors for it
     pub(super) systems: HashMap<String, HashSet<String>>,
     /// Advisory concurrent-build capacity, summed to size the
@@ -463,6 +464,7 @@ mod tests {
     fn caps(system: &str, features: &[&str]) -> WorkerCaps {
         WorkerCaps {
             name: "w".into(),
+            connected_at: Instant::now(),
             systems: [(
                 system.to_owned(),
                 features.iter().map(|f| (*f).to_owned()).collect(),
@@ -568,6 +570,7 @@ mod tests {
     fn worker_caps_feature_matching() {
         let caps = WorkerCaps {
             name: "w1".into(),
+            connected_at: Instant::now(),
             systems: [
                 ("x86_64-linux".to_owned(), ["kvm".to_owned()].into()),
                 ("aarch64-linux".to_owned(), [].into()),

@@ -16,7 +16,9 @@ use crate::errors::{Result, err_ctx};
 use crate::proto::BuildUsage;
 
 mod histogram;
+mod workers;
 use histogram::{BYTES, SECONDS, Series, bytes_f64, observe, render_histogram};
+use workers::{render_workers_json, wants_workers};
 
 /// Monotonic build lifecycle counters. Gauges (queue depth, connected
 /// workers) are read straight from the live state at scrape time.
@@ -295,23 +297,18 @@ fn render_systems(out: &mut String, state: &HubState, queued: &BTreeMap<String, 
     }
 }
 
-/// Connected builders: a `tribuchet_builder_up` gauge per (worker,
-/// system) plus the connected and per-system totals.
+/// Connected workers, in total and per system. Per-worker detail is on
+/// `/workers`, which keeps the series count independent of worker churn.
 fn render_workers(out: &mut String, state: &HubState) {
     let mut per_system: BTreeMap<String, u64> = BTreeMap::new();
-    let mut builders: Vec<(String, Vec<String>)> = Vec::new();
     let caps = state.worker_caps.lock().unwrap();
     for c in caps.values() {
-        let mut systems: Vec<String> = c.systems.keys().cloned().collect();
-        systems.sort();
-        for system in &systems {
+        for system in c.systems.keys() {
             *per_system.entry(system.clone()).or_default() += 1;
         }
-        builders.push((c.name.clone(), systems));
     }
     let connected = caps.len() as u64;
     drop(caps);
-    builders.sort();
 
     metric(
         out,
@@ -320,21 +317,6 @@ fn render_workers(out: &mut String, state: &HubState) {
         "Workers with an open session.",
         connected,
     );
-    let _ = writeln!(
-        out,
-        "# HELP tribuchet_builder_up Connected builder, labelled by hostname and system."
-    );
-    let _ = writeln!(out, "# TYPE tribuchet_builder_up gauge");
-    for (worker, systems) in &builders {
-        for system in systems {
-            let _ = writeln!(
-                out,
-                "tribuchet_builder_up{{worker=\"{}\",system=\"{}\"}} 1",
-                label(worker),
-                label(system)
-            );
-        }
-    }
     let _ = writeln!(
         out,
         "# HELP tribuchet_workers_for_system Connected workers advertising a system."
@@ -370,12 +352,16 @@ pub(super) async fn serve(state: Arc<HubState>, addr: String) -> Result<()> {
         };
         let state = state.clone();
         tokio::spawn(async move {
-            // Drain the request head; any path scrapes the same metrics.
+            // Only /workers is special. Any other path scrapes the metrics.
             let mut buf = [0u8; 1024];
-            let _ = sock.read(&mut buf).await;
-            let body = render(&state).await;
+            let n = sock.read(&mut buf).await.unwrap_or(0);
+            let (kind, body) = if wants_workers(&buf[..n]) {
+                ("application/json", render_workers_json(&state))
+            } else {
+                ("text/plain; version=0.0.4", render(&state).await)
+            };
             let resp = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 200 OK\r\nContent-Type: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
@@ -489,6 +475,7 @@ mod tests {
                 id,
                 WorkerCaps {
                     name: format!("w{id}"),
+                    connected_at: Instant::now(),
                     systems: [("x86_64-linux".to_owned(), HashSet::default())].into(),
                     max_jobs,
                 },
