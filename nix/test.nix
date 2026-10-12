@@ -37,11 +37,7 @@ in
   # PID 1 unit chatter (all at info) off the serial console but lift
   # our own units to notice so they stay visible.
   defaults.services.openssh.settings.LogLevel = "ERROR";
-  defaults.services.journald.extraConfig = lib.mkForce ''
-    ForwardToConsole=yes
-    TTYPath=/dev/ttyS0
-    MaxLevelConsole=notice
-  '';
+  defaults.services.journald.settings.Journal.MaxLevelConsole = lib.mkForce "notice";
   defaults.boot.kernelParams = [ "loglevel=4" ];
   defaults.systemd.services =
     lib.genAttrs [ "tribuchet-hub" "tribuchet-worker" "nix-daemon" "tribuchet-agent@" ]
