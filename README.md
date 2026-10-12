@@ -211,18 +211,16 @@ Set `metrics-listen = "127.0.0.1:7438"` in `hub.toml` and the hub serves
 | metric | type | labels | meaning |
 |---|---|---|---|
 | `tribuchet_builds_submitted_total` | counter | | builds accepted for scheduling |
-| `tribuchet_builds_dispatched_total` | counter | | builds handed to a worker |
 | `tribuchet_builds_declined_total` | counter | | builds declined because no capable worker registered in time |
 | `tribuchet_builds_requeued_total` | counter | | builds requeued after a worker session was lost |
 | `tribuchet_builds_failed_total` | counter | | builds that ended in failure |
 | `tribuchet_builds_succeeded_total` | counter | | builds that completed |
-| `tribuchet_queue_depth` | gauge | | builds waiting for a worker |
-| `tribuchet_system_builds` | gauge | system, state = queued, running | builds in each state |
+| `tribuchet_system_builds` | gauge | system, state = queued, running | builds in each state. Sum the `queued` series for the queue depth |
 | `tribuchet_system_slots` | gauge | system | build slots of connected workers. A worker serving several systems counts in each. Free slots are `slots - running` |
 | `tribuchet_workers_connected` | gauge | | workers with an open session |
 | `tribuchet_workers_for_system` | gauge | system | connected workers advertising a system |
 | `tribuchet_builder_up` | gauge | worker, system | 1 per connected worker and system |
-| `tribuchet_queue_seconds` | histogram | system | time a build waited for a worker, per attempt |
+| `tribuchet_queue_seconds` | histogram | system | time a build waited for a worker, per attempt. Its `_count` is the number of dispatches |
 | `tribuchet_build_seconds` | histogram | system | wall time of a build on its worker |
 | `tribuchet_build_cpu_seconds` | histogram | system | CPU time of a build |
 | `tribuchet_build_peak_memory_bytes` | histogram | system | peak memory of a build |

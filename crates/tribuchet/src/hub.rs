@@ -323,7 +323,6 @@ async fn worker_loop(
                 register.worker_name.clone(),
             ))
             .await;
-        Metrics::inc(&state.metrics.dispatched);
         state
             .metrics
             .observe_queue(&job.req.system, job.queued_at.elapsed());

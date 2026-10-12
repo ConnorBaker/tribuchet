@@ -23,7 +23,6 @@ use histogram::{BYTES, SECONDS, Series, bytes_f64, observe, render_histogram};
 #[derive(Default)]
 pub(super) struct Metrics {
     pub(super) submitted: AtomicU64,
-    pub(super) dispatched: AtomicU64,
     pub(super) declined: AtomicU64,
     pub(super) requeued: AtomicU64,
     pub(super) failed: AtomicU64,
@@ -193,11 +192,6 @@ async fn render(state: &HubState) -> String {
             &m.submitted,
         ),
         (
-            "tribuchet_builds_dispatched_total",
-            "Builds handed to a worker.",
-            &m.dispatched,
-        ),
-        (
             "tribuchet_builds_declined_total",
             "Builds declined because no capable worker registered in time.",
             &m.declined,
@@ -253,20 +247,9 @@ async fn render(state: &HubState) -> String {
     render_histograms(&mut out, m);
 
     let mut queued: BTreeMap<String, u64> = BTreeMap::new();
-    let queue_depth = {
-        let q = state.queue.lock().await;
-        for j in q.iter() {
-            *queued.entry(j.req.system.clone()).or_default() += 1;
-        }
-        q.len() as u64
-    };
-    metric(
-        &mut out,
-        "tribuchet_queue_depth",
-        "gauge",
-        "Builds waiting for a worker.",
-        queue_depth,
-    );
+    for j in state.queue.lock().await.iter() {
+        *queued.entry(j.req.system.clone()).or_default() += 1;
+    }
 
     render_workers(&mut out, state);
     render_systems(&mut out, state, &queued);
