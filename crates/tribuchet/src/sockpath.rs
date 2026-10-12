@@ -8,6 +8,8 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::Path;
 use std::sync::Mutex;
 
+use rustix::io::Errno;
+
 static CWD_LOCK: Mutex<()> = Mutex::new(());
 
 pub fn bind(path: &Path) -> io::Result<UnixListener> {
@@ -26,7 +28,8 @@ pub fn connect(path: &Path) -> io::Result<UnixStream> {
 
 fn too_long(e: &io::Error) -> bool {
     // Rust reports an over-long path as InvalidInput before the syscall.
-    e.kind() == io::ErrorKind::InvalidInput || e.raw_os_error() == Some(libc::ENAMETOOLONG)
+    e.kind() == io::ErrorKind::InvalidInput
+        || e.raw_os_error() == Some(Errno::NAMETOOLONG.raw_os_error())
 }
 
 fn in_parent_dir<T>(path: &Path, f: impl FnOnce(&Path) -> io::Result<T>) -> io::Result<T> {

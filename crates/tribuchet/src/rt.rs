@@ -5,6 +5,9 @@
 use std::ffi::CString;
 use std::io;
 
+#[cfg(target_os = "linux")]
+use rustix::thread::set_name;
+
 /// A multi-threaded runtime whose worker and blocking-pool threads carry
 /// `name`. Mirrors the defaults of `Runtime::new` otherwise.
 pub fn runtime(name: &'static str) -> io::Result<tokio::runtime::Runtime> {
@@ -19,11 +22,7 @@ pub fn runtime(name: &'static str) -> io::Result<tokio::runtime::Runtime> {
 pub fn name_current_thread(name: &str) {
     #[cfg(target_os = "linux")]
     if let Ok(c) = CString::new(name) {
-        // SAFETY: `c` is a valid NUL-terminated string for the call's
-        // duration and pthread_self() is always valid for this thread.
-        unsafe {
-            libc::pthread_setname_np(libc::pthread_self(), c.as_ptr());
-        }
+        let _ = set_name(&c);
     }
     #[cfg(not(target_os = "linux"))]
     let _ = name;
