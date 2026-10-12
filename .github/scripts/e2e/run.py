@@ -78,6 +78,18 @@ def spawn_daemon(argv: list[str], log: Path) -> subprocess.Popen[bytes]:
         )
 
 
+def start_daemon(
+    argv: list[str], log: Path, ready: Callable[[], bool], what: str
+) -> None:
+    """Spawn *argv* and wait up to 30 s for *ready*. A daemon that exited
+    has its log dumped and fails the step, even if it got ready first."""
+    proc = spawn_daemon(argv, log)
+    wait_for(lambda: ready() or proc.poll() is not None, timeout=30, what=what)
+    if proc.poll() is not None or not ready():
+        sys.stderr.write(log.read_text())
+        raise SystemExit(f"{what} failed")
+
+
 # ---------------------------------------------------------------- hub ----
 
 
@@ -129,7 +141,7 @@ def hub_start(systems: list[str]) -> None:
 
     # Hub binds the attach socket to group nixbld and reads topTmpDir
     # owned by build users; both need root.
-    proc = spawn_daemon(
+    start_daemon(
         [
             "sudo",
             "RUST_LOG=info",
@@ -139,15 +151,9 @@ def hub_start(systems: list[str]) -> None:
             "/etc/tribuchet/hub.toml",
         ],
         HUB_LOG,
+        lambda: log_contains(HUB_LOG, "hub running"),
+        "hub start",
     )
-    wait_for(
-        lambda: log_contains(HUB_LOG, "hub running") or proc.poll() is not None,
-        timeout=30,
-        what="hub to start",
-    )
-    if not log_contains(HUB_LOG, "hub running"):
-        sys.stderr.write(HUB_LOG.read_text())
-        raise SystemExit("hub did not start")
 
     (REPO / "addr.txt").write_text(out(["tailscale", "ip", "-4"]) + "\n")
     print(HUB_LOG.read_text())
@@ -164,7 +170,7 @@ def hub_build(systems: list[str]) -> None:
     # The flake-locked nixpkgs is what nixbot built and cached.
     nixpkgs = out(["nix", "eval", "--raw", "--inputs-from", ".", "nixpkgs#path"])
 
-    def build(probe: str, suffix: str) -> list[str]:
+    def build(probe: str, suffix: str) -> None:
         # One nix-build for all systems: the hub queues each derivation
         # and dispatches it once the matching worker registers (within
         # worker-grace-secs), so per-system arrival order does not matter.
@@ -194,7 +200,6 @@ def hub_build(systems: list[str]) -> None:
             payload = Path(path).read_text().strip()
             if not payload.endswith(suffix):
                 raise SystemExit(f"unexpected build output in {path}: {payload!r}")
-        return paths
 
     build("probe.nix", "-via-tailnet")
     build("probe-fod.nix", "fod-dns-ok")  # DNS + TLS from inside the sandbox
@@ -239,23 +244,18 @@ def gh_api(path: str) -> Any | None:
 
 
 def wait_buildbot(sha: str) -> None:
-    """Block until the buildbot check run for *sha* succeeds, so the
-    build below fetches nixbot's closure instead of rebuilding. Tolerates
-    a not-yet-listed check (push fires before buildbot registers one)."""
+    """Block until the newest buildbot check run for *sha* succeeds, so the
+    build below fetches nixbot's closure instead of rebuilding. nixbot
+    replaces a commit's check run when it restarts a build, so older runs
+    are ignored and a missing one (push fires before buildbot registers) is
+    waited for."""
     name = "buildbot/nix-build"
 
     def ready() -> bool:
         data = gh_api(f"commits/{sha}/check-runs?check_name={name}")
-        if data is None:
-            return False
-        runs = data.get("check_runs", [])
-        if not runs or any(r.get("status") != "completed" for r in runs):
-            return False
-        # Fail fast instead of waiting the full timeout: a red buildbot would
-        # otherwise hang every push-triggered e2e until the deadline.
-        if any(r.get("conclusion") != "success" for r in runs):
-            raise SystemExit(f"{name} on {sha[:8]} did not succeed; skipping e2e")
-        return True
+        runs = data["check_runs"] if data else []
+        latest = max(runs, key=lambda r: r["id"], default=None)
+        return latest is not None and latest["conclusion"] == "success"
 
     wait_for(ready, timeout=1800, interval=15, what=f"{name} on {sha[:8]}")
 
@@ -264,13 +264,8 @@ def job_conclusion(name: str) -> str | None:
     """Conclusion of a sibling job in this run, or ``None`` while it is
     still running / on transient API errors."""
     data = gh_api(f"actions/runs/{os.environ['GITHUB_RUN_ID']}/jobs")
-    if data is None:
-        return None
-    for j in data.get("jobs", []):
-        if j["name"] == name:
-            c: str | None = j.get("conclusion")
-            return c
-    return None
+    jobs = data["jobs"] if data else []
+    return next((j["conclusion"] for j in jobs if j["name"] == name), None)
 
 
 def start_agent(worker_uid: int) -> None:
@@ -291,15 +286,7 @@ def start_agent(worker_uid: int) -> None:
     ]
     if sys.platform == "linux":
         agent_cmd += ["--uid-base", str(AGENT_UID_BASE)]
-    proc = spawn_daemon(agent_cmd, AGENT_LOG)
-    wait_for(
-        lambda: AGENT_SOCKET.exists() or proc.poll() is not None,
-        timeout=30,
-        what="agent to start",
-    )
-    if proc.poll() is not None:
-        sys.stderr.write(AGENT_LOG.read_text())
-        raise SystemExit("agent exited")
+    start_daemon(agent_cmd, AGENT_LOG, AGENT_SOCKET.exists, "agent start")
     # The unprivileged worker must connect to the root-owned socket.
     run(["sudo", "chmod", "666", str(AGENT_SOCKET)])
 
