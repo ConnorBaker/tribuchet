@@ -127,6 +127,11 @@ in
       default = 400;
       description = "Uid of the _tribuchet worker user.";
     };
+    gid = lib.mkOption {
+      type = lib.types.int;
+      default = 600;
+      description = "Gid of the _tribuchet worker user's primary group.";
+    };
     agentUidBase = lib.mkOption {
       type = lib.types.int;
       default = 401;
@@ -153,14 +158,16 @@ in
   };
 
   config = lib.mkMerge [
-    # Hub and worker share the _tribuchet user. It is in nixbld (build
-    # users must write /nix/store) and trusted by the nix-daemon (the
-    # worker imports inputs, the hub queries and exports store paths).
+    # The nix-daemon rejects peers whose primary group is nixbld, so it
+    # is only supplementary (needed for the attach directory).
     (lib.mkIf (hub.enable || cfg.enable) {
       users.knownUsers = [ "_tribuchet" ];
+      users.knownGroups = [ "_tribuchet" ];
+      users.groups._tribuchet.gid = cfg.gid;
+      users.groups.nixbld.members = [ "_tribuchet" ];
       users.users._tribuchet = {
         uid = cfg.uid;
-        gid = nixbldGid;
+        gid = cfg.gid;
         home = "/var/empty";
         shell = "/usr/bin/false";
         description = "tribuchet";
