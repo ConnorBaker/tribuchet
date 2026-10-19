@@ -185,29 +185,41 @@ impl attach_hub_server::AttachHub for AttachSvc {
             return Ok(declined);
         }
 
-        let existing = self
-            .state
-            .inflight
-            .lock()
-            .unwrap()
-            .by_key
-            .get(&key)
-            .cloned();
-        let rx = if let Some(replay) = existing {
-            tracing::info!(key, "deduplicating build submission");
-            replay.subscribe().await
-        } else {
+        let paths: Vec<String> = req.outputs.values().cloned().collect();
+        let rx = loop {
+            // Registered before the checks so a release in between
+            // is not missed.
+            let released = self.state.inflight.lock().unwrap().released.clone();
+            let notified = released.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            let existing = self
+                .state
+                .inflight
+                .lock()
+                .unwrap()
+                .by_key
+                .get(&key)
+                .cloned();
+            if let Some(replay) = existing {
+                tracing::info!(key, "deduplicating build submission");
+                break replay.subscribe().await;
+            }
             let replay = Arc::new(Replay::default());
-            let rx = replay.subscribe().await;
-            let paths = req.outputs.values().cloned().collect();
             // A different request claiming an in-flight scratch path
-            // would race the other client's unpack at the same dest.
-            let listing =
-                Inflight::list(&self.state.inflight, &key, paths, &replay).ok_or_else(|| {
-                    Status::failed_precondition(
-                        "an output path is part of a different in-flight build",
-                    )
-                })?;
+            // would race the other client's unpack at the same dest, so
+            // wait for it to finish (e.g. an abandoned earlier attempt).
+            let Some(listing) = Inflight::list(&self.state.inflight, &key, paths.clone(), &replay)
+            else {
+                tracing::info!(
+                    key,
+                    "output path held by a different in-flight build; waiting"
+                );
+                notified.await;
+                continue;
+            };
+            let rx = replay.subscribe().await;
             let job = Job {
                 id: new_id(),
                 key,
@@ -223,7 +235,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
             Metrics::inc(&self.state.metrics.submitted);
             self.state.queue.lock().await.push_back(job);
             self.state.notify.notify_waiters();
-            rx
+            break rx;
         };
         // Close the check-then-queue race: the last capable worker may
         // have disconnected (and swept the queue) between the capability
