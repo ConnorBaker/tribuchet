@@ -169,7 +169,16 @@ Import `tribuchet.nixosModules.default` (flake input
 
 The hub unit is socket-activated. The worker unit reloads instead of
 restarting on package or settings changes, so running builds survive
-deploys.
+deploys. The build agents and their builds together may use the host's
+memory less `services.tribuchet-worker.agentMemoryReserve` (8 GiB by
+default) and less a per-page bound on what zswap holds for them outside
+their charge (zsmalloc's fragmentation after frees can pass it until
+global reclaim compacts the pool), and swap up to `agentSwapPercent`
+percent of MemTotal (100 by default) through zswap, which the module
+turns on for them alone. Past that the kernel OOM-kills inside their
+slice, never an agent, instead of taking the host down.
+Set the reserve to `null` to lift the cap and leave swap and zswap as
+the host has them.
 
 ### macOS (nix-darwin)
 

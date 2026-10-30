@@ -109,6 +109,8 @@ in
         services.tribuchet-worker = {
           enable = true;
           package = tribuchet;
+          # the VM has less than the default 8 GiB to keep back
+          agentMemoryReserve = 512 * 1024 * 1024;
           settings = {
             # placeholder; the test script substitutes the hub's
             # tailnet IP so the connection arrives from a tailnet

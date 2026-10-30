@@ -100,16 +100,25 @@ in
       # Writing the uid/gid maps of the agent's user namespace needs
       # CAP_SETUID/CAP_SETGID over the uid block, dropped right after.
       # CAP_CHOWN stays: each build cgroup is handed to its mapped root.
+      # CAP_SYS_RESOURCE stays: each build process, between fork and
+      # exec, resets the oom_score_adj floor it inherits from the agent
+      # (sandbox::unprotect_from_oom).
       AmbientCapabilities = [
         "CAP_SETUID"
         "CAP_SETGID"
         "CAP_CHOWN"
+        "CAP_SYS_RESOURCE"
       ];
       CapabilityBoundingSet = [
         "CAP_SETUID"
         "CAP_SETGID"
         "CAP_CHOWN"
+        "CAP_SYS_RESOURCE"
       ];
+      # The kernel never OOM-kills a task at -1000 (oom_badness): an
+      # agent outlives a build's OOM kill to report it. Its builds start
+      # at 0, with a floor of 0, so they cannot take that back.
+      OOMScoreAdjust = -1000;
       # the per-build cgroup the sandbox roots its cgroup namespace in
       Delegate = true;
       # Builders inherit this; match nix-daemon to avoid EMFILE.
@@ -130,6 +139,15 @@ in
       User = "tribuchet";
       WatchdogSec = "30";
       ExecStart = "${lib.getExe' package "tribuchet"} worker --config ${workerToml}";
+      # Each agent thaws its build when the worker's lease on it ends, as
+      # the worker exits however it ended; this thaws, as root, what an
+      # agent that does not answer left frozen. systemd runs it after every
+      # exit of the worker unless the kernel kills it: before Linux
+      # 8e3599202166 (v7.3-rc2; 7.2.y lacks it), once the unit's
+      # cgroup.kill is written (`systemctl kill -s KILL` of the whole unit,
+      # systemd-oomd), every process later cloned into that cgroup is
+      # SIGKILLed, this one included. cgroup.freeze is the agents', not
+      # the worker's uid's, hence "+" (full privileges).
       ExecStopPost = "+${thawBuilds}";
       # Running builds live in the agent services and are re-adopted by
       # the next worker instance.

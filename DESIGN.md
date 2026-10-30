@@ -279,6 +279,11 @@ reported at start, and nothing is frozen there.
   where Nix is not patched to leave it to the external builder.
 * The frozen builds' memory rule is a margin, not a bound: a leader that
   grows faster than one 200 ms sample can still fill a capped slice.
+* Within the agents' slice the kernel's OOM killer kills one process,
+  the largest, which may be a co-tenant's; a build whose child is
+  killed but whose builder exits 0 succeeds (`oom_killed=true`). From
+  Linux 7.0, and 6.19.9, its memcg scan skips an exiting victim
+  (a72f73c4dd9b) and can kill a second task.
 * Dedupe attaches duplicates to the first attempt, so a transient
   failure propagates to all attached submitters (same as Buck2's RE
   dedupe behaviour).
@@ -298,6 +303,22 @@ command line. `nixosModules.default` ships hub and worker services
 socket-activated, the worker unit delegates its cgroup subtree for
 per-build limits and restarts on package bumps and settings changes
 while running builds keep going (KillMode=process plus re-adoption).
+The agents run at OOMScoreAdjust=-1000 and their builds at 0, which a
+build cannot lower, so no agent is an OOM victim. Every agent and its
+builds run in `system-tribuchet\x2dagent.slice`, whose RAM plus the
+RAM zswap holds for it outside its charge stays at or below MemTotal
+less `agentMemoryReserve` (`nix/agent-memory.nix`): a generator caps it
+at A = MemTotal − reserve − S / 4096 × 256 at boot and at each
+daemon-reload, and it swaps only through zswap, with writeback off, up
+to S (`agentSwapPercent` of MemTotal); every other unit has
+MemoryZSwapMax=0. `tribuchet-agent-swap` turns zswap on and then gives
+the slice S; its stop takes S to 0 and only then turns zswap off, so
+that S is never in force with zswap off. `tribuchet-agent-guard`,
+bound to it, clamps the slice's swap at what it holds once the slice,
+at its cap, has reclaimed next to nothing for 30 s, so that the kernel
+OOM-kills a runaway as at S, and gives S back after the kill. A host
+configuration that also sets these properties on the slice fails
+evaluation.
 The e2e test consumes the same module. macOS hosts use the
 `darwinModules.default` nix-darwin module, which ships both services:
 the hub adopts its listeners from launchd (`launch_activate_socket`,

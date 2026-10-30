@@ -27,6 +27,9 @@ use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 
 #[cfg(target_os = "linux")]
+use rustix::fs::{Mode, OFlags, open};
+#[cfg(target_os = "linux")]
+use rustix::io::{Errno, write};
 #[cfg(target_os = "linux")]
 use rustix::pipe::{PipeFlags, pipe_with};
 
@@ -250,6 +253,7 @@ fn build_command(spec: &SandboxSpec) -> Result<(Command, Option<OwnedFd>), Error
     // Own process group, so orphaned builder children can be killed
     // after the builder exits.
     CommandExt::process_group(&mut cmd, 0);
+    unprotect_from_oom(&mut cmd);
     // The derivation env must not reach the pre-sandbox setup stage
     // (worker binary, worker host credentials): LD_PRELOAD would run
     // client code outside the sandbox. With the spec on stdin the env
@@ -267,6 +271,29 @@ fn build_command(spec: &SandboxSpec) -> Result<(Command, Option<OwnedFd>), Error
     }
     cmd.stdin(Stdio::null());
     Ok((cmd, None))
+}
+
+/// Start a build at oom_score_adj 0: the agent runs at -1000, which
+/// its children inherit along with that floor. Written while the child
+/// still holds the agent's CAP_SYS_RESOURCE, 0 resets the floor as well,
+/// so the build cannot lower its score again. EACCES means the floor is
+/// already above 0: nothing to undo.
+#[cfg(target_os = "linux")]
+pub fn unprotect_from_oom(cmd: &mut Command) {
+    // SAFETY: open, write and close are async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            let fd = open(
+                c"/proc/self/oom_score_adj",
+                OFlags::WRONLY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?;
+            match write(&fd, b"0") {
+                Ok(_) | Err(Errno::ACCESS) => Ok(()),
+                Err(e) => Err(e.into()),
+            }
+        });
+    }
 }
 
 /// Spawn the sandboxed build with stdout/stderr on `log`. The build

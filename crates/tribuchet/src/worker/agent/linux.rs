@@ -5,9 +5,10 @@
 //! At startup the agent creates a user namespace mapping in-ns
 //! 0..65536 to its uid block. Writing another namespace's uid_map
 //! needs CAP_SETUID in the parent namespace, so the agent unit runs
-//! with AmbientCapabilities=CAP_SETUID CAP_SETGID CAP_CHOWN; the
-//! setuid/setgid caps are dropped right after the write, CAP_CHOWN
-//! stays for handing each build cgroup to its mapped root uid.
+//! with AmbientCapabilities=CAP_SETUID CAP_SETGID CAP_CHOWN
+//! CAP_SYS_RESOURCE; the setuid/setgid caps are dropped right after the
+//! write, CAP_CHOWN stays for handing each build cgroup to its mapped
+//! root uid, CAP_SYS_RESOURCE for each build's oom_score_adj floor.
 //! Sandboxed builds join that namespace via the worker's setup
 //! stage, spawned here.
 
@@ -387,11 +388,13 @@ pub fn fs_helper_stage() -> ! {
 }
 
 /// Confinement hook of the direct-exec path (no sandbox spec):
-/// seatbelt-profile requests have no Linux equivalent there.
-pub(super) fn confine(_cmd: &mut Command, req: &StartRequest, _build_dir: &str) -> Result<()> {
+/// seatbelt-profile requests have no Linux equivalent there; the
+/// builder gives up the agent's OOM protection as a sandboxed one does.
+pub(super) fn confine(cmd: &mut Command, req: &StartRequest, _build_dir: &str) -> Result<()> {
     if !req.profile.is_empty() {
         return Err(msg("seatbelt profiles are only supported on macOS"));
     }
+    sandbox::unprotect_from_oom(cmd);
     Ok(())
 }
 
@@ -422,16 +425,22 @@ impl Userns {
     }
 }
 
-/// Drop the agent's capabilities down to CAP_CHOWN; only handing the
-/// build cgroups to their mapped root uid still needs privilege after
-/// the map write.
+/// Drop the agent's capabilities down to CAP_CHOWN, which hands the
+/// build cgroups to their mapped root uid, and CAP_SYS_RESOURCE if the
+/// unit granted it, which lets a build reset its oom_score_adj floor
+/// (sandbox::unprotect_from_oom).
 fn drop_caps() -> Result<()> {
     rustix::thread::clear_ambient_capability_set().map_err(err_ctx("clearing the ambient set"))?;
+    let granted = rustix::thread::capabilities(None)
+        .map_err(err_ctx("reading the capability sets"))?
+        .permitted;
+    let keep = rustix::thread::CapabilitySet::CHOWN
+        | (granted & rustix::thread::CapabilitySet::SYS_RESOURCE);
     rustix::thread::set_capabilities(
         None,
         rustix::thread::CapabilitySets {
-            effective: rustix::thread::CapabilitySet::CHOWN,
-            permitted: rustix::thread::CapabilitySet::CHOWN,
+            effective: keep,
+            permitted: keep,
             inheritable: rustix::thread::CapabilitySet::empty(),
         },
     )
