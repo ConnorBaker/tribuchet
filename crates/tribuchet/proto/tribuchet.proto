@@ -19,7 +19,8 @@ message WorkerMessage {
     // Output chunks answering the hub's Need, then one eof.
     ChunkFrame chunk = 5;
     // Worker-side admission: how many more assignments the worker
-    // accepts right now. Level-triggered: each one replaces the last.
+    // accepts right now. Level-triggered: each one replaces the last,
+    // less the assignments sent that it had not seen yet.
     RequestJob request_job = 6;
     // Answer to a BuildAssignment whose dedupe_key matches a build the
     // worker already runs (or has finished but not delivered): the hub
@@ -39,6 +40,10 @@ message Resumed {
 
 message RequestJob {
   uint32 capacity = 1;
+  // Assignments this session had received when the worker counted
+  // `capacity`. The hub takes off the ones it sent since. Unset by
+  // workers predating the field.
+  optional uint64 assignments = 2;
 }
 
 message HubMessage {

@@ -11,6 +11,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
 use super::metrics::Metrics;
+use super::naming::drv_name;
 use super::state::{HubState, Inflight, Job, Replay, Servability};
 use crate::proto::{
     AttachEvent, BuildMessage, BuildRequest, DECLINE_EXIT_CODE, attach_event, attach_hub_server,
@@ -206,7 +207,8 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 tracing::info!(key, "deduplicating build submission");
                 break replay.subscribe().await;
             }
-            let replay = Arc::new(Replay::default());
+            let id = new_id();
+            let replay = Arc::new(Replay::new(id.clone()));
             // A different request claiming an in-flight scratch path
             // would race the other client's unpack at the same dest, so
             // wait for it to finish (e.g. an abandoned earlier attempt).
@@ -221,17 +223,24 @@ impl attach_hub_server::AttachHub for AttachSvc {
             };
             let rx = replay.subscribe().await;
             let job = Job {
-                id: new_id(),
+                id,
                 key,
                 req,
                 tmp_dir_pack,
                 features,
                 replay,
-                listing: Mutex::new(Some(listing)),
+                listing: Arc::new(Mutex::new(Some(listing))),
                 attempts: 0,
+                resumed_losses: 0,
                 queued_at: Instant::now(),
+                loss: None,
             };
-            tracing::info!(id = job.id, system = job.req.system, "queueing build");
+            tracing::info!(
+                id = job.id,
+                system = job.req.system,
+                drv = drv_name(&job.req).unwrap_or_default(),
+                "queueing build"
+            );
             Metrics::inc(&self.state.metrics.submitted);
             self.state.queue.lock().await.push_back(job);
             self.state.notify.notify_waiters();
@@ -240,7 +249,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
         // Close the check-then-queue race: the last capable worker may
         // have disconnected (and swept the queue) between the capability
         // check above and the push.
-        self.state.fail_unservable().await;
+        self.state.hold_unservable().await;
         Ok(Response::new(ReceiverStream::new(rx)))
     }
 }
@@ -249,6 +258,9 @@ impl attach_hub_server::AttachHub for AttachSvc {
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+    use std::time::Duration;
+
+    use crate::hub::state::WorkerCaps;
 
     /// 32-char base32 hash part for synthetic store paths.
     const H: &str = "00000000000000000000000000000000";
@@ -325,6 +337,19 @@ mod tests {
         req.env.insert("X".into(), "1".into());
         assert_ne!(a, dedupe_key(&req, b""));
         assert_ne!(a, dedupe_key(&base_request(), b"other .attrs.sh"));
+    }
+
+    /// A hub with one x86_64-linux worker registered.
+    fn hub() -> Arc<HubState> {
+        let state = Arc::new(HubState::for_test(Duration::ZERO));
+        let caps = WorkerCaps {
+            name: "w".into(),
+            connected_at: Instant::now(),
+            systems: [("x86_64-linux".to_owned(), HashSet::new())].into(),
+            max_jobs: 1,
+        };
+        state.worker_caps.lock().unwrap().insert(1, caps);
+        state
     }
 
     /// Strings shifted between adjacent sections must not collide:

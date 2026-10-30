@@ -1,23 +1,26 @@
-# First run: the test kills the nix-build client mid-build and expects
-# the hub to cancel the build on the worker (well before the 30s are
-# up). Second run: the same derivation must build to completion,
-# proving the cancellation left no stale per-derivation state behind.
-{ bash }:
+# A build that logs about once a second for `seconds` and then succeeds:
+# one whose client a test kills or brings back late. Its log names it
+# (`<name>-marker-running`) so that the test can find its builder.
+{
+  bash,
+  name,
+  seconds,
+}:
 derivation {
-  name = "tt-cancel";
+  name = "tt-${name}";
   system = "x86_64-linux";
   builder = builtins.storePath bash + "/bin/bash";
   args = [
     "-c"
     # logs roughly once a second: continuous output must not keep the
-    # hub from noticing the departed client and cancelling the build
+    # hub from noticing the departed client
     ''
-      echo cancel-marker-running >&2
+      echo ${name}-marker-running >&2
       last=-1
-      while [ $SECONDS -lt 30 ]; do
+      while [ $SECONDS -lt ${toString seconds} ]; do
         if [ $SECONDS -gt $last ]; then last=$SECONDS; echo "still running $SECONDS" >&2; fi
       done
-      echo cancel-done > $out
+      echo ${name}-done > $out
     ''
   ];
 }

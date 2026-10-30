@@ -161,7 +161,8 @@ authenticated transport).
 
 MVP targets 2–10 workers and a few clients: all scheduler state is in
 memory (no database). The hub's replay buffer is capped at 256 MiB per
-build and slow dedupe subscribers are dropped rather than buffered.
+build. An attach client that is slow, or attaches late, may miss log
+lines but receives every output (`hub/state/replay.rs`).
 
 ### Chunked staging
 
@@ -203,6 +204,29 @@ session gap by requeueing instead of failing jobs whose worker
 session died; the attached client sees a pause, not an error. A full
 stop behaves the same way: builds keep running, and their results
 wait on disk until a worker starts again (or expire undelivered).
+A queued build that no connected worker can serve stays queued until
+one registers, and its clients are told so. A loss the worker resumes costs a build nothing; the fourth
+genuine loss (followed by a start-over) fails it, and so does the
+thirteenth loss on a resume (`hub/losses.rs`).
+
+A build with no attach client is kept while no waiting build wants its
+slot. Under demand, one whose clients have all been gone 14 s is given
+up, the one with the least work sunk (its run time) first, and no more
+than the waiting builds can use, counted hub-wide
+(`hub/state/clientless.rs`). None that a worker holds from before a hub
+restart is given up: it runs to completion.
+
+The hub's own nix-daemon fails a build, naming the cause, once a
+failure of class c has repeated θ(c) times in a row on the same
+request, as that build counts them; otherwise the build waits and its
+clients are told once (`hub/relay/daemon.rs`):
+
+| class | θ |
+|---|---|
+| a refusal of the request, a handshake the hub cannot speak, a new connection closed before the handshake as the daemon's journal says it refuses the hub's user | 1 |
+| a message the hub cannot read | 2 |
+| a request the daemon drops as its journal says a worker crashed | 3 |
+| anything else: a drop or close with no such word in the journal, no answer within a minute, a silent daemon's included | ∞ |
 
 ## Known limitations (MVP)
 
@@ -219,10 +243,10 @@ wait on disk until a worker starts again (or expire undelivered).
 * Results are kept until the hub acknowledges them, but log replay
   offsets advance when a chunk is handed to the session, so a few log
   lines in flight when a session dies are skipped on resume.
-* Cancellation is lazy: a dispatched build whose attach clients are
-  all gone is killed only after a grace period, and an abandoned
-  queued job is dropped when a worker would have picked it up, not
-  immediately.
+* An abandoned queued job is dropped when a worker would have picked
+  it up, not immediately.
+* The attach socket sets no HTTP/2 keepalive: an attach client that
+  stays connected but reads nothing keeps its stream until it exits.
 * An output delivery fails its build when the hub's chunk cache cannot
   store or read back a chunk of it.
 * Dedupe attaches duplicates to the first attempt, so a transient
