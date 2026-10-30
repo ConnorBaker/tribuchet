@@ -25,6 +25,18 @@ pub enum Error {
     },
     #[error("{0}")]
     Msg(String),
+    /// The hub gave the build up: its last attach client left while it
+    /// waited. No verdict for anyone.
+    #[error("no attach client left")]
+    GivenUp,
+    /// The worker's heartbeat no longer lists a build it resumed: it no
+    /// longer has it (its agent did not). A loss, as of a dead session.
+    #[error("the worker no longer holds the build")]
+    Unlisted,
+    /// Given up, then dispatched again by its key to the same worker,
+    /// which delivers to that dispatch: nothing more for this one.
+    #[error("a later dispatch took the build over")]
+    Superseded,
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]

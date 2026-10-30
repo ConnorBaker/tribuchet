@@ -21,13 +21,14 @@
 // struct's `timed_out` field reads naturally despite the lint.
 #![allow(clippy::too_many_lines, clippy::struct_field_names)]
 
+mod daemon;
 mod harness;
 
 use std::time::Instant;
 
 use harness::{
-    Node, assert_journal, bash, build_grep, count, fail, run, succeed, succeed_t, wait_journal,
-    wait_until_succeeds, write_echo_deriv, write_file,
+    Node, assert_journal, bash, build_grep, count, fail, journal, more_than, run, succeed,
+    succeed_t, wait_journal, wait_until_succeeds, write_echo_deriv, write_file,
 };
 
 #[test]
@@ -65,8 +66,8 @@ fn build_remote() {
 fn build_shared() {
     // Two runtime-added paths the worker lacks, the referrer embedding the
     // reference's path so Nix records the edge; several builds depend on both,
-    // dispatched at once. Per-worker staging serialization must import each
-    // closure in isolation instead of racing on the daemon path lock.
+    // dispatched at once. One build fetches and imports each path while the
+    // others wait on its claim, instead of racing on the daemon path lock.
     succeed(Node::Hub, "head -c 4000000 /dev/urandom > /root/ref");
     let refp = succeed(Node::Hub, "nix-store --add /root/ref")
         .trim()
@@ -314,20 +315,6 @@ fn build_cross() {
 }
 
 #[test]
-fn build_recursive() {
-    let out = succeed(Node::Hub, "nix-build /etc/tt/recursive.nix --no-out-link");
-    let inner = succeed(Node::Hub, &format!("cat {}", out.trim()))
-        .trim()
-        .to_string();
-    // The closure-delta must have travelled: the inner path is registered in
-    // the hub's store, not just referenced.
-    succeed(Node::Hub, &format!("nix-store --check-validity {inner}"));
-    succeed(Node::Hub, &format!("grep -q recursive-payload {inner}"));
-    // And the worker really added it locally too.
-    succeed(Node::Worker, &format!("nix-store --check-validity {inner}"));
-}
-
-#[test]
 fn build_nspawn() {
     // Longest build: boots a NixOS container inside the remote build.
     let out = succeed_t(
@@ -460,20 +447,75 @@ fn lifecycle() {
     // The new instance logs its configuration: the max-jobs bump survived.
     assert_journal(Node::Worker, "tribuchet-worker", "max_jobs: 3");
 
-    // --- killing the client cancels the build on the worker ---------------
+    // --- a build held from before a hub restart runs to completion ------
+    // Held by key on the worker across a hub restart, a build whose client
+    // went is never given up, though work waits for its slot, and a client
+    // asking 60 s later joins it (hub/tests/clientless_farm.rs; the other
+    // cases are clientless*.rs's).
+    // kept's dispatches as a new build
+    let fresh = || {
+        let cmd = format!(
+            "{} | grep 'dispatching build' | grep tt-kept | grep -c resumed=false || true",
+            journal("tribuchet-hub")
+        );
+        succeed(Node::Hub, &cmd).trim().parse::<i64>().unwrap()
+    };
+    let dispatched = fresh();
+    let resumed = count(Node::Worker, "tribuchet-worker", "build resumed");
+    let cancels = count(Node::Hub, "tribuchet-hub", "cancelling");
     succeed(
         Node::Hub,
-        "systemd-run --unit=cancelbuild bash -lc 'nix-build /etc/tt/cancel.nix --no-out-link'",
+        "systemd-run --unit=kept1 bash -lc 'nix-build /etc/tt/kept.nix --no-out-link'",
     );
-    // bracket trick: do not match the pgrep wrapper's own cmdline
-    wait_until_succeeds(Node::Worker, "pgrep -f 'cancel-marker-runnin[g]'", 60);
-    succeed(Node::Hub, "systemctl kill --signal=SIGKILL cancelbuild");
-    wait_until_succeeds(Node::Worker, "! pgrep -f 'cancel-marker-runnin[g]'", 60);
-    assert_journal(Node::Hub, "tribuchet-hub", "cancelling build");
-
-    // --- the cancelled derivation builds fine when asked again ------------
-    let out = succeed_t(Node::Hub, "nix-build /etc/tt/cancel.nix --no-out-link", 120);
-    succeed(Node::Hub, &format!("grep -q cancel-done {}", out.trim()));
+    wait_until_succeeds(Node::Worker, "pgrep -f 'kept-marker-runnin[g]'", 60);
+    succeed(Node::Hub, "systemctl kill --signal=SIGKILL kept1");
+    let registered = count(Node::Hub, "tribuchet-hub", "worker registered");
+    succeed(Node::Hub, "systemctl restart tribuchet-hub");
+    wait_until_succeeds(
+        Node::Hub,
+        &more_than("tribuchet-hub", "worker registered", registered),
+        90,
+    );
+    // Work for each other slot and one more, 60 s each.
+    let cancel = succeed(
+        Node::Hub,
+        "grep -o '/nix/store/[^ ]*-cancel.nix' /etc/tt/kept.nix",
+    );
+    for w in ["w1", "w2", "w3"] {
+        let expr = format!(
+            "import {} {{ bash = \"{}\"; name = \"{w}\"; seconds = 60; }}",
+            cancel.trim(),
+            bash()
+        );
+        write_file(Node::Hub, &format!("/root/{w}.nix"), &expr);
+        succeed(
+            Node::Hub,
+            &format!("systemd-run --unit={w} nix-build /root/{w}.nix"),
+        );
+    }
+    succeed(Node::Hub, "sleep 30");
+    let runs = |w: &str| run(Node::Worker, &format!("pgrep -f '{w}-marker-runnin[g]'")).code == 0;
+    assert!(
+        ["w1", "w2", "w3"].iter().any(|w| !runs(w)),
+        "no work waited"
+    );
+    succeed(Node::Hub, "sleep 30");
+    succeed(Node::Worker, "pgrep -f 'kept-marker-runnin[g]'");
+    let out = succeed_t(Node::Hub, "nix-build /etc/tt/kept.nix --no-out-link", 180);
+    succeed(Node::Hub, &format!("grep -q kept-done {}", out.trim()));
+    assert_eq!(fresh(), dispatched + 1, "kept ran again");
+    assert_eq!(
+        count(Node::Worker, "tribuchet-worker", "build resumed"),
+        resumed + 1,
+        "not resumed"
+    );
+    assert_eq!(
+        count(Node::Hub, "tribuchet-hub", "cancelling"),
+        cancels,
+        "given up"
+    );
+    let idle = "! systemctl is-active -q w1 w2 w3";
+    wait_until_succeeds(Node::Hub, idle, 120);
 
     // --- concurrent builds share one worker session (quiet slot) ----------
     let t0 = Instant::now();
@@ -493,9 +535,9 @@ fn lifecycle() {
     wait_until_succeeds(Node::Worker, no_build_cgroups, 60);
 
     // --- stopping the worker mid-build leaves the build running -----------
-    // KillMode=process. The hub fails the job while no capable worker
-    // is connected, so the client retries until the resubmission
-    // dedupes onto the surviving build.
+    // KillMode=process. The hub holds the job while no capable worker
+    // is connected and hands it back to the restarted worker by key.
+    // The retry loop only matters if the client fails anyway.
     let adopted = count(Node::Worker, "tribuchet-worker", "adopted running build");
     succeed(
         Node::Hub,

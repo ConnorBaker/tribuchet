@@ -468,9 +468,11 @@ mod tests {
             tmp_dir_pack: Arc::new(Vec::new()),
             features: vec![],
             replay: Arc::new(Replay::default()),
-            listing: Mutex::default(),
+            listing: Arc::default(),
             attempts: 0,
+            resumed_losses: 0,
             queued_at: Instant::now(),
+            loss: None,
         };
         state.queue.lock().await.push_back(job("x86_64-linux"));
         state.queue.lock().await.push_back(job("x86_64-linux"));

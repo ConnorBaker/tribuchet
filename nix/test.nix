@@ -4,13 +4,39 @@
 {
   tribuchet,
   nixosModule,
-  # "builds", "nspawn" or "lifecycle": independent derivations
-  # instead of one long serial run, and only nspawn seeds the ~900 MB
-  # container closure into the VM stores.
+  # "builds", "nspawn", "lifecycle", or one whose tests are
+  # crates/tribuchet/tests/e2e/PHASE.rs and whose additions to the nodes,
+  # if any, tests/phase-PHASE.nix: independent derivations instead of one
+  # long serial run, and only nspawn seeds the ~900 MB container closure
+  # into the VM stores.
   phase,
 }:
-{ pkgs, lib, ... }:
+{
+  pkgs,
+  lib,
+  nodes,
+  ...
+}:
 let
+  upstreamPhase = lib.elem phase [
+    "builds"
+    "nspawn"
+    "lifecycle"
+  ];
+  phaseNodes =
+    let
+      f = ./tests + "/phase-${phase}.nix";
+    in
+    if builtins.pathExists f then import f { inherit pkgs lib tribuchet; } else { };
+  # one agent socket per agent: per core with agents = "auto"
+  agents =
+    let
+      w = nodes.worker;
+    in
+    if w.services.tribuchet-worker.agents == "auto" then
+      w.virtualisation.cores
+    else
+      w.services.tribuchet-worker.agents;
   # evaluated here so the container closure can be pre-seeded into both
   # VM stores; the hub re-evaluates the same expression at test time
   nspawn = import ./nspawn-container.nix { nixpkgs = pkgs.path; };
@@ -20,6 +46,16 @@ let
     pkgs.stdenvNoCC
     nspawn.toplevel
   ];
+  # A phase whose filter matches no test fails before any VM boots,
+  # instead of passing with "0 passed".
+  listed = lib.optionalString (!upstreamPhase) ''
+    import subprocess
+    listed = subprocess.run(
+        ["${tribuchet.e2eTests}/bin/tribuchet-e2e", "${phase}::", "--list"],
+        check=True, capture_output=True, text=True,
+    ).stdout
+    assert ": test\n" in listed, "no e2e test matches ${phase}::"
+  '';
 
 in
 {
@@ -165,8 +201,12 @@ in
         environment.etc."tt/reload.nix".text = ''
           import ${./tests/reload.nix} { bash = "${pkgs.bash}"; }
         '';
-        environment.etc."tt/cancel.nix".text = ''
-          import ${./tests/cancel.nix} { bash = "${pkgs.bash}"; }
+        environment.etc."tt/kept.nix".text = ''
+          import ${./tests/cancel.nix} {
+            bash = "${pkgs.bash}";
+            name = "kept";
+            seconds = 150;
+          }
         '';
         environment.etc."tt/stop.nix".text = ''
           import ${./tests/stop.nix} { bash = "${pkgs.bash}"; }
@@ -198,7 +238,10 @@ in
           }
         '';
 
-        imports = [ nixosModule ];
+        imports = [
+          nixosModule
+          (phaseNodes.hub or { })
+        ];
         services.tribuchet-hub = {
           enable = true;
           # keep the no-worker decline quick for the fallback subtest
@@ -254,7 +297,10 @@ in
         virtualisation.cores = 2;
         virtualisation.additionalPaths = nspawnPaths;
 
-        imports = [ nixosModule ];
+        imports = [
+          nixosModule
+          (phaseNodes.worker or { })
+        ];
         services.tribuchet-worker = {
           enable = true;
           package = tribuchet;
@@ -285,6 +331,7 @@ in
   };
 
   testScript = ''
+    ${listed}
     start_all()
     hub.wait_for_unit("multi-user.target")
     worker.wait_for_unit("multi-user.target")
@@ -308,8 +355,10 @@ in
         hub.succeed("systemctl start tribuchet-hub")
         worker.succeed("systemctl start tribuchet-worker")
         # agents = "auto": the generator made one agent socket per core
-        worker.succeed("systemctl is-active tribuchet-agent@1.socket tribuchet-agent@2.socket")
-        worker.fail("systemctl is-active tribuchet-agent@3.socket")
+        worker.succeed(
+            "systemctl is-active tribuchet-agent@1.socket tribuchet-agent@${toString agents}.socket"
+        )
+        worker.fail("systemctl is-active tribuchet-agent@${toString (agents + 1)}.socket")
         hub.wait_until_succeeds(
             "journalctl -u tribuchet-hub | grep -q 'worker registered'"
         )
@@ -354,6 +403,13 @@ in
     with subtest("NixOS container build"):
         subprocess.run(
             [e2e, "build_nspawn", "--nocapture"],
+            env=e2e_env, check=True,
+        )
+  ''
+  + lib.optionalString (!upstreamPhase) ''
+    with subtest("${phase}"):
+        subprocess.run(
+            [e2e, "${phase}::", "--nocapture", "--test-threads=1"],
             env=e2e_env, check=True,
         )
   ''

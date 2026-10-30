@@ -73,7 +73,6 @@ pub struct HubConfig {
     /// (re)serve before declining (lets a patched Nix fall back to a
     /// local build). Covers the startup re-registration window and a
     /// worker's reconnect window; a never-seen platform declines at
-    /// once.
     #[serde(default = "default_worker_grace_secs")]
     pub worker_grace_secs: u64,
     /// Optional address (e.g. 127.0.0.1:7438) for the Prometheus
@@ -105,13 +104,18 @@ fn default_chunk_cache_bytes() -> u64 {
     10 << 30
 }
 
-/// XDG_CACHE_HOME/tribuchet/chunks with the usual ~/.cache fallback.
-pub fn default_chunk_cache_dir() -> PathBuf {
-    let base = env::var_os("XDG_CACHE_HOME")
+/// XDG_CACHE_HOME/tribuchet with the usual ~/.cache fallback.
+fn cache_dir() -> PathBuf {
+    env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
         .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".cache")))
-        .unwrap_or_else(|| PathBuf::from("/var/cache"));
-    base.join("tribuchet").join("chunks")
+        .unwrap_or_else(|| PathBuf::from("/var/cache"))
+        .join("tribuchet")
+}
+
+/// XDG_CACHE_HOME/tribuchet/chunks.
+pub fn default_chunk_cache_dir() -> PathBuf {
+    cache_dir().join("chunks")
 }
 
 /// A hub-maintained nix.conf fragment. A local nix.conf `include`s the

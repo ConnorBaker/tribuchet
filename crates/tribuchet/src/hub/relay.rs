@@ -1,30 +1,30 @@
 //! Per-job protocol with a worker: input staging, output relay and verification.
 
+mod daemon;
 mod extras;
 mod outputs;
 mod serve;
 mod staging;
+pub(super) use daemon::{ANSWER as DAEMON_ANSWER, Evidence as DaemonEvidence};
 use outputs::{deliver_outputs, parse_extras, verify_set};
 pub(super) use staging::WorkerSession;
 use staging::{Staging, stream_tmp_dir};
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tonic::Status;
 
+use super::cancel;
+use super::losses::Dispatch;
 use super::metrics::Metrics;
+use super::naming::drv_name;
 use super::state::{HubState, Job, Replay};
-use crate::errors::{Result, err_msg};
+use crate::errors::{Error, Result, err_msg};
 use crate::proto::{
-    BuildAssignment, BuildResult, CancelBuild, HubMessage, ResultAck, attach_event, hub_message,
-    worker_message,
+    BuildAssignment, BuildResult, HubMessage, ResultAck, attach_event, hub_message, worker_message,
 };
-
-/// How long a dispatched build may run with no attach client listening
-/// before the hub cancels it on the worker.
-const CANCEL_GRACE: Duration = Duration::from_secs(10);
 
 pub(super) async fn send(
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
@@ -37,18 +37,19 @@ pub(super) async fn send(
 }
 
 /// Drive one dispatched build to its verdict. A failed build is not an `Err`.
+/// knows as `worker`, in session `session`. A failed build is not an
+/// `Err`.
 pub(super) async fn run_job(
     state: &HubState,
     job: &Job,
-    out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
+    (out_tx, worker, session): (&mpsc::Sender<Result<HubMessage, Status>>, &str, u64),
     mut in_rx: mpsc::Receiver<worker_message::Msg>,
     sess: Arc<WorkerSession>,
-    dispatched: &mut bool,
+    dispatch: &mut Dispatch,
 ) -> Result<()> {
     let req = &job.req;
     let mut staging = Staging::new(state, job, &sess);
     let inputs = staging.assignment_inputs().await?;
-    *dispatched = true;
     send(
         out_tx,
         hub_message::Msg::Assignment(BuildAssignment {
@@ -68,11 +69,14 @@ pub(super) async fn run_job(
         }),
     )
     .await?;
+    dispatch.sent = true;
 
     stream_tmp_dir(&job.id, &job.tmp_dir_pack, out_tx).await?;
 
-    let mut abandoned_since: Option<Instant> = None;
     let mut cancel_sent = false;
+    let given_up = state.given_up(&job.id);
+    // The worker's heartbeats when it said it holds the build already.
+    let mut resumed_after = None;
     // An interval, not a per-iteration sleep: a build that logs
     // continuously must not starve the abandonment check.
     let mut abandon_check = tokio::time::interval(Duration::from_secs(2));
@@ -84,23 +88,19 @@ pub(super) async fn run_job(
                 r?;
                 continue;
             }
-            _ = abandon_check.tick(), if !cancel_sent => {
-                if job.replay.has_subscribers().await {
-                    abandoned_since = None;
-                } else if abandoned_since.get_or_insert_with(Instant::now).elapsed()
-                    > CANCEL_GRACE
-                {
-                    tracing::info!(id = job.id, "no attach client left; cancelling build");
-                    job.unlist();
-                    send(
-                        out_tx,
-                        hub_message::Msg::Cancel(CancelBuild {
-                            build_id: job.id.clone(),
-                            dedupe_key: job.key.clone(),
-                        }),
-                    )
-                    .await?;
-                    cancel_sent = true;
+            () = given_up.cancelled(), if !cancel_sent => {
+                tracing::info!(id = job.id, "no attach client left; cancelling build");
+                cancel(out_tx, job).await?;
+                cancel_sent = true;
+                continue;
+            }
+            _ = abandon_check.tick() => {
+                if resumed_after.is_some_and(|n| state.unlisted(session, &job.key, n)) {
+                    tracing::warn!(id = job.id, "the worker no longer lists the build it resumed");
+                    return Err(Error::Unlisted);
+                }
+                if cancel_sent && state.superseded(&job.id) {
+                    return Err(Error::Superseded);
                 }
                 continue;
             }
@@ -110,18 +110,25 @@ pub(super) async fn run_job(
             // The worker already holds this build (it survived a hub
             // restart). Its result arrives like any other.
             worker_message::Msg::Resumed(_) => {
+                dispatch.resumed = true;
+                resumed_after = Some(state.heartbeats(session));
                 tracing::info!(id = job.id, "worker resumed an in-flight build");
             }
             worker_message::Msg::Log(l) => {
                 job.replay.publish(attach_event::Event::Log(l.data)).await;
             }
-            worker_message::Msg::Need(n) => staging.handle_need(n, out_tx).await?,
+            worker_message::Msg::Need(n) => {
+                dispatch.staged = true;
+                staging.handle_need(n, out_tx).await?;
+            }
             worker_message::Msg::Result(res) => {
                 if let Some(u) = &res.usage {
                     state.metrics.observe_usage(&job.req.system, u);
                     tracing::info!(
                         id = job.id,
                         key = job.key,
+                        drv = drv_name(&job.req).unwrap_or_default(),
+                        worker,
                         exit_code = res.exit_code,
                         wall_ms = u.wall_ms,
                         cpu_usec = u.cpu_usec,

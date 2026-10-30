@@ -3,6 +3,7 @@
 //! chunks, verifying every chunk's BLAKE3 against the recipe.
 
 use std::collections::{BTreeMap, HashSet};
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 use tokio::task::spawn_blocking;
@@ -11,23 +12,22 @@ use tonic::Status;
 use super::extras::{ExtraImport, start_extra};
 use super::{msg_name, recv, send};
 use crate::chunker::{Recipe, decode_chunk, parse_recipe};
-use crate::chunkstore::{Hash, PinGuard};
+use crate::chunkstore::Hash;
 use crate::errors::{Result, err_ctx, err_msg};
 use crate::hub::chunkcache::ChunkCache;
-use crate::hub::state::{HubState, Job};
+use crate::hub::state::{HubState, Job, KeptOutputs};
 use crate::proto::{
     HubMessage, Manifest, Need, OutputNar, attach_event, hub_message, worker_message,
 };
-use std::sync::Arc;
 
 pub(super) struct Announced {
     store_path: String,
-    recipe: Recipe,
+    recipe: Arc<Recipe>,
 }
 
 impl Announced {
     fn new(store_path: String, hashes: &[u8], sizes: &[u64]) -> Result<Self> {
-        let recipe = parse_recipe(&store_path, hashes, sizes)?;
+        let recipe = Arc::new(parse_recipe(&store_path, hashes, sizes)?);
         Ok(Self { store_path, recipe })
     }
 }
@@ -75,7 +75,6 @@ pub(super) fn parse_extras(reported: Vec<Manifest>) -> Result<Vec<(Announced, Ma
 struct ChunkSource<'a> {
     cache: &'a Arc<ChunkCache>,
     needed: HashSet<Hash>,
-    _pin: PinGuard,
     in_rx: &'a mut mpsc::Receiver<worker_message::Msg>,
 }
 
@@ -138,10 +137,18 @@ pub(super) async fn deliver_outputs(
         outputs
             .iter()
             .chain(extras.iter().map(|(a, _)| a))
-            .flat_map(|a| &a.recipe)
+            .flat_map(|a| a.recipe.iter())
     };
     let cache = &state.chunks;
+    // Held by the replay, past this delivery when a client missed it.
     let pin = cache.pin(all().map(|(h, _)| *h));
+    let kept = outputs
+        .iter()
+        .map(|a| (a.store_path.clone(), a.recipe.clone()))
+        .collect();
+    job.replay
+        .keep_outputs(KeptOutputs::new(state.chunks.clone(), kept, pin))
+        .await;
     let mut needed = HashSet::new();
     let mut hashes = Vec::new();
     for (h, _) in all() {
@@ -167,11 +174,10 @@ pub(super) async fn deliver_outputs(
     let mut src = ChunkSource {
         cache,
         needed,
-        _pin: pin,
         in_rx,
     };
     for a in &outputs {
-        for (hash, size) in &a.recipe {
+        for (hash, size) in a.recipe.iter() {
             let frame = src.get(hash, *size).await?;
             job.replay
                 .publish(attach_event::Event::Output(OutputNar {
@@ -187,21 +193,6 @@ pub(super) async fn deliver_outputs(
                 zstd_nar_chunk: Vec::new(),
                 eof: true,
             }))
-            .await;
-    }
-    for (a, e) in extras {
-        let ExtraImport { tx, task } = start_extra(state, e)?;
-        for (hash, size) in &a.recipe {
-            let frame = src.get(hash, *size).await?;
-            if tx.send(frame.into()).await.is_err() {
-                break;
-            }
-        }
-        drop(tx);
-        // The daemon checks nar_sha256 against the bytes it imported.
-        task.await??;
-        job.replay
-            .publish(attach_event::Event::AddedPath(a.store_path))
             .await;
     }
     src.finish().await

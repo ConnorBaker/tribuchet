@@ -8,9 +8,9 @@
 //! - reads input store paths directly from local disk
 //! - verifies output chunks against their manifest while relaying
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -23,30 +23,36 @@ use crate::proto::worker_hub_server::WorkerHub;
 use crate::tailscale;
 
 use crate::proto::{
-    CancelBuild, HubMessage, Register, WorkerMessage, attach_event, hub_message, worker_message,
+    CancelBuild, HubMessage, Register, RequestJob, WorkerMessage, attach_event, hub_message,
+    worker_message,
 };
 
 mod chunkcache;
 #[cfg(test)]
 pub(crate) use chunkcache::ChunkCache;
+mod losses;
 mod metrics;
+mod naming;
+mod placement;
 mod relay;
 mod serve;
 mod state;
 mod submit;
+#[cfg(test)]
+mod testlog;
 pub use serve::run;
 
-use crate::errors::{Result, chain};
+use crate::errors::{Error, Result, chain};
+use losses::Dispatch;
 use metrics::Metrics;
 use relay::{WorkerSession, run_job, send};
-use state::{HubState, Job, WorkerCaps};
+use state::{Holding, HubState, Job, WorkerCaps};
+use std::mem;
 
 /// No worker message for this long tears the session down and fails
 /// its builds: heartbeats flow every 30s, so silence means a dead
 /// worker that would otherwise pin its builds (and dedupe keys) forever.
 const WORKER_SILENCE_TIMEOUT: Duration = Duration::from_mins(3);
-/// A worker-session loss requeues a job at most this many times.
-const MAX_JOB_ATTEMPTS: u32 = 3;
 
 /// In tailscale mode the hub asks tailscaled who the peer is on every
 /// session and uses that as the worker name; mTLS mode trusts the
@@ -87,7 +93,7 @@ impl CapsGuard {
 impl Drop for CapsGuard {
     fn drop(&mut self) {
         self.state.worker_caps.lock().unwrap().remove(&self.id);
-        self.state.held.lock().unwrap().remove(&self.id);
+        self.state.holding.lock().unwrap().remove(&self.id);
         self.state.regen_nix_config();
         // Remember the platform so a build for it briefly waits for the
         // worker to reconnect instead of declining immediately.
@@ -125,6 +131,36 @@ impl Router {
     }
 }
 
+/// What the hub may still send one worker session. The worker alone
+/// decides its capacity; the hub only takes off the assignments it sent
+/// that a declaration had not counted yet.
+#[derive(Default)]
+struct Admission {
+    /// Left of the worker's last declaration.
+    free: u32,
+    /// Builds handed to this session, each sent as one assignment.
+    sent: u64,
+    /// The last declaration as received, for the dispatch log.
+    capacity: u32,
+    assignments: Option<u64>,
+}
+
+impl Admission {
+    /// A declaration replaces the count, less what it had not seen.
+    /// A worker predating `assignments` sends none and its value
+    /// stands as is, as before.
+    fn declare(&mut self, r: &RequestJob) {
+        self.capacity = r.capacity;
+        self.assignments = r.assignments;
+        let unseen = r
+            .assignments
+            .map_or(0, |seen| self.sent.saturating_sub(seen));
+        self.free = r
+            .capacity
+            .saturating_sub(u32::try_from(unseen).unwrap_or(u32::MAX));
+    }
+}
+
 fn msg_build_id(msg: &worker_message::Msg) -> Option<&str> {
     match msg {
         worker_message::Msg::Log(l) => Some(&l.build_id),
@@ -143,7 +179,7 @@ fn msg_build_id(msg: &worker_message::Msg) -> Option<&str> {
 async fn route_loop(
     mut in_rx: mpsc::Receiver<WorkerMessage>,
     router: Router,
-    capacity: Arc<AtomicU32>,
+    admission: Arc<Mutex<Admission>>,
     state: Arc<HubState>,
     worker: u64,
 ) {
@@ -164,13 +200,24 @@ async fn route_loop(
             .metrics
             .count_msg(relay::msg_name(&m), m.encoded_len());
         if let worker_message::Msg::RequestJob(r) = &m {
-            capacity.store(r.capacity, Ordering::SeqCst);
+            let free = {
+                let mut a = admission.lock().unwrap();
+                a.declare(r);
+                a.free
+            };
+            // Several per build: debug, the dispatch line carries the last.
+            tracing::debug!(
+                session = worker,
+                capacity = r.capacity,
+                assignments = r.assignments,
+                free,
+                "capacity declared"
+            );
             state.notify.notify_waiters();
             continue;
         }
         if let worker_message::Msg::Heartbeat(h) = &m {
-            let keys: HashSet<String> = h.resumable_keys.iter().cloned().collect();
-            state.held.lock().unwrap().insert(worker, keys);
+            state.hold(worker, h.resumable_keys.iter().cloned().collect(), true);
         }
         let Some(id) = msg_build_id(&m).map(str::to_string) else {
             continue;
@@ -275,37 +322,44 @@ async fn worker_loop(
     // with these keys go to it regardless of capacity (their slots are
     // already occupied by them).
     let worker_id = caps_guard.id;
+    state.hold(
+        worker_id,
+        register.resumable_keys.iter().cloned().collect(),
+        false,
+    );
+    let admission = Arc::new(Mutex::new(Admission::default()));
     state
-        .held
+        .placement
         .lock()
         .unwrap()
-        .insert(worker_id, register.resumable_keys.iter().cloned().collect());
-    // The worker's last declared free capacity, decremented per
-    // dispatch until its next declaration replaces it.
-    let capacity = Arc::new(AtomicU32::new(0));
+        .open(worker_id, admission.clone());
     let mut route = tokio::spawn(route_loop(
         in_rx,
         router.clone(),
-        capacity.clone(),
+        admission.clone(),
         state.clone(),
         worker_id,
     ));
-    let sess = Arc::new(WorkerSession::new());
+    let sess = Arc::new(WorkerSession::new(register.worker_name.clone()));
 
     'outer: loop {
-        let job = loop {
+        let (job, resumed) = loop {
             if out_tx.is_closed() || route.is_finished() {
                 break 'outer;
             }
             // resumed builds already occupy their slot on the worker
             if let Some(job) = state.take_job_by_key(worker_id).await {
-                break job;
+                admission.lock().unwrap().sent += 1;
+                break (job, true);
             }
-            if capacity.load(Ordering::SeqCst) > 0
-                && let Some(job) = state.take_job(&caps, worker_id).await
+            let free = admission.lock().unwrap().free;
+            if free > 0
+                && let Some(job) = state.take_job(&caps).await
             {
-                capacity.fetch_sub(1, Ordering::SeqCst);
-                break job;
+                let mut a = admission.lock().unwrap();
+                a.free = a.free.saturating_sub(1);
+                a.sent += 1;
+                break (job, false);
             }
             // notify_waiters() wakes only current waiters; the timeout
             // closes the race between checking the queue and awaiting.
@@ -315,11 +369,7 @@ async fn worker_loop(
                 _ = &mut route => break 'outer,
             }
         };
-        tracing::info!(
-            id = job.id,
-            worker = register.worker_name,
-            "dispatching build"
-        );
+        placement::dispatch(&register.worker_name, &job, resumed, &admission);
         // Tell the attach client where its build runs.
         job.replay
             .publish(attach_event::Event::Dispatched(
@@ -337,61 +387,179 @@ async fn worker_loop(
             out_tx.clone(),
             in_rx,
             sess.clone(),
+            (worker_id, register.worker_name.clone()),
+            admission.clone(),
         ));
     }
     // Builds in flight fail through their closed router channels.
     route.abort();
     router.close_all();
+    state.placement.lock().unwrap().close(worker_id);
     drop(caps_guard);
-    state.fail_unservable().await;
+    state.hold_unservable().await;
     Metrics::inc(&state.metrics.disconnected);
     tracing::info!(worker = register.worker_name, "worker disconnected");
 }
 
+/// The loss of a build with the session of the worker that ran it. The
+/// worker likely still runs it and re-registers shortly: until `until`,
+/// the build is kept for it. A worker that said it no longer has the
+/// build gets no grace; its loss is still the next dispatch's to settle.
+struct Loss {
+    /// Name the worker registers with, the identity a reconnect keeps.
+    worker: String,
+    /// Id of the session that died.
+    session: u64,
+    until: Instant,
+}
+
+impl Loss {
+    /// Within the grace and the worker is not back. Back means
+    /// registered with its held keys: from then on those route the job.
+    fn awaited(&self, workers: &HashMap<u64, WorkerCaps>, holding: &HashMap<u64, Holding>) -> bool {
+        Instant::now() < self.until
+            && !workers.iter().any(|(id, c)| {
+                *id != self.session && c.name == self.worker && holding.contains_key(id)
+            })
+    }
+}
+
 /// Run one dispatched job and settle it: finish, requeue or fail.
+/// `worker` is the session's id and worker name.
 async fn supervise_job(
     state: Arc<HubState>,
-    job: Job,
+    mut job: Job,
     router: Router,
     out_tx: mpsc::Sender<Result<HubMessage, Status>>,
     in_rx: mpsc::Receiver<worker_message::Msg>,
     sess: Arc<WorkerSession>,
+    worker: (u64, String),
+    admission: Arc<Mutex<Admission>>,
 ) {
     let _running = state.metrics.running(&job.req.system);
-    let mut dispatched = false;
-    let res = run_job(&state, &job, &out_tx, in_rx, sess, &mut dispatched).await;
+    let dispatch_listed = state.list_dispatch(&job, worker.0);
+    let mut dispatch = Dispatch::default();
+    let res = run_job(
+        &state,
+        &job,
+        (&out_tx, &worker.1, worker.0),
+        in_rx,
+        sess,
+        &mut dispatch,
+    )
+    .await;
+    // Before a requeue lists the build again elsewhere.
+    drop(dispatch_listed);
+    let dispatched = dispatch.sent;
     router.unregister(&job.id);
+    if !dispatched {
+        // The worker will never count an assignment that was not sent.
+        let mut a = admission.lock().unwrap();
+        a.sent = a.sent.saturating_sub(1);
+    }
     // run_job counts the build verdict. Only session/hub-side errors
     // reach the branches below.
     let Err(err) = res else {
         state.finish(&job).await;
         return;
     };
+    // A worker that no longer lists a build it resumed lost it as much
+    // as one whose session died, though the session lives on.
+    let unlisted = matches!(err, Error::Unlisted);
+    let session_dead = unlisted || router.is_closed() || out_tx.is_closed();
+    if matches!(err, Error::Superseded) {
+        // Its worker delivers to the dispatch that took its key over.
+        tracing::info!(
+            id = job.id,
+            "given up and taken over by a later dispatch of its key"
+        );
+        state.finish(&job).await;
+        return;
+    }
+    if matches!(err, Error::GivenUp) {
+        // Its clients left while it waited on the hub's daemon. Nobody
+        // gets a verdict: a client resubmitting just now would get a
+        // stream that ends without one, and resubmit again.
+        tracing::info!(id = job.id, "no attach client left; giving the build up");
+        let _ = cancel(&out_tx, &job).await;
+        state.finish(&job).await;
+        return;
+    }
     let err = chain(&err);
-    // Neither a dead session nor a failure before the worker saw the
-    // assignment is a build verdict: requeue so this worker (by dedupe
-    // key) or another one picks it up.
-    let session_dead = router.is_closed() || out_tx.is_closed();
-    if (session_dead || !dispatched) && job.attempts < MAX_JOB_ATTEMPTS {
+    if !dispatched && session_dead {
+        // The worker never got the assignment: no loss to count, and
+        // any loss pending from before is still pending.
+        tracing::warn!(id = job.id, "assignment not sent, requeueing build: {err}");
+        Metrics::inc(&state.metrics.requeued);
+        state.requeue(job).await;
+        return;
+    }
+    if !dispatched {
+        // The hub could not prepare the assignment: its own failure,
+        // never a loss of the worker's (an input it does not have, or
+        // that its daemon refused). A worker that took the build back by
+        // key runs it already: cancel that.
+        let _ = cancel(&out_tx, &job).await;
+        if job.replay.has_subscribers().await {
+            tracing::warn!(id = job.id, "build failed before dispatch: {err}");
+            Metrics::inc(&state.metrics.failed);
+            job.replay.publish(attach_event::Event::Error(err)).await;
+        } else {
+            tracing::info!(id = job.id, "dropping build before dispatch: {err}");
+        }
+        state.finish(&job).await;
+        return;
+    }
+    // A dead session is no build verdict: requeue so this worker (by
+    // dedupe key) or another one picks it up.
+    if session_dead {
+        let Some(j) = losses::lost(&state, job, &dispatch).await else {
+            return;
+        };
+        job = j;
         tracing::warn!(id = job.id, "dispatch lost, requeueing build: {err}");
         Metrics::inc(&state.metrics.requeued);
+        // A worker restart drops the session but not the build: keep
+        // it for that worker until it re-registers, or the grace ends,
+        // instead of running it a second time elsewhere. One that said
+        // it no longer has it is waited for no longer; its next
+        // dispatch starts it over.
+        let (session, worker) = worker;
+        let grace = if unlisted {
+            Duration::ZERO
+        } else {
+            state.worker_grace
+        };
+        job.loss = Some(Loss {
+            worker,
+            session,
+            until: Instant::now() + grace,
+        });
         state.requeue(job).await;
     } else {
         tracing::warn!(id = job.id, "build failed: {err}");
         Metrics::inc(&state.metrics.failed);
         // The session is still up and may hold a half-staged or
         // running build for this id. Cancel frees that slot.
-        let _ = send(
-            &out_tx,
-            hub_message::Msg::Cancel(CancelBuild {
-                build_id: job.id.clone(),
-                dedupe_key: job.key.clone(),
-            }),
-        )
-        .await;
+        let _ = cancel(&out_tx, &job).await;
         job.replay.publish(attach_event::Event::Error(err)).await;
         state.finish(&job).await;
     }
 }
+
+/// Tell the worker to cancel `job`; Err if its session is gone. A worker
+/// that does not hold the build ignores it (worker/session.rs,
+/// handle_cancel).
+async fn cancel(out_tx: &mpsc::Sender<Result<HubMessage, Status>>, job: &Job) -> Result<()> {
+    send(
+        out_tx,
+        hub_message::Msg::Cancel(CancelBuild {
+            build_id: job.id.clone(),
+            dedupe_key: job.key.clone(),
+        }),
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests;
