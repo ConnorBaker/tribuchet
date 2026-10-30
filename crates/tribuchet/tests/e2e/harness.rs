@@ -284,6 +284,26 @@ pub fn fetch(node: Node, path: &str) -> String {
     fs::read_to_string(format!("{}/{name}", env("TT_SHARED"))).unwrap()
 }
 
+/// Runs `cmd` on the hub in the background as the unit `unit`: its output
+/// in /tmp/`unit`.out, its pid in .pid, its exit status in .rc.
+pub fn submit(unit: &str, cmd: &str) {
+    succeed(
+        Node::Hub,
+        &format!(
+            "systemd-run --unit={unit} bash -lc '{cmd} > /tmp/{unit}.out 2>&1 & echo $! > /tmp/{unit}.pid; \
+             rc=0; wait $! || rc=$?; echo $rc > /tmp/{unit}.rc'"
+        ),
+    );
+}
+
+/// The exit status of `submit`'s `unit`, once it ended, within `secs`.
+pub fn ended(unit: &str, secs: u64) -> String {
+    wait_until_succeeds(Node::Hub, &format!("test -s /tmp/{unit}.rc"), secs);
+    succeed(Node::Hub, &format!("cat /tmp/{unit}.rc"))
+        .trim()
+        .to_owned()
+}
+
 pub fn build_grep(nixfile: &str, needle: &str) {
     let out = succeed(Node::Hub, &format!("nix-build {nixfile} --no-out-link"));
     let out = out.trim();
