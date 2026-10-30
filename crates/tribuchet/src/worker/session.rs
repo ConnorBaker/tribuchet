@@ -82,7 +82,7 @@ pub(super) async fn session(opts: &WorkerConfig, ctx: &Arc<WorkerCtx>) -> Result
         &mut active,
         &out_tx,
         ctx,
-        Duration::from_secs(opts.build_timeout_secs),
+        Duration::from_secs(opts.build_timeout_secs.get()),
         opts.max_jobs.max(1),
     )
     .await;

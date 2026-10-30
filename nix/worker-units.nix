@@ -28,6 +28,27 @@ let
       --uid-base "$(( ${toString agentUidBase} + ($1 - 1) * 65536 ))" \
       --worker-uid "$(${lib.getExe' pkgs.coreutils "id"} -u tribuchet)"
   '';
+  # The worker's ExecStopPost: thaw every frozen build cgroup of this
+  # worker's agents, whoever froze it, even on a host where the arbiter is
+  # off. A build to keep frozen across a worker stop is
+  # frozen through its agent's unit (systemctl freeze), whose own
+  # cgroup.freeze this leaves alone.
+  thawBuilds = pkgs.writeShellScript "${workerUnit}-thaw-builds" ''
+    systemctl=${lib.getExe' pkgs.systemd "systemctl"}
+    "$systemctl" list-units --all --plain --no-legend --type=service '${agentUnit}*.service' |
+      while read -r unit _; do
+        cg=$("$systemctl" show -P ControlGroup "$unit") && [ -n "$cg" ] || continue
+        for f in "/sys/fs/cgroup$cg"/build-*/cgroup.freeze; do
+          [ -e "$f" ] && read -r v <"$f" && [ "$v" = 1 ] || continue
+          if echo 0 >"$f"; then
+            echo "thawed ''${f%/cgroup.freeze} after the worker stopped"
+          else
+            echo "could not thaw ''${f%/cgroup.freeze}" >&2
+          fi
+        done
+      done
+    exit 0
+  '';
 in
 {
   # Not under a RuntimeDirectory: systemd creates the socket parents and
@@ -109,6 +130,7 @@ in
       User = "tribuchet";
       WatchdogSec = "30";
       ExecStart = "${lib.getExe' package "tribuchet"} worker --config ${workerToml}";
+      ExecStopPost = "+${thawBuilds}";
       # Running builds live in the agent services and are re-adopted by
       # the next worker instance.
       StateDirectory = "tribuchet/worker";

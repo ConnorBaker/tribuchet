@@ -80,9 +80,29 @@ pub fn remove_path_all(path: &Path) {
     }
 }
 
+/// The number after `key`, a line's first word, in a file of "key value"
+/// lines: cgroup stat files, /proc/meminfo, /proc/<pid>/status.
+pub fn stat_field(text: &str, key: &str) -> Option<u64> {
+    text.lines().find_map(|l| {
+        let mut words = l.split_whitespace();
+        (words.next()? == key).then(|| words.next()?.parse().ok())?
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_stat_field_is_the_number_after_its_whole_key() {
+        let text = "file_mapped 9\nfile 7\nMemAvailable:    2048 kB\nUid:\t1000\t1001\nbad x\n";
+        assert_eq!(stat_field(text, "file"), Some(7));
+        assert_eq!(stat_field(text, "MemAvailable:"), Some(2048));
+        assert_eq!(stat_field(text, "Uid:"), Some(1000));
+        for key in ["fil", "MemAvailable", "bad", "absent"] {
+            assert_eq!(stat_field(text, key), None, "{key}");
+        }
+    }
 
     #[test]
     fn force_remove_read_only_tree() {

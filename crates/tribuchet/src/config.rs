@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::thread;
 
@@ -185,10 +186,13 @@ pub struct WorkerConfig {
     #[serde(default = "default_key")]
     pub key: PathBuf,
     /// Kill builds running longer than this many seconds.
+    /// does not count, nor does time frozen by the CPU arbiter. 0 is
+    /// refused at load, not taken as none.
     #[serde(default = "default_build_timeout")]
-    pub build_timeout_secs: u64,
+    pub build_timeout_secs: NonZeroU64,
     /// Kill builds producing no log output for this many seconds
-    /// (Nix's max-silent-time); 0 disables.
+    /// (Nix's max-silent-time), not counting time frozen by the CPU
+    /// arbiter; 0 disables.
     #[serde(default)]
     pub max_silent_time_secs: u64,
     /// Kill builds whose log exceeds this many bytes (Nix's
@@ -281,8 +285,8 @@ fn default_cert() -> PathBuf {
 fn default_key() -> PathBuf {
     "/var/lib/tribuchet/tls/worker.key".into()
 }
-fn default_build_timeout() -> u64 {
-    24 * 3600
+fn default_build_timeout() -> NonZeroU64 {
+    NonZeroU64::new(24 * 3600).unwrap()
 }
 fn default_import_jobs() -> u32 {
     4
@@ -325,7 +329,7 @@ mod tests {
         .unwrap();
         assert_eq!(cfg.hub, "https://hub:7437");
         assert_eq!(cfg.max_jobs, 2);
-        assert_eq!(cfg.build_timeout_secs, 24 * 3600);
+        assert_eq!(cfg.build_timeout_secs.get(), 24 * 3600);
         assert_eq!(cfg.state_dir, PathBuf::from("/var/lib/tribuchet/worker"));
         assert_eq!(
             cfg.emulate.get("aarch64-linux"),

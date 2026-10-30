@@ -40,6 +40,13 @@ pub struct BuildJson {
     /// Output name -> scratch store path. The same scratch paths must be
     /// populated on the client; Nix rewrites and registers them afterwards.
     pub outputs: BTreeMap<String, String>,
+    /// Nix's timeout and max-silent-time, 0 for none, which Nix leaves to
+    /// the external builder (nix/patches/external-builders-timeouts.patch);
+    /// absent, Nix enforces them itself.
+    #[serde(default)]
+    pub timeout: u64,
+    #[serde(default)]
+    pub max_silent_time: u64,
 }
 
 impl BuildJson {

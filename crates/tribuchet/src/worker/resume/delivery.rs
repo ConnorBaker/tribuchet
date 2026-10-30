@@ -111,6 +111,9 @@ pub(in crate::worker) struct Usage {
     pub(in crate::worker) cpu_usec: u64,
     pub(in crate::worker) peak_memory_bytes: u64,
     pub(in crate::worker) oom_killed: bool,
+    /// Of wall_ms; absent from a delivery persisted before it was kept.
+    #[serde(default)]
+    pub(in crate::worker) frozen_ms: u64,
 }
 
 impl From<sandbox_proto::agent::ExitNotice> for Usage {
@@ -120,6 +123,7 @@ impl From<sandbox_proto::agent::ExitNotice> for Usage {
             cpu_usec: n.cpu_usec,
             peak_memory_bytes: n.peak_memory_bytes,
             oom_killed: n.oom_killed,
+            frozen_ms: n.frozen_ms,
         }
     }
 }
@@ -131,6 +135,7 @@ impl From<Usage> for BuildUsage {
             cpu_usec: u.cpu_usec,
             peak_memory_bytes: u.peak_memory_bytes,
             oom_killed: u.oom_killed,
+            frozen_ms: u.frozen_ms,
         }
     }
 }

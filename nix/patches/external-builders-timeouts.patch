@@ -1,0 +1,37 @@
+From: Tribuchet contributors
+Subject: [PATCH] external builders: hand the build's timeouts to the builder
+
+An external builder runs the build elsewhere, as a remote builder does,
+and only it can tell the build's running time from the time it waits
+or is held stopped. Write `timeout` and `maxSilentTime` into build.json
+and leave them to the external builder, as Nix leaves them to a remote
+builder: do not count them against the external builder's wall time.
+
+diff --git a/src/libstore/build/derivation-building-goal.cc b/src/libstore/build/derivation-building-goal.cc
+index 295f986258..8aab0433ea 100644
+--- a/src/libstore/build/derivation-building-goal.cc
++++ b/src/libstore/build/derivation-building-goal.cc
+@@ -1020,7 +1020,9 @@ Goal::Co DerivationBuildingGoal::buildLocally(
+ 
+     actLock.reset();
+ 
+-    worker.childStarted(shared_from_this(), {builderOut}, true, true);
++    /* An external builder gets the build's timeouts in build.json and
++       enforces them itself, as a remote builder does. */
++    worker.childStarted(shared_from_this(), {builderOut}, true, !localBuildCap.externalBuilder);
+ 
+     started();
+ 
+diff --git a/src/libstore/unix/build/external-derivation-builder.cc b/src/libstore/unix/build/external-derivation-builder.cc
+index fc5358a1b8..7241c8307e 100644
+--- a/src/libstore/unix/build/external-derivation-builder.cc
++++ b/src/libstore/unix/build/external-derivation-builder.cc
+@@ -67,6 +67,8 @@ struct ExternalDerivationBuilder : DerivationBuilderImpl
+         json.emplace("storeDir", store.storeDir);
+         json.emplace("realStoreDir", store.config->realStoreDir.get());
+         json.emplace("system", drv.platform);
++        json.emplace("timeout", settings.getWorkerSettings().buildTimeout.get());
++        json.emplace("maxSilentTime", settings.getWorkerSettings().maxSilentTime.get());
+         {
+             auto l = nlohmann::json::array();
+             for (auto & i : inputPaths)

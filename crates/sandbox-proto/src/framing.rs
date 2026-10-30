@@ -86,7 +86,13 @@ fn recv_message<M: Message + Default>(sock: &UnixStream) -> Result<(M, Vec<Owned
     let (n, fds) = {
         let mut iov = [IoSliceMut::new(&mut len_buf)];
         let mut cmsg = RecvAncillaryBuffer::new(&mut cmsg_buf);
-        let msg = recvmsg(sock, &mut iov, &mut cmsg, RecvFlags::empty())
+        // Close-on-exec on Linux, so that no process the receiver spawns
+        // gets them (a freeze handle the worker holds included).
+        #[cfg(target_os = "linux")]
+        let flags = RecvFlags::CMSG_CLOEXEC;
+        #[cfg(not(target_os = "linux"))]
+        let flags = RecvFlags::empty();
+        let msg = recvmsg(sock, &mut iov, &mut cmsg, flags)
             .map_err(io::Error::from)
             .map_err(ioerr("receiving message"))?;
         let mut fds = Vec::new();
@@ -169,6 +175,7 @@ mod tests {
     use std::os::fd::AsRawFd;
     use std::thread;
 
+    /// Fds come through with the message, close-on-exec on Linux.
     #[test]
     fn call_roundtrip_with_fds() {
         let (a, b) = UnixStream::pair().unwrap();
@@ -186,6 +193,11 @@ mod tests {
         let (received, fds) = recv_call(&b).unwrap();
         assert_eq!(received, call::Call::Adopt(request));
         assert_eq!(fds.len(), 1);
+        #[cfg(target_os = "linux")]
+        {
+            let flags = rustix::io::fcntl_getfd(&fds[0]).unwrap();
+            assert!(flags.contains(rustix::io::FdFlags::CLOEXEC), "{flags:?}");
+        }
     }
 
     /// A message larger than one read buffer must be reassembled, and

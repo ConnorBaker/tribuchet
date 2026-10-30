@@ -76,6 +76,8 @@ async fn run_async(build: BuildJson, socket: PathBuf, build_json_path: PathBuf) 
         fixed_output,
         required_features,
         local_networking,
+        timeout_secs: build.timeout,
+        max_silent_secs: build.max_silent_time,
     };
     // Packed once and resent verbatim on every reconnect attempt.
     // Nix places everything the builder consumes in topTmpDir/build.

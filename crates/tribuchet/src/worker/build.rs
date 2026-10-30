@@ -457,6 +457,7 @@ mod tests {
             store_dir: "/nix/store".into(),
             fixed_output: false,
             inputs: vec![],
+            ..Default::default()
         }
     }
 

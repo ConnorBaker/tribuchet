@@ -152,6 +152,10 @@ message BuildAssignment {
   repeated Manifest inputs = 11;
   repeated string required_features = 12;
   bool local_networking = 13;
+  // BuildRequest's limits. The worker takes the lesser of each and its
+  // own; 0 (none, or from hubs predating the fields) leaves its own.
+  uint64 timeout_secs = 15;
+  uint64 max_silent_secs = 16;
 }
 
 message TmpDirArchive {
@@ -210,6 +214,9 @@ message BuildUsage {
   // censored when oom_killed.
   uint64 peak_memory_bytes = 3;
   bool oom_killed = 4;
+  // Of wall_ms, the time the build was frozen (by the worker's CPU
+  // arbiter, or anyone); 0 when unknown.
+  uint64 frozen_ms = 5;
 }
 
 // Local service between `tribuchet attach` and the hub, served on a unix
@@ -251,6 +258,11 @@ message BuildRequest {
   repeated string required_features = 10;
   // __darwinAllowLocalNetworking
   bool local_networking = 11;
+  // Nix's timeout and max-silent-time for the build, from build.json; 0
+  // is none. The worker counts them in the build's running time: not the
+  // time it waits for a worker or an agent, nor the time it is frozen.
+  uint64 timeout_secs = 12;
+  uint64 max_silent_secs = 13;
 }
 
 message AttachEvent {

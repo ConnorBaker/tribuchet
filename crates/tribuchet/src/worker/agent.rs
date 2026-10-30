@@ -13,7 +13,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::io::{Read, Write};
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -314,13 +314,14 @@ fn handle_start(
         (build_dir, exit, pid)
     };
     tracing::info!(id = req.build_id, pid, "builder started");
+    let freeze = platform::freeze_handle(&agent.confinement, &req.build_id, conn);
     framing::send_reply(
         conn,
         reply::Reply::Start(StartReply {
             pid,
             scratch_dir: build_dir.to_string_lossy().into_owned(),
         }),
-        &[],
+        &freeze.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>(),
     )?;
     notify_exit(conn, &exit)
 }
@@ -334,6 +335,7 @@ fn handle_adopt(agent: &Arc<Agent>, conn: &UnixStream, req: &AdoptRequest) -> Re
         }
     };
     let exit_code = exit.0.lock().unwrap().as_ref().map(|e| e.exit_code);
+    let freeze = platform::freeze_handle(&agent.confinement, &req.build_id, conn);
     framing::send_reply(
         conn,
         reply::Reply::Adopt(AdoptReply {
@@ -341,7 +343,7 @@ fn handle_adopt(agent: &Arc<Agent>, conn: &UnixStream, req: &AdoptRequest) -> Re
             scratch_dir: build_dir.to_string_lossy().into_owned(),
             exit_code,
         }),
-        &[],
+        &freeze.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>(),
     )?;
     notify_exit(conn, &exit)
 }
@@ -456,7 +458,7 @@ fn reap_on_exit(
             let _ = log.write_all(b"tribuchet: builder killed by the build memory limit\n");
         }
         let wall_ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
-        let (cpu_usec, peak_memory_bytes) = platform::usage(
+        let (cpu_usec, peak_memory_bytes, frozen_usec) = platform::usage(
             &agent.confinement,
             &build_id,
             reaped
@@ -470,6 +472,7 @@ fn reap_on_exit(
             cpu_usec,
             peak_memory_bytes,
             oom_killed,
+            frozen_ms: frozen_usec / 1000,
         });
         exit.1.notify_all();
     });

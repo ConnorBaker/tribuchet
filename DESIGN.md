@@ -228,6 +228,31 @@ clients are told once (`hub/relay/daemon.rs`):
 | a request the daemon drops as its journal says a worker crashed | 3 |
 | anything else: a drop or close with no such word in the journal, no answer within a minute, a silent daemon's included | ∞ |
 
+## CPU arbitration
+
+The worker's CPU arbiter (`worker/arbiter.rs`) is always on; nothing
+turns it off: where parallel builds each fill every CPU, it finishes
+the leader, and the builds on average, earlier, on less CPU. While the
+oldest parallel build (by its start, persisted with it, so the same
+after a worker restart; ties by key) keeps every CPU busy, the other
+parallel builds are frozen. No build is
+frozen more than 10 s in any 30 s, and builds stay frozen only while
+what they pin together (each its memory.current less its page cache;
+swap is no room) fits each capped cgroup's headroom and the host's
+MemAvailable (`worker/arbiter/memory.rs`). The worker freezes and thaws
+a build only through the write-only handle on its cgroup.freeze that
+the build's agent hands over with the lease; the file is the agent's
+(mode 0644), so neither the worker nor any build can open it to write.
+The agent thaws its build when the lease ends, however the worker ended
+it, and the worker unit's ExecStopPost thaws every build as root once
+the worker has exited, should an agent not. Frozen time, by the
+cgroup's own count, counts toward neither `build-timeout-secs` nor
+`max-silent-time-secs`, nor a client's `timeout` and `max-silent-time`,
+which reach the worker through Nix's build.json (patched Nix) and the
+hub, the lesser of the two applying.
+A kernel without that count (`frozen_usec`, before Linux 6.18) is
+reported at start, and nothing is frozen there.
+
 ## Known limitations (MVP)
 
 * Workers run up to `max-jobs` concurrent builds over one session.
@@ -249,6 +274,11 @@ clients are told once (`hub/relay/daemon.rs`):
   stays connected but reads nothing keeps its stream until it exits.
 * An output delivery fails its build when the hub's chunk cache cannot
   store or read back a chunk of it.
+* A freeze still counts against wall-clock timers the worker does not
+  own: a build's own (test drivers, watchdogs), and Nix's `timeout`
+  where Nix is not patched to leave it to the external builder.
+* The frozen builds' memory rule is a margin, not a bound: a leader that
+  grows faster than one 200 ms sample can still fill a capped slice.
 * Dedupe attaches duplicates to the first attempt, so a transient
   failure propagates to all attached submitters (same as Buck2's RE
   dedupe behaviour).
