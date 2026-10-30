@@ -59,7 +59,10 @@ message StartRequest {
   optional uint64 memory_max_bytes = 9;
 }
 
-// Attached fd 0 is a read handle on the build's log file.
+// Attached fd 0, where the build has a cgroup, is a write-only handle on
+// its cgroup.freeze: the worker freezes and thaws the build through it,
+// and the agent thaws the build when this connection ends. So does
+// AdoptReply's.
 message StartReply {
   int32 pid = 1;
   // The agent-owned scratch dir the build runs in (its cwd).
@@ -77,6 +80,9 @@ message ExitNotice {
   uint64 cpu_usec = 3;
   uint64 peak_memory_bytes = 4;
   bool oom_killed = 5;
+  // Of wall_ms, the time the build cgroup spent frozen (cgroup.stat.local
+  // frozen_usec, Linux 6.18+); 0 without one.
+  uint64 frozen_ms = 6;
 }
 
 // Reattach to the build after a worker restart.

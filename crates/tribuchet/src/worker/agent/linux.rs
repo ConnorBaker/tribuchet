@@ -38,7 +38,7 @@ use sandbox_proto::agent::StartRequest;
 
 use super::{Build, Options, cgroup, make_readable, msg, spawn_plain, stage_scratch};
 use crate::errors::{Error, Result, chain, err_ctx};
-use crate::fsutil::io_ctx;
+use crate::fsutil::{io_ctx, stat_field};
 use crate::netpolicy::NetPolicy;
 use crate::sd;
 use crate::worker::sandbox::{self, SandboxSpec};
@@ -193,6 +193,16 @@ pub(super) fn spawn_builder(
         sandbox::send_spec_to(&spec, w)?;
     }
     Ok((child, Some(spec.root)))
+}
+
+/// The handle on the build's cgroup.freeze the worker gets with `lease`
+/// (cgroup::freeze_handle); none where the build has no cgroup.
+pub(super) fn freeze_handle(
+    confinement: &Confinement,
+    build_id: &str,
+    lease: &UnixStream,
+) -> Option<fs::File> {
+    cgroup::freeze_handle(confinement.cgroup_base.as_ref()?, build_id, lease)
 }
 
 /// Per-build network forwarder: receive the tap fd the setup stage
@@ -451,13 +461,17 @@ pub(super) fn sample_memory() -> impl FnOnce() -> u64 {
     || 0
 }
 
-/// CPU microseconds and peak memory bytes of the build. The cgroup covers
-/// every process of the build. Only namespace builds have one, so a
-/// direct-exec build, or a host without a delegated cgroup, falls back to
-/// the reaped builder's rusage.
-pub(super) fn usage(confinement: &Confinement, build_id: &str, rusage: (u64, u64)) -> (u64, u64) {
+/// CPU microseconds, peak memory bytes and frozen microseconds of the
+/// build. The cgroup covers every process of the build. Only namespace
+/// builds have one, so a direct-exec build, or a host without a delegated
+/// cgroup, falls back to the reaped builder's rusage, and was never frozen.
+pub(super) fn usage(
+    confinement: &Confinement,
+    build_id: &str,
+    rusage: (u64, u64),
+) -> (u64, u64, u64) {
     let Some(base) = &confinement.cgroup_base else {
-        return rusage;
+        return (rusage.0, rusage.1, 0);
     };
     let u = cgroup::usage(&base.join(format!("build-{build_id}")));
     (
@@ -467,6 +481,7 @@ pub(super) fn usage(confinement: &Confinement, build_id: &str, rusage: (u64, u64
         } else {
             rusage.1
         },
+        u.frozen_usec,
     )
 }
 
@@ -475,13 +490,7 @@ pub(super) fn oom_killed(confinement: &Confinement, build_id: &str) -> bool {
     let Some(base) = &confinement.cgroup_base else {
         return false;
     };
-    fs::read_to_string(base.join(format!("build-{build_id}")).join("memory.events")).is_ok_and(
-        |events| {
-            events
-                .lines()
-                .any(|l| l.strip_prefix("oom_kill ").is_some_and(|n| n.trim() != "0"))
-        },
-    )
+    cgroup::oom_killed(&base.join(format!("build-{build_id}")))
 }
 
 /// Pids whose real uid is this uid, from /proc.
@@ -500,8 +509,7 @@ pub(super) fn own_uid_pids() -> Vec<i32> {
             if field("State:")?.trim_start().starts_with('Z') {
                 return None;
             }
-            let real: u32 = field("Uid:")?.split_whitespace().next()?.parse().ok()?;
-            (real == uid).then_some(pid)
+            (stat_field(&status, "Uid:")? == u64::from(uid)).then_some(pid)
         })
         .collect()
 }

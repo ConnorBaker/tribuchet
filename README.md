@@ -39,6 +39,15 @@ and owns transfer, scheduling and execution itself.
   destinations.
 - Live build logs across reloads and restarts, with `max-log-size`,
   `max-silent-time` and timeout enforcement.
+- A CPU arbiter, always on where the kernel counts each cgroup's frozen
+  time (Linux 6.18 or later): while the oldest parallel build keeps
+  every CPU busy, younger parallel builds are frozen, for at most 10 s
+  of any 30 s and only while what they pin together fits their memory
+  caps and the host's available memory; frozen time counts toward
+  neither `build-timeout-secs` and `max-silent-time-secs` nor a
+  client's `timeout` and `max-silent-time`. There is no setting to
+  turn it off;
+  DESIGN.md (CPU arbitration) says why.
 - NixOS and nix-darwin modules for both services, and an OCI worker
   image for hosts without Nix.
 

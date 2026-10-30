@@ -14,6 +14,7 @@ pub mod agent;
 #[cfg(target_os = "linux")]
 pub(crate) mod agent_spawn;
 mod agents;
+mod arbiter;
 pub mod binfmt;
 mod build;
 #[cfg(test)]
@@ -92,6 +93,7 @@ struct WorkerCtx {
     pub(super) recursive_nix: bool,
     /// The per-uid build agents, one leased per build.
     agents: agents::AgentPool,
+    arbiter: Arc<arbiter::Arbiter>,
     /// Dedupe keys of builds the hub cancelled; the supervising loops
     /// abort them. Keyed like the registry, since a resumed build's
     /// build_id changes while it runs.
@@ -105,24 +107,19 @@ struct WorkerCtx {
 
 impl WorkerCtx {
     /// Reason to abort a running build, evaluated each supervision
-    /// tick. Reads the log file (size for max-log-size, mtime for
-    /// max-silent-time): counters fed by a session-bound tailer freeze
-    /// when the hub session drops and would kill a healthy build.
-    /// `timed_out` carries the caller's deadline check (wall clock vs
-    /// the persisted unix deadline of an adopted build).
+    /// tick. Reads the log file's size for max-log-size, and takes the
+    /// caller's checks of its deadline (`timed_out`) and max-silent-time
+    /// (`silent`), both by its running time: counters fed by a
+    /// session-bound tailer freeze when the hub session drops and would
+    /// kill a healthy build.
     fn abort_reason(
         &self,
         dedupe_key: &str,
         log_path: &Path,
         timed_out: Option<String>,
+        silent: Option<String>,
     ) -> Option<String> {
-        let log = fs::metadata(log_path).ok();
-        let silent = log
-            .as_ref()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.elapsed().ok())
-            .unwrap_or_default();
-        let log_size = log.map_or(0, |m| m.len());
+        let log_size = fs::metadata(log_path).map_or(0, |m| m.len());
         if self.cancelled.lock().unwrap().remove(dedupe_key) {
             return Some("build cancelled".into());
         }
@@ -135,13 +132,7 @@ impl WorkerCtx {
                 self.max_log_size
             ));
         }
-        if !self.max_silent_time.is_zero() && silent > self.max_silent_time {
-            return Some(format!(
-                "build produced no output for {}s",
-                self.max_silent_time.as_secs()
-            ));
-        }
-        None
+        silent
     }
 
     fn resumable_keys(&self) -> Vec<String> {
@@ -379,6 +370,7 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         build_memory_max_bytes: opts.build_memory_max_bytes,
         recursive_nix: opts.recursive_nix,
         agents: agents::AgentPool::new(opts.agent_sockets.clone()),
+        arbiter: arbiter::Arbiter::new(),
     });
 
     // Ready once local setup is done, not once the hub answers: the
@@ -411,10 +403,10 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
     }
 }
 
-/// SIGTERM (unit stop or restart): exit immediately. All resumable
-/// state is already on disk and builds run in their own process
-/// groups/cgroups (KillMode=process), so a replacement worker
-/// re-adopts them.
+/// SIGTERM (unit stop or restart): exit. All resumable state is already
+/// on disk and builds run in their own process groups/cgroups
+/// (KillMode=process), so a replacement worker re-adopts them; each
+/// build's agent thaws it as its lease ends.
 fn spawn_handover() {
     tokio::spawn(async {
         sd::stop_requested().await;

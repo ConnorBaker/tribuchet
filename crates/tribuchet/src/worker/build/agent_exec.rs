@@ -181,13 +181,16 @@ impl ActiveBuild {
         };
         // From here a restarted worker can re-adopt the build from
         // its agent.
+        let started_unix = unix_now();
         let resume = ResumeState {
             dedupe_key: a.dedupe_key.clone(),
             build_id: a.build_id.clone(),
             pid: build.pid,
             spec,
-            deadline_unix: unix_now() + timeout.as_secs(),
             agent_socket: socket.to_path_buf(),
+            started_unix,
+            deadline_unix: started_unix + limit(timeout, a.timeout_secs).as_secs(),
+            max_silent_secs: a.max_silent_secs,
         };
         if let Err(e) = resume.persist(&self.dir) {
             tracing::warn!(id = a.build_id, "persisting resume state: {}", chain(&e));
@@ -249,17 +252,25 @@ pub(in crate::worker) fn supervise_agent(
     st: &ResumeState,
     dir: PathBuf,
     socket: &Path,
-    build: agents::AgentBuild,
+    mut build: agents::AgentBuild,
 ) -> FinishedBuild {
     let log_path = dir.join("build.log");
+    let tracking = ctx.arbiter.track(st, build.freeze.take());
+    let max_silent = limit(ctx.max_silent_time, st.max_silent_secs);
     // The exit notice arrives on the lease connection. Wait for it on
     // its own thread so the abort conditions keep being polled.
     let waiter = thread::spawn(move || build.wait_exit());
     let mut aborted: Option<String> = None;
+    let mut silence = Silence::default();
     while !waiter.is_finished() {
         if aborted.is_none() {
-            let timed_out = (unix_now() >= st.deadline_unix).then(|| "build timed out".to_string());
-            if let Some(r) = ctx.abort_reason(&st.dedupe_key, &log_path, timed_out) {
+            let frozen = tracking.frozen();
+            let timed_out = past_deadline(st.deadline_unix, unix_now(), frozen)
+                .then(|| "build timed out".to_string());
+            let silent = silence.observe(&log_path, Instant::now(), frozen);
+            let silent = (!max_silent.is_zero() && silent > max_silent)
+                .then(|| format!("build produced no output for {}s", max_silent.as_secs()));
+            if let Some(r) = ctx.abort_reason(&st.dedupe_key, &log_path, timed_out, silent) {
                 aborted = Some(r);
                 if let Err(e) = agents::kill(socket, &st.build_id) {
                     tracing::warn!(
@@ -298,7 +309,8 @@ pub(in crate::worker) fn supervise_agent(
         // Finish makes the outputs (at their real store paths on
         // macOS, under the sandbox root on Linux) readable for
         // packing.
-        let remaining = Duration::from_secs(st.deadline_unix.saturating_sub(unix_now()));
+        let deadline_unix = st.deadline_unix.saturating_add(tracking.frozen().as_secs());
+        let remaining = Duration::from_secs(deadline_unix.saturating_sub(unix_now()));
         let deadline = Instant::now() + remaining.max(Duration::from_mins(10));
         let packed = agents::finish(socket, &st.build_id)
             .map_err(err_ctx("finishing the build on its agent"))
@@ -326,5 +338,122 @@ pub(in crate::worker) fn supervise_agent(
         extras,
         dir,
         finished_at: Instant::now(),
+    }
+}
+
+/// A build's limit: the lesser of the worker's own and the one its client
+/// asked for (Nix's, through attach and the hub), 0 being none.
+fn limit(own: Duration, asked: u64) -> Duration {
+    let asked = Duration::from_secs(asked);
+    if own.is_zero() || (!asked.is_zero() && asked < own) {
+        asked
+    } else {
+        own
+    }
+}
+
+/// Whether a build has run out its timeout: `deadline_unix` is its start
+/// plus the timeout by the wall clock, and only running time counts
+/// toward it, so the time it spent frozen moves the deadline on. Time
+/// spent waiting for an agent already does not count:
+/// the deadline starts once its builder has.
+fn past_deadline(deadline_unix: u64, now_unix: u64, frozen: Duration) -> bool {
+    now_unix >= deadline_unix.saturating_add(frozen.as_secs())
+}
+
+/// A build's silence, for max-silent-time: the running time since its log
+/// last grew, the time it was frozen left out. It starts at the first
+/// look, so a silence restarts once per worker restart (an adopted build's
+/// earlier freezes cannot be told from its silence). Read each supervision
+/// tick, so to 200 ms.
+#[derive(Default)]
+struct Silence {
+    /// The log's size at the last look.
+    seen: u64,
+    /// When it last grew, and the build's frozen time then.
+    output: Option<(Instant, Duration)>,
+}
+
+impl Silence {
+    /// The silence at `now`, `frozen` being the build's frozen time then.
+    fn observe(&mut self, log: &Path, now: Instant, frozen: Duration) -> Duration {
+        let Ok(meta) = fs::metadata(log) else {
+            return Duration::ZERO;
+        };
+        if self.output.is_none() || meta.len() != self.seen {
+            self.output = Some((now, frozen));
+        }
+        self.seen = meta.len();
+        let (at, then) = self.output.unwrap_or((now, frozen));
+        now.saturating_duration_since(at)
+            .saturating_sub(frozen.saturating_sub(then))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Write;
+    use std::time::SystemTime;
+
+    use super::*;
+
+    /// Silence is the running time since the log last grew, from the first
+    /// look: time frozen does not add to it, and a log last written before
+    /// that look (an adopted build's) starts it then.
+    #[test]
+    fn silence_is_running_time_since_the_log_last_grew() {
+        let dir = tempfile::tempdir().unwrap();
+        let log = dir.path().join("build.log");
+        fs::write(&log, "started\n").unwrap();
+        let hour_ago = SystemTime::now() - Duration::from_secs(3600);
+        fs::File::options()
+            .append(true)
+            .open(&log)
+            .unwrap()
+            .set_modified(hour_ago)
+            .unwrap();
+        let t0 = Instant::now();
+        let mut s = Silence::default();
+        let mut at = |t: u64, frozen: u64, append: &[u8]| {
+            fs::File::options()
+                .append(true)
+                .open(&log)
+                .unwrap()
+                .write_all(append)
+                .unwrap();
+            let secs = Duration::from_secs;
+            s.observe(&log, t0 + secs(t), secs(frozen)).as_secs()
+        };
+        assert_eq!(at(0, 0, b""), 0, "a log written before the first look");
+        assert_eq!(at(5, 0, b""), 5);
+        assert_eq!(at(10, 3, b""), 7, "frozen time added to it");
+        assert_eq!(at(11, 3, b"\n"), 0, "output did not end it");
+        assert_eq!(at(13, 4, b""), 1);
+    }
+
+    /// A build's limit is the lesser of the worker's own and its client's,
+    /// 0 being none, as from a client or hub predating the fields.
+    #[test]
+    fn a_build_is_limited_by_the_lesser_of_the_workers_and_its_clients() {
+        for (own, asked, lesser) in [
+            (600, 0, 600),
+            (600, 60, 60),
+            (60, 600, 60),
+            (0, 60, 60),
+            (0, 0, 0),
+        ] {
+            let secs = Duration::from_secs;
+            assert_eq!(limit(secs(own), asked), secs(lesser), "{own} {asked}");
+        }
+    }
+
+    /// 100 s of timeout from 1000: a build never frozen has run it out at
+    /// 1100; one frozen 30 s of it, at 1130.
+    #[test]
+    fn frozen_time_moves_the_deadline_on() {
+        assert!(!past_deadline(1100, 1099, Duration::ZERO));
+        assert!(past_deadline(1100, 1100, Duration::ZERO));
+        assert!(!past_deadline(1100, 1129, Duration::from_secs(30)));
+        assert!(past_deadline(1100, 1130, Duration::from_secs(30)));
     }
 }
