@@ -25,6 +25,8 @@ let
     strictDeps = true;
     nativeBuildInputs = [ protobuf ];
     PROTOC = "${protobuf}/bin/protoc";
+    # tokio's eager driver hand-off (rt.rs) is unstable.
+    RUSTFLAGS = "--cfg tokio_unstable";
   };
 
   cargoArtifacts = craneLib.buildDepsOnly commonArgs;

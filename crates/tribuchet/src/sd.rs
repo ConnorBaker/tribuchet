@@ -203,7 +203,7 @@ pub async fn stop_requested() {
 /// Keep the systemd watchdog fed (WatchdogSec=); a wedged runtime
 /// stops the pings and gets the service killed and restarted.
 pub fn spawn_watchdog() {
-    let Some(timeout) = env::var("WATCHDOG_USEC")
+    let timeout = env::var("WATCHDOG_USEC")
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map(Duration::from_micros)
@@ -211,15 +211,25 @@ pub fn spawn_watchdog() {
             env::var("WATCHDOG_PID")
                 .ok()
                 .is_none_or(|p| p == process::id().to_string())
-        })
-    else {
-        return;
-    };
+        });
+    if let Some(timeout) = timeout {
+        feed(timeout, || {
+            let _ = sd_notify::notify(&[sd_notify::NotifyState::Watchdog]);
+        });
+    }
+}
+
+/// Call `ping` from a timer task on the current runtime every quarter of
+/// the watchdog's `timeout`, from 10 ms to 1 s: a stalled runtime is
+/// killed only after about `timeout`, and pinged while its timer runs.
+pub(crate) fn feed(timeout: Duration, ping: impl Fn() + Send + 'static) {
+    // A quarter: three late ticks still beat a kill.
+    let period = (timeout / 4).clamp(Duration::from_millis(10), Duration::from_secs(1));
     tokio::spawn(async move {
-        let mut tick = tokio::time::interval(timeout / 2);
+        let mut tick = tokio::time::interval(period);
         loop {
             tick.tick().await;
-            let _ = sd_notify::notify(&[sd_notify::NotifyState::Watchdog]);
+            ping();
         }
     });
 }

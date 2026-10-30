@@ -120,6 +120,8 @@ async fn send_frame(
 }
 
 /// Serve needed chunks from the cache, returning what still needs a repack.
+/// repack. Adds the frame bytes sent to `wire`. A blocking thread reads
+/// the frames, one ahead of the sends.
 async fn serve_cached(
     cache: &ChunkCache,
     build_id: &str,
@@ -129,13 +131,24 @@ async fn serve_cached(
     let Some(frames) = cache.locate_all(&todo) else {
         return Ok(todo);
     };
+    let (tx, mut rx) = mpsc::channel(1);
+    let reader = spawn_blocking(move || {
+        for (hash, fref) in frames {
+            // A failed read: the repack picks up this chunk and the rest.
+            let Ok(frame) = fref.read_blocking() else {
+                return;
+            };
+            if tx.blocking_send((hash, frame)).is_err() {
+                return;
+            }
+        }
+    });
     let mut rest = todo;
-    for (hash, fref) in frames {
-        // Evicted between locate and read: the repack picks it up.
-        let Ok(frame) = fref.read() else { break };
+    while let Some((hash, frame)) = rx.recv().await {
         send_frame(out_tx, build_id, &hash, frame).await?;
         rest.remove(&hash);
     }
+    reader.await.map_err(err_ctx("cache read task panicked"))?;
     Ok(rest)
 }
 
@@ -175,7 +188,7 @@ async fn stream_path_chunks(
 /// cache on second sighting.
 fn frame_for(cache: &ChunkCache, chunk: &Chunk) -> Result<Vec<u8>> {
     let admit = match cache.classify(&chunk.hash) {
-        Disposition::Cached(fref) => match fref.read() {
+        Disposition::Cached(fref) => match fref.read_blocking() {
             Ok(frame) => return Ok(frame),
             Err(_) => false,
         },
@@ -195,6 +208,7 @@ fn frame_for(cache: &ChunkCache, chunk: &Chunk) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::chunkstore::io_hook;
 
     #[tokio::test]
     async fn serve_cached_skips_repack_and_reports_leftovers() {
@@ -202,7 +216,7 @@ mod tests {
         let cache = ChunkCache::open(dir.path().to_path_buf(), 1 << 20).unwrap();
         let a: Hash = [1; 32];
         let b: Hash = [2; 32];
-        cache.admit(a, &compress(b"hello", 3).unwrap()).unwrap();
+        io_hook::off_runtime(|| cache.admit(a, &compress(b"hello", 3).unwrap()).unwrap());
 
         let (tx, mut rx) = mpsc::channel(8);
 

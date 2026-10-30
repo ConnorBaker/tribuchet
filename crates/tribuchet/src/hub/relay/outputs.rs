@@ -5,6 +5,7 @@
 use std::collections::{BTreeMap, HashSet};
 
 use tokio::sync::mpsc;
+use tokio::task::spawn_blocking;
 use tonic::Status;
 
 use super::extras::{ExtraImport, start_extra};
@@ -17,6 +18,7 @@ use crate::hub::state::{HubState, Job};
 use crate::proto::{
     HubMessage, Manifest, Need, OutputNar, attach_event, hub_message, worker_message,
 };
+use std::sync::Arc;
 
 pub(super) struct Announced {
     store_path: String,
@@ -71,7 +73,7 @@ pub(super) fn parse_extras(reported: Vec<Manifest>) -> Result<Vec<(Announced, Ma
 /// Chunks arrive in the order `send_chunks` on the worker emits them:
 /// recipe order across outputs then extras, each needed hash once.
 struct ChunkSource<'a> {
-    cache: &'a ChunkCache,
+    cache: &'a Arc<ChunkCache>,
     needed: HashSet<Hash>,
     _pin: PinGuard,
     in_rx: &'a mut mpsc::Receiver<worker_message::Msg>,
@@ -80,23 +82,19 @@ struct ChunkSource<'a> {
 impl ChunkSource<'_> {
     /// The chunk's zstd frame, plaintext verified against the recipe.
     /// The delivery's hashes are pinned, so repeats read back from the
-    /// cache.
+    /// cache. Cache I/O runs on the blocking pool, off this worker.
     async fn get(&mut self, hash: &Hash, size: usize) -> Result<Vec<u8>> {
         let frame = if self.needed.remove(hash) {
             let frame = self.receive(hash).await?;
             decode_chunk(&frame, hash, size).map_err(err_ctx("output chunk"))?;
-            self.cache
-                .admit(*hash, &frame)
-                .map_err(|e| err_msg(format!("caching output chunk: {e}")))?;
-            frame
+            let cache = self.cache.clone();
+            let hash = *hash;
+            spawn_blocking(move || cache.admit(hash, &frame).map(|()| frame))
+                .await
+                .map_err(err_ctx("cache admit task panicked"))?
+                .map_err(|e| err_msg(format!("caching output chunk: {e}")))?
         } else {
-            let frame = self
-                .cache
-                .locate(hash)
-                .and_then(|f| f.read().ok())
-                .ok_or_else(|| err_msg("pinned output chunk missing from the cache"))?;
-            decode_chunk(&frame, hash, size).map_err(err_ctx("cached output chunk"))?;
-            frame
+            self.cache.read_checked(hash, size).await?
         };
         Ok(frame)
     }
@@ -136,13 +134,13 @@ pub(super) async fn deliver_outputs(
     outputs: Vec<Announced>,
     extras: Vec<(Announced, Manifest)>,
 ) -> Result<()> {
-    let cache = &*state.chunks;
     let all = || {
         outputs
             .iter()
             .chain(extras.iter().map(|(a, _)| a))
             .flat_map(|a| &a.recipe)
     };
+    let cache = &state.chunks;
     let pin = cache.pin(all().map(|(h, _)| *h));
     let mut needed = HashSet::new();
     let mut hashes = Vec::new();
@@ -208,3 +206,6 @@ pub(super) async fn deliver_outputs(
     }
     src.finish().await
 }
+
+#[cfg(test)]
+mod stall_tests;

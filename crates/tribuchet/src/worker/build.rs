@@ -419,6 +419,8 @@ impl ActiveBuild {
 mod agent_exec;
 #[path = "build/chunks.rs"]
 mod chunks;
+#[cfg(test)]
+pub(crate) use chunks::tests as chunk_tests;
 #[path = "build/claims.rs"]
 mod claims;
 #[path = "build/validate.rs"]

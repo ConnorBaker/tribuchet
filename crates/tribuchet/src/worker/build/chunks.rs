@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 use std::mem;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use bytes::Bytes;
 use harmonia_store_path::StoreDir;
@@ -19,7 +19,9 @@ use crate::proto::{ChunkFrame, MAX_NAR_BYTES, MAX_RESEND_ROUNDS, Manifest, Need}
 use crate::store::parse_path_info;
 
 pub(super) struct ChunkStaging {
-    store: Arc<Mutex<ChunkStore>>,
+    /// Shared with the import feeds and every other build. No lock that
+    /// a lookup or a pin takes is ever held across file I/O.
+    store: Arc<ChunkStore>,
     /// path -> ordered recipe, kept until the import succeeded
     /// staged recipe and the pin keeping its chunks until imported
     recipes: HashMap<String, (Recipe, PinGuard)>,
@@ -30,7 +32,7 @@ pub(super) struct ChunkStaging {
 }
 
 impl ChunkStaging {
-    pub(super) fn new(store: Arc<Mutex<ChunkStore>>) -> Self {
+    pub(super) fn new(store: Arc<ChunkStore>) -> Self {
         Self {
             store,
             recipes: HashMap::new(),
@@ -48,11 +50,7 @@ impl ChunkStaging {
         sizes: &[u64],
     ) -> Result<(Vec<u8>, bool)> {
         let recipe = parse_recipe(&path, hashes, sizes)?;
-        let pin = self
-            .store
-            .lock()
-            .unwrap()
-            .pin(recipe.iter().map(|(h, _)| *h));
+        let pin = self.store.pin(recipe.iter().map(|(h, _)| *h));
         let need = self.await_missing(&path, &recipe);
         let ready = !self.remaining.contains_key(&path);
         self.recipes.insert(path, (recipe, pin));
@@ -60,7 +58,7 @@ impl ChunkStaging {
     }
 
     fn await_missing(&mut self, path: &str, recipe: &[(Hash, usize)]) -> Vec<u8> {
-        let store = self.store.lock().unwrap();
+        let store = &self.store;
         let mut need: Vec<u8> = Vec::new();
         let mut missing = 0;
         for (hash, _) in recipe {
@@ -107,8 +105,6 @@ impl ChunkStaging {
             .try_into()
             .map_err(|_| err_msg("malformed chunk hash"))?;
         self.store
-            .lock()
-            .unwrap()
             .insert(hash, frame)
             .map_err(|e| err_msg(format!("chunk store write failed: {e}")))?;
         let mut ready = Vec::new();
@@ -322,7 +318,7 @@ impl ActiveBuild {
 /// Returns the chunks found corrupt or missing, after forgetting them
 /// in the store so a retry requests them again.
 pub(super) fn feed_import(
-    store: &Mutex<ChunkStore>,
+    store: &ChunkStore,
     recipe: &[(Hash, usize)],
     tx: &mpsc::Sender<Bytes>,
 ) -> Vec<Hash> {
@@ -330,7 +326,7 @@ pub(super) fn feed_import(
     for (hash, size) in recipe {
         let Some(raw) = read_verified(store, hash, *size) else {
             tracing::warn!(chunk = hex::encode(hash), "stored chunk corrupt or missing");
-            store.lock().unwrap().forget(hash);
+            store.forget(hash);
             bad.push(*hash);
             continue;
         };
@@ -343,38 +339,11 @@ pub(super) fn feed_import(
     bad
 }
 
-fn read_verified(store: &Mutex<ChunkStore>, hash: &Hash, size: usize) -> Option<Vec<u8>> {
-    let frame = store.lock().unwrap().peek(hash)?.read().ok()?;
+fn read_verified(store: &ChunkStore, hash: &Hash, size: usize) -> Option<Vec<u8>> {
+    let frame = store.peek(hash)?.read_blocking().ok()?;
     decode_chunk(&frame, hash, size).ok()
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use zstd::bulk::compress;
-
-    #[test]
-    fn feed_import_forgets_corrupt_and_missing_chunks() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Mutex::new(ChunkStore::open(dir.path().to_path_buf(), 1 << 20).unwrap());
-        let good = b"good chunk".to_vec();
-        let good_hash: Hash = *blake3::hash(&good).as_bytes();
-        let liar: Hash = [7; 32];
-        let missing: Hash = [9; 32];
-        {
-            let mut s = store.lock().unwrap();
-            s.insert(good_hash, &compress(&good, 3).unwrap()).unwrap();
-            s.insert(liar, &compress(b"not what the hash says", 3).unwrap())
-                .unwrap();
-        }
-        let recipe = [(good_hash, good.len()), (liar, 22), (missing, 1)];
-        let (tx, mut rx) = mpsc::channel(8);
-        let bad = feed_import(&store, &recipe, &tx);
-        assert_eq!(bad, vec![liar, missing]);
-        assert_eq!(rx.try_recv().unwrap().as_ref(), good.as_slice());
-        assert!(rx.try_recv().is_err());
-        let s = store.lock().unwrap();
-        assert!(s.contains(&good_hash));
-        assert!(!s.contains(&liar));
-    }
-}
+#[path = "chunks/tests.rs"]
+pub(crate) mod tests;

@@ -6,6 +6,7 @@ use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use super::Hash;
 
@@ -22,7 +23,8 @@ pub(super) fn index_path(dir: &Path, id: u64) -> PathBuf {
 }
 
 pub(super) struct PackWriter {
-    file: File,
+    /// Also the pack's read handle, so readers never open files.
+    file: Arc<File>,
     pub(super) id: u64,
     pub(super) len: u64,
     /// (hash, payload offset, payload len) in append order
@@ -33,10 +35,11 @@ impl PackWriter {
     pub(super) fn create(dir: &Path, id: u64) -> io::Result<Self> {
         let file = OpenOptions::new()
             .create_new(true)
+            .read(true)
             .write(true)
             .open(pack_path(dir, id))?;
         Ok(Self {
-            file,
+            file: Arc::new(file),
             id,
             len: 0,
             entries: Vec::new(),
@@ -52,6 +55,8 @@ impl PackWriter {
         rec.extend_from_slice(&len.to_le_bytes());
         rec.extend_from_slice(hash);
         rec.extend_from_slice(frame);
+        #[cfg(test)]
+        io_hook::fire(io_hook::Op::Write);
         self.file.write_all_at(&rec, self.len)?;
         let offset = self.len + HEADER;
         self.len += HEADER + u64::from(len);
@@ -64,6 +69,8 @@ impl PackWriter {
     pub(super) fn seal(self, dir: &Path) -> io::Result<()> {
         // drop a torn tail left by a failed last append
         self.file.set_len(self.len)?;
+        #[cfg(test)]
+        io_hook::fire(io_hook::Op::Sync);
         self.file.sync_data()?;
         write_index(dir, self.id, &self.entries)
     }
@@ -79,11 +86,15 @@ fn write_index(dir: &Path, id: u64, entries: &[(Hash, u64, u32)]) -> io::Result<
         buf.extend_from_slice(&len.to_le_bytes());
     }
     f.write_all(&buf)?;
+    #[cfg(test)]
+    io_hook::fire(io_hook::Op::IndexSync);
     f.sync_data()?;
     fs::rename(tmp, index_path(dir, id))
 }
 
 pub(super) fn load_index(dir: &Path, id: u64) -> io::Result<Vec<(Hash, u64, u32)>> {
+    #[cfg(test)]
+    io_hook::fire(io_hook::Op::IndexLoad);
     let data = fs::read(index_path(dir, id))?;
     let mut out = Vec::with_capacity(data.len() / 44);
     for rec in data.chunks_exact(44) {
@@ -137,6 +148,8 @@ pub(super) fn open_pack(dir: &Path, id: u64) -> io::Result<File> {
 }
 
 pub(super) fn read_frame(file: &File, offset: u64, len: u32) -> io::Result<Vec<u8>> {
+    #[cfg(test)]
+    io_hook::fire(io_hook::Op::Read);
     let mut buf = vec![0u8; len as usize];
     file.read_exact_at(&mut buf, offset)?;
     Ok(buf)
@@ -144,6 +157,73 @@ pub(super) fn read_frame(file: &File, offset: u64, len: u32) -> io::Result<Vec<u
 
 impl PackWriter {
     pub(super) fn sync(&self) -> io::Result<()> {
+        #[cfg(test)]
+        io_hook::fire(io_hook::Op::CopySync);
         self.file.sync_data()
+    }
+
+    pub(super) fn file(&self) -> Arc<File> {
+        self.file.clone()
+    }
+}
+
+/// Test seam: a per-thread callback before each pack read, write or
+/// fsync, each sidecar index's fsync or read, and each retire's
+/// unlinks, to hold a thread inside chunk-store file I/O, and before a
+/// retire takes the index lock to decide what it keeps.
+#[cfg(test)]
+pub(crate) mod io_hook {
+    use std::cell::RefCell;
+    use std::sync::Arc;
+    use std::thread;
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub(crate) enum Op {
+        Read,
+        Write,
+        /// A seal's fsync of its pack.
+        Sync,
+        Decide,
+        /// A retire's fsync of the chunks it copied, before it unlinks
+        /// the pack they came from.
+        CopySync,
+        /// The fsync of a sealed pack's sidecar index, before its rename.
+        IndexSync,
+        /// A read of a sealed pack's sidecar index, at open or as a
+        /// retire's first step.
+        IndexLoad,
+        /// A retire's unlink of the pack it retires, or of that pack's
+        /// index.
+        Unlink,
+    }
+
+    pub(crate) type Hook = Arc<dyn Fn(Op) + Send + Sync>;
+
+    thread_local! {
+        static HOOK: RefCell<Option<Hook>> = const { RefCell::new(None) };
+    }
+
+    /// `f`, run on a thread of its own, off any runtime: a test's setup
+    /// that writes the store from async code (fire).
+    pub(crate) fn off_runtime<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+        thread::scope(|s| s.spawn(f).join().unwrap())
+    }
+
+    /// Run `hook` before each of this thread's ops above.
+    pub(crate) fn install(hook: Hook) {
+        HOOK.with(|h| *h.borrow_mut() = Some(hook));
+    }
+
+    pub(in crate::chunkstore) fn fire(op: Op) {
+        // Never on a runtime's worker, the thread that drives its tasks:
+        // there tokio refuses to block_on ("Cannot start a runtime from
+        // within a runtime"), and the test fails. Elsewhere it is a no-op.
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.block_on(async {});
+        }
+        let hook = HOOK.with(|h| h.borrow().clone());
+        if let Some(hook) = hook {
+            hook(op);
+        }
     }
 }

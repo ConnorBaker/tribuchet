@@ -2,7 +2,7 @@
 
 use std::io;
 use std::result::Result as StdResult;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Instant;
 
 use bytes::Bytes;
@@ -47,7 +47,7 @@ impl ImportHandle {
 
 pub(super) struct ImportJob {
     pub(super) info: ValidPathInfo,
-    pub(super) store: Arc<Mutex<ChunkStore>>,
+    pub(super) store: Arc<ChunkStore>,
     pub(super) recipe: Recipe,
     pub(super) result: oneshot::Sender<ImportOutcome>,
     pub(super) wake: (mpsc::UnboundedSender<Wake>, Wake),
