@@ -1,12 +1,11 @@
 //! Per-job protocol with a worker: input staging, output relay and verification.
 
 mod daemon;
-mod extras;
 mod outputs;
 mod serve;
 mod staging;
 pub(super) use daemon::{ANSWER as DAEMON_ANSWER, Evidence as DaemonEvidence};
-use outputs::{deliver_outputs, parse_extras, verify_set};
+use outputs::{deliver_outputs, verify_set};
 pub(super) use staging::WorkerSession;
 use staging::{Staging, stream_tmp_dir};
 
@@ -36,7 +35,7 @@ pub(super) async fn send(
         .map_err(|_| err_msg("worker connection lost"))
 }
 
-/// Drive one dispatched build to its verdict. A failed build is not an `Err`.
+/// Drive one dispatched build to its verdict on the worker the hub
 /// knows as `worker`, in session `session`. A failed build is not an
 /// `Err`.
 pub(super) async fn run_job(
@@ -66,6 +65,7 @@ pub(super) async fn run_job(
             inputs,
             required_features: job.features.clone(),
             local_networking: req.local_networking,
+            worker_name: worker.to_owned(),
             timeout_secs: req.timeout_secs,
             max_silent_secs: req.max_silent_secs,
         }),
@@ -144,8 +144,7 @@ pub(super) async fn run_job(
                     return publish_worker_failure(state, out_tx, job, &res).await;
                 }
                 let outputs = verify_set(res.outputs, &job.req.outputs)?;
-                let extras = parse_extras(res.extras)?;
-                deliver_outputs(state, job, out_tx, &mut in_rx, outputs, extras).await?;
+                deliver_outputs(state, job, out_tx, &mut in_rx, outputs).await?;
                 finish_relay(state, out_tx, &job.replay, job).await;
                 return Ok(());
             }

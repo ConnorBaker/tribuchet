@@ -12,7 +12,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 use super::metrics::Metrics;
 use super::naming::drv_name;
-use super::state::{HubState, Inflight, Job, Replay, Servability};
+use super::state::{HubState, Inflight, Job, Replay, Servability, unserved};
 use crate::proto::{
     AttachEvent, BuildMessage, BuildRequest, DECLINE_EXIT_CODE, attach_event, attach_hub_server,
     build_message,
@@ -187,6 +187,14 @@ impl attach_hub_server::AttachHub for AttachSvc {
             return Err(Status::invalid_argument("build request without outputs"));
         }
         validate_request(&req)?;
+        // Queued, a build with network that no worker serves would wait
+        // forever; declined, it would run on this host's own network.
+        if req.fixed_output && unserved(&req.required_features) {
+            return Err(Status::failed_precondition(
+                "no worker builds a fixed-output derivation that requires recursive-nix, and \
+                 the hub's host builds none with network",
+            ));
+        }
         let tmp_dir_pack = Arc::new(tmp_dir_pack);
         let key = dedupe_key(&req, &tmp_dir_pack);
 
@@ -275,7 +283,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::hub::state::WorkerCaps;
-    use crate::hub::tests::submit;
+    use crate::hub::tests::{submit, try_submit};
 
     /// 32-char base32 hash part for synthetic store paths.
     const H: &str = "00000000000000000000000000000000";
@@ -422,6 +430,35 @@ mod tests {
         let told = String::from_utf8(told).unwrap();
         assert!(told.contains("waiting for one"), "{told}");
         assert_eq!(state.queue.lock().await.len(), 1);
+    }
+
+    /// A build that requires recursive-nix, which no worker serves,
+    /// though one serves its system. With network it fails at submit,
+    /// naming why: queued, it would wait forever, and declined, Nix
+    /// would build it on the hub's host. Without, it is declined, as any
+    /// build no worker serves, and Nix builds it locally.
+    #[tokio::test]
+    async fn a_build_requiring_recursive_nix_fails_with_network_and_is_declined_without() {
+        let state = hub();
+        let fod = BuildRequest {
+            fixed_output: true,
+            required_features: vec!["recursive-nix".into()],
+            ..base_request()
+        };
+        let Err(failed) = try_submit(&state, fod.clone()).await else {
+            panic!("the build was taken");
+        };
+        assert_eq!(failed.code(), tonic::Code::FailedPrecondition);
+        assert!(failed.message().contains("recursive-nix"), "{failed}");
+        assert_eq!(state.queue.lock().await.len(), 0);
+        let local = BuildRequest {
+            fixed_output: false,
+            ..fod
+        };
+        let mut events = try_submit(&state, local).await.expect("not declined");
+        let first = tokio::time::timeout(Duration::from_secs(10), events.message()).await;
+        let first = first.unwrap().unwrap().unwrap().event.unwrap();
+        assert_eq!(first, attach_event::Event::ExitCode(DECLINE_EXIT_CODE));
     }
 
     /// Strings shifted between adjacent sections must not collide:

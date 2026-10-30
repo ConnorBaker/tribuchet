@@ -14,9 +14,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
-use super::ActiveBuild;
-use super::pack_outputs_and_extras;
-use super::unix_now;
+use super::{ActiveBuild, pack_outputs, unix_now};
 use crate::errors::{Result, chain, err_ctx, err_msg};
 use crate::fsutil::io_ctx;
 use crate::proto::WorkerMessage;
@@ -26,7 +24,7 @@ use crate::worker::caps::requires_uid_range;
 #[cfg(target_os = "macos")]
 use crate::worker::caps::requires_uid_range;
 use crate::worker::logtail::tail_log;
-use crate::worker::resume::{FinishedBuild, ResumeState, Usage};
+use crate::worker::resume::{FinishedBuild, ResumeState, Usage, persist_finished};
 use crate::worker::{WorkerCtx, agents, sandbox};
 
 impl ActiveBuild {
@@ -58,13 +56,7 @@ impl ActiveBuild {
         if self.reuse_outputs {
             return Ok(self.finish_reused());
         }
-        let socket =
-            self.ctx.agents.acquire().ok_or_else(|| {
-                err_msg("no free build agent (max-jobs exceeds the agent count?)")
-            })?;
-        let result = self.execute_on_agent(&socket, out_tx, timeout);
-        self.ctx.agents.release(socket);
-        result
+        self.execute_on_agent(out_tx, timeout)
     }
 
     /// Pack existing outputs without running a builder. Agent cleanup
@@ -73,22 +65,18 @@ impl ActiveBuild {
         let spec = sandbox::SandboxSpec {
             outputs: self.assignment.outputs.values().cloned().collect(),
             store_inputs: self.input_list(),
-            recursive_nix: self.recursive_nix(),
             ..sandbox::SandboxSpec::default()
         };
         let deadline = Instant::now() + Duration::from_mins(10);
-        let packed = tokio::runtime::Handle::current()
-            .block_on(pack_outputs_and_extras(&self.dir, &spec, None, deadline));
-        let (exit_code, error, outputs, extras) = match packed {
-            Ok((o, e)) => (0, String::new(), o, e),
-            Err(e) => (1, chain(&e), vec![], vec![]),
+        let (exit_code, error, outputs) = match pack_outputs(&self.dir, &spec, deadline) {
+            Ok(o) => (0, String::new(), o),
+            Err(e) => (1, chain(&e), vec![]),
         };
         FinishedBuild {
             exit_code,
             usage: Usage::default(),
             error,
             outputs,
-            extras,
             dir: self.dir.clone(),
             finished_at: Instant::now(),
         }
@@ -96,7 +84,6 @@ impl ActiveBuild {
 
     fn execute_on_agent(
         &self,
-        socket: &Path,
         out_tx: &mpsc::Sender<WorkerMessage>,
         timeout: Duration,
     ) -> Result<FinishedBuild> {
@@ -117,7 +104,6 @@ impl ActiveBuild {
             sandbox::SandboxSpec {
                 outputs: outputs.clone(),
                 store_inputs: self.input_list(),
-                recursive_nix: self.recursive_nix(),
                 ..sandbox::SandboxSpec::default()
             },
         );
@@ -148,13 +134,16 @@ impl ActiveBuild {
             .create(true)
             .append(true)
             .open(self.dir.join("build.log"))?;
-        let build = agents::AgentBuild::start(
-            socket,
+        let started = self.ctx.agents.start(
             &req,
             &fs::File::open(self.dir.join("top.tmpdir.zst"))
                 .map_err(io_ctx("opening", &self.dir.join("top.tmpdir.zst")))?,
             &log_w,
-        )?;
+            || self.ctx.cancelled.lock().unwrap().remove(&a.dedupe_key),
+            || self.tell_waiting(),
+        );
+        self.ctx.wait_for_agent(&a.dedupe_key, false);
+        let (socket, build) = started?;
         drop(log_w);
         tracing::info!(
             id = a.build_id,
@@ -192,32 +181,32 @@ impl ActiveBuild {
             build_id: a.build_id.clone(),
             pid: build.pid,
             spec,
-            agent_socket: socket.to_path_buf(),
             started_unix,
             deadline_unix: started_unix + limit(timeout, a.timeout_secs).as_secs(),
             max_silent_secs: a.max_silent_secs,
+            agent_socket: socket.clone(),
         };
         if let Err(e) = resume.persist(&self.dir) {
             tracing::warn!(id = a.build_id, "persisting resume state: {}", chain(&e));
         }
-        let fin = supervise_agent(&self.ctx, &resume, self.dir.clone(), socket, build);
+        let fin = supervise_agent(&self.ctx, &resume, self.dir.clone(), &socket, build);
         log_done.store(true, Ordering::Relaxed);
         let _ = tailer.join();
+        self.ctx.agents.release(socket);
         Ok(fin)
+    }
+
+    /// No agent is free or reachable: say so, here and to the client,
+    /// once to each session that holds the build while it waits.
+    fn tell_waiting(&self) {
+        let a = &self.assignment;
+        tracing::warn!(id = a.build_id, "no build agent free or reachable; waiting");
+        self.ctx.wait_for_agent(&a.dedupe_key, true);
     }
 
     /// The Linux sandbox spec sent with the StartRequest. The agent
     /// fills in its scratch paths, user namespace and uid block before
     /// spawning the setup stage with it.
-    fn recursive_nix(&self) -> bool {
-        self.ctx.recursive_nix
-            && self
-                .assignment
-                .required_features
-                .iter()
-                .any(|f| f == "recursive-nix")
-    }
-
     #[cfg(target_os = "linux")]
     fn build_spec(&self) -> Result<sandbox::SandboxSpec> {
         let a = &self.assignment;
@@ -233,15 +222,12 @@ impl ActiveBuild {
                 leased_uid_count: Some(uid_count),
                 emulator: self.ctx.emulators.get(&a.system).map(PathBuf::as_path),
                 net_policy: self.ctx.fod_network.clone(),
-                recursive_nix: self.recursive_nix(),
-                nix_daemon_socket: None,
             },
         )?;
         tracing::info!(
             id = a.build_id,
             fixed_output = a.fixed_output,
             network = spec.network,
-            net_isolation = spec.net_isolation,
             "sandbox network decision"
         );
         Ok(spec)
@@ -299,8 +285,8 @@ pub(in crate::worker) fn supervise_agent(
         }
     };
     tracing::info!(id = st.build_id, exit_code = code, aborted = ?aborted, "builder finished");
-    let (exit_code, error, outputs, extras) = if let Some(reason) = aborted {
-        (1, reason, vec![], vec![])
+    let (exit_code, error, outputs) = if let Some(reason) = aborted {
+        (1, reason, vec![])
     } else if code != 0 {
         // A Linux setup-stage failure leaves its message under the
         // sandbox root; a plain builder failure leaves none.
@@ -308,7 +294,7 @@ pub(in crate::worker) fn supervise_agent(
         let detail = sandbox::setup_error_detail(&st.spec).unwrap_or_default();
         #[cfg(target_os = "macos")]
         let detail = String::new();
-        (code, detail, vec![], vec![])
+        (code, detail, vec![])
     } else {
         // Finish makes the outputs (at their real store paths on
         // macOS, under the sandbox root on Linux) readable for
@@ -318,31 +304,28 @@ pub(in crate::worker) fn supervise_agent(
         let deadline = Instant::now() + remaining.max(Duration::from_mins(10));
         let packed = agents::finish(socket, &st.build_id)
             .map_err(err_ctx("finishing the build on its agent"))
-            .and_then(|()| {
-                tokio::runtime::Handle::current()
-                    .block_on(pack_outputs_and_extras(&dir, &st.spec, None, deadline))
-            });
+            .and_then(|()| pack_outputs(&dir, &st.spec, deadline));
         match packed {
-            Ok((o, e)) => (0, String::new(), o, e),
-            Err(e) => (1, chain(&e), vec![], vec![]),
+            Ok(o) => (0, String::new(), o),
+            Err(e) => (1, chain(&e), vec![]),
         }
     };
-    // The agent removes its scratch dir and the scratch outputs
-    // (packing above already read them) and forgets the build.
-    if let Err(e) = agents::cleanup(socket, &st.build_id) {
-        tracing::warn!(id = st.build_id, "agent cleanup failed: {}", chain(&e));
-    } else if let Err(e) = agents::shutdown(socket) {
-        tracing::warn!(id = st.build_id, "agent shutdown failed: {}", chain(&e));
-    }
-    FinishedBuild {
+    let fin = FinishedBuild {
         exit_code,
         usage,
         error,
         outputs,
-        extras,
         dir,
         finished_at: Instant::now(),
-    }
+    };
+    // On disk before the agent forgets the build: a worker stopped while
+    // Cleanup runs leaves a result to deliver, not a running build no
+    // agent has.
+    persist_finished(&st.dedupe_key, &st.build_id, &fin);
+    // The agent removes its scratch dir and the scratch outputs
+    // (packing above already read them) and forgets the build.
+    agents::retire(socket, &st.build_id, "agent cleanup");
+    fin
 }
 
 /// A build's limit: the lesser of the worker's own and the one its client

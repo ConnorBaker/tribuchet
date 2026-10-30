@@ -88,7 +88,13 @@ pub fn setup_stage() -> ! {
 
 const CLOSE_RANGE_CLOEXEC: libc::c_uint = 4;
 
-fn enter_and_exec(spec: &SandboxSpec, status_file: &fs::File) -> io::Result<Infallible> {
+pub(in crate::worker::sandbox) fn enter_and_exec(
+    spec: &SandboxSpec,
+    status_file: &fs::File,
+) -> io::Result<Infallible> {
+    if let Some(why) = spec.unconfined() {
+        return Err(io::Error::other(format!("refusing a build {why}")));
+    }
     // The agent placed this process in the build cgroup before the
     // spec arrived on stdin; CLONE_NEWCGROUP below roots the namespace
     // there.
@@ -305,20 +311,17 @@ struct SetupParams<'a> {
 
 fn setup(p: &SetupParams) -> io::Result<()> {
     let spec = p.spec;
+    // Every build gets a network of its own, never the host's: a
+    // network build one with the user-mode NAT the agent runs.
     let mut flags = UnshareFlags::NEWUSER
         | UnshareFlags::NEWNS
+        | UnshareFlags::NEWNET
         | UnshareFlags::NEWPID
         | UnshareFlags::NEWIPC
         | UnshareFlags::NEWUTS;
-    // Network builds keep the host namespace only without isolation;
-    // with it they get a private one plus user-mode NAT.
-    let private_net = !spec.network || spec.net_isolation;
-    if private_net {
-        flags |= UnshareFlags::NEWNET;
-    }
-    // The agent runs the datapath. This end of the tap-handoff
-    // socketpair was inherited across the setup stage's exec.
-    let net_fwd = if spec.net_isolation && spec.network {
+    // This end of the tap-handoff socketpair was inherited across the
+    // setup stage's exec.
+    let net_fwd = if spec.network {
         let fd = spec
             .net_fwd_fd
             .ok_or_else(|| io::Error::other("sandbox spec lacks the tap handoff fd"))?;
@@ -358,9 +361,7 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     sethostname(b"localhost").map_err(ioerr("sethostname"))?;
     // "(none)" is the kernel default; fixed like Nix for determinism
     setdomainname(b"(none)").map_err(ioerr("setdomainname"))?;
-    if private_net {
-        loopback_up().map_err(ioerr("bringing lo up"))?;
-    }
+    loopback_up().map_err(ioerr("bringing lo up"))?;
     if let Some(sock) = net_fwd {
         attach_net(&sock, &net_config(spec))?;
     }

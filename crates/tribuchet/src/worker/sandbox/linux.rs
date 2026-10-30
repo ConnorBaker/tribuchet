@@ -14,7 +14,7 @@ use super::{Error, step};
 use crate::fsutil::io_ctx;
 
 #[path = "linux/stage.rs"]
-mod stage;
+pub(super) mod stage;
 pub use stage::setup_stage;
 
 /// Prepare the on-disk sandbox root and finalize the spec. Only the
@@ -108,6 +108,17 @@ fn write_skeleton(spec: &SandboxSpec) -> Result<(), Error> {
                     .map_err(io_ctx("writing", &root.join("etc").join(f)))?;
             }
         }
+        // presto-pasta answers DNS on the gateway addresses; point
+        // the sandbox at them, not the host resolv.conf whose
+        // nameserver may be an unreachable loopback stub.
+        let net = net_config(spec);
+        let conf = if net.ipv6 {
+            format!("nameserver {}\nnameserver {}\n", net.gateway4, net.gateway6)
+        } else {
+            format!("nameserver {}\n", net.gateway4)
+        };
+        fs::write(root.join("etc/resolv.conf"), conf)
+            .map_err(io_ctx("writing", &root.join("etc/resolv.conf")))?;
     }
     Ok(())
 }

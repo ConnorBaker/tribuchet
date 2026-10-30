@@ -9,7 +9,6 @@ use tokio::sync::mpsc;
 use tokio::task::spawn_blocking;
 use tonic::Status;
 
-use super::extras::{ExtraImport, start_extra};
 use super::{msg_name, recv, send};
 use crate::chunker::{Recipe, decode_chunk, parse_recipe};
 use crate::chunkstore::Hash;
@@ -58,20 +57,8 @@ pub(super) fn verify_set(
     Ok(out)
 }
 
-pub(super) fn parse_extras(reported: Vec<Manifest>) -> Result<Vec<(Announced, Manifest)>> {
-    reported
-        .into_iter()
-        .map(|e| {
-            Ok((
-                Announced::new(e.store_path.clone(), &e.hashes, &e.sizes)?,
-                e,
-            ))
-        })
-        .collect()
-}
-
 /// Chunks arrive in the order `send_chunks` on the worker emits them:
-/// recipe order across outputs then extras, each needed hash once.
+/// recipe order across outputs, each needed hash once.
 struct ChunkSource<'a> {
     cache: &'a Arc<ChunkCache>,
     needed: HashSet<Hash>,
@@ -131,15 +118,9 @@ pub(super) async fn deliver_outputs(
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
     in_rx: &mut mpsc::Receiver<worker_message::Msg>,
     outputs: Vec<Announced>,
-    extras: Vec<(Announced, Manifest)>,
 ) -> Result<()> {
-    let all = || {
-        outputs
-            .iter()
-            .chain(extras.iter().map(|(a, _)| a))
-            .flat_map(|a| a.recipe.iter())
-    };
     let cache = &state.chunks;
+    let all = || outputs.iter().flat_map(|a| a.recipe.iter());
     // Held by the replay, past this delivery when a client missed it.
     let pin = cache.pin(all().map(|(h, _)| *h));
     let kept = outputs
