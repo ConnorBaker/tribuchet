@@ -23,6 +23,7 @@
 
 mod arbiter;
 mod daemon;
+mod fod_ipv6;
 mod harness;
 mod pairs;
 
@@ -242,8 +243,9 @@ fn build_logbomb() {
 }
 
 /// The fixed-output subtests share the hub's fodsrv and the worker's dnsmasq,
-/// and the DNS variant restarts dnsmasq, so keep them in one test in the
-/// original order rather than racing three tasks on shared network state.
+/// the DNS variant restarts dnsmasq and the IPv6 ones change the worker's
+/// routes, so keep them in one test in the original order rather than racing
+/// tasks on shared network state.
 #[test]
 fn build_fod() {
     // FOD source on the hub, fetched by the isolated sandbox through presto-pasta.
@@ -306,6 +308,9 @@ fn build_fod() {
     wait_until_succeeds(Node::Worker, "getent hosts fod-dns.test", 30);
     fail(Node::Worker, "grep -q fod-dns.test /etc/hosts");
     build_grep("/etc/tt/fod-dns.nix", "hello-fod");
+
+    // 4) and 5): the worker's IPv6 states.
+    fod_ipv6::states();
 }
 
 #[test]

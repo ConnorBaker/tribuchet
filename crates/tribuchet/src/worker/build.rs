@@ -437,6 +437,7 @@ mod tests {
     use std::collections::BTreeMap;
 
     use super::*;
+    use crate::build_json::tests::{HASH, SRI};
 
     fn base_assignment() -> BuildAssignment {
         BuildAssignment {
