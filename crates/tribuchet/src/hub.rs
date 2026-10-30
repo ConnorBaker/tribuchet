@@ -390,3 +390,5 @@ async fn supervise_job(
         state.finish(&job).await;
     }
 }
+#[cfg(test)]
+mod tests;
