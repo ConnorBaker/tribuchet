@@ -4,9 +4,8 @@
 //! bind-mounts (and on macOS deletes) them, so a string that parses
 //! here but escapes /nix/store would be a path-traversal primitive.
 
-use std::collections::{BTreeSet, HashSet};
+use std::collections::BTreeSet;
 use std::error;
-use std::hash::Hash;
 
 use harmonia_store_path::StoreDir;
 use harmonia_store_path_info::{NarHash, UnkeyedValidPathInfo, ValidPathInfo};
@@ -80,35 +79,6 @@ pub fn parse_path_info(
             store_dir,
         },
     })
-}
-
-/// Iterative DFS post-order over `roots`: references before referrers.
-/// `refs_of` returns only edges within the node set. Cycle-safe.
-pub fn topo_order<K, I, F>(roots: I, mut refs_of: F) -> Vec<K>
-where
-    K: Eq + Hash + Clone,
-    I: IntoIterator<Item = K>,
-    F: FnMut(&K) -> Vec<K>,
-{
-    let mut order = Vec::new();
-    let mut seen = HashSet::new();
-    let mut stack: Vec<(K, bool)> = Vec::new();
-    for root in roots {
-        stack.push((root, false));
-        while let Some((k, emit)) = stack.pop() {
-            if emit {
-                order.push(k);
-            } else if seen.insert(k.clone()) {
-                stack.push((k.clone(), true));
-                for r in refs_of(&k) {
-                    if !seen.contains(&r) {
-                        stack.push((r, false));
-                    }
-                }
-            }
-        }
-    }
-    order
 }
 
 #[cfg(test)]

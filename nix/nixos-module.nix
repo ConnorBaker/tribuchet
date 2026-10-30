@@ -158,16 +158,6 @@ in
           so kills builds the CPU arbiter froze for time they did not run.
         '';
       };
-      recursiveNix = lib.mkOption {
-        type = lib.types.bool;
-        default = false;
-        description = ''
-          Patch Nix so external builders see recursive-nix derivations
-          and can populate the registered output closure via a
-          `result.json` sidecar. Off by default; only useful when a
-          tribuchet worker advertises the `recursive-nix` feature.
-        '';
-      };
     };
   };
 
@@ -243,13 +233,11 @@ in
     (lib.mkIf hub.externalBuilders.enable {
       nix.package =
         let
-          patches =
-            lib.optionals hub.externalBuilders.patchNix [
-              ./patches/external-builders-uid-range.patch
-              ./patches/external-builders-decline-fallback.patch
-              ./patches/external-builders-timeouts.patch
-            ]
-            ++ lib.optional hub.externalBuilders.recursiveNix ./patches/recursive-nix-external-builders.patch;
+          patches = lib.optionals hub.externalBuilders.patchNix [
+            ./patches/external-builders-uid-range.patch
+            ./patches/external-builders-decline-fallback.patch
+            ./patches/external-builders-timeouts.patch
+          ];
         in
         if patches == [ ] then
           hub.externalBuilders.nixPackage

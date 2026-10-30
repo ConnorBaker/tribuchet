@@ -188,7 +188,8 @@ pub struct WorkerConfig {
     pub cert: PathBuf,
     #[serde(default = "default_key")]
     pub key: PathBuf,
-    /// Kill builds running longer than this many seconds.
+    /// Kill builds running longer than this many seconds, counted from
+    /// when a build agent starts the build: waiting for a free agent
     /// does not count, nor does time frozen by the CPU arbiter. 0 is
     /// refused at load, not taken as none.
     #[serde(default = "default_build_timeout")]
@@ -229,11 +230,6 @@ pub struct WorkerConfig {
     /// evaluated when a build opens an outbound connection.
     #[serde(default)]
     pub fod_network: NetPolicy,
-    /// Advertise the `recursive-nix` system feature so the hub routes
-    /// derivations using it here. Requires the patched Nix on the
-    /// client side (see `nix/patches/`).
-    #[serde(default)]
-    pub recursive_nix: bool,
     /// Confine builds with a Seatbelt profile (macOS only).
     #[serde(default)]
     pub sandbox: bool,
@@ -241,8 +237,9 @@ pub struct WorkerConfig {
     /// agent count bounds concurrent builds.
     #[serde(default)]
     pub agent_sockets: Vec<PathBuf>,
-    /// Directory whose `*.sock` entries are appended to agent-sockets at
-    /// startup, for hosts that size the agent count at boot.
+    /// Directory whose `*.sock` entries are appended to agent-sockets,
+    /// for hosts that size the agent count at boot. Sockets created
+    /// later join within 10 s.
     #[serde(default)]
     pub agent_sockets_dir: Option<PathBuf>,
     /// Number of agents the worker spawns and supervises itself, for

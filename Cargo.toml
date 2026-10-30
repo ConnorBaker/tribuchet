@@ -53,7 +53,6 @@ harmonia-store-path-info = { git = "https://github.com/nix-community/harmonia", 
 rusqlite = "0.40"
 harmonia-store-db = { git = "https://github.com/nix-community/harmonia", rev = "10a2228f94956fb568dfc799a1c918484bf33653" }
 harmonia-store-remote = { git = "https://github.com/nix-community/harmonia", rev = "10a2228f94956fb568dfc799a1c918484bf33653" }
-harmonia-store-ref-scan = { git = "https://github.com/nix-community/harmonia", rev = "10a2228f94956fb568dfc799a1c918484bf33653" }
 # presto-pasta 0.0.8 with fixes the FOD sandboxes need that are in no
 # release yet: a guest connect the host cannot make is answered at once,
 # and the caller can leave the guest without IPv6 where the host has no

@@ -114,7 +114,6 @@ in
           experimental-features = [
             "ca-derivations"
             "impure-derivations"
-            "recursive-nix"
           ];
           # let the daemon accept uid-range builds; tribuchet's worker
           # provides the actual uid range
@@ -241,12 +240,6 @@ in
             busybox = "${pkgs.pkgsCross.aarch64-multiplatform.pkgsStatic.busybox}";
           }
         '';
-        environment.etc."tt/recursive.nix".text = ''
-          import ${./tests/recursive.nix} {
-            bash = "${pkgs.bash}";
-            nix = "${pkgs.nixVersions.latest}";
-          }
-        '';
 
         imports = [
           nixosModule
@@ -258,7 +251,6 @@ in
           settings.worker-grace-secs = 2;
           externalBuilders = {
             enable = true;
-            recursiveNix = true;
             systems = [
               "x86_64-linux"
               "aarch64-linux"
@@ -353,7 +345,6 @@ in
             max-log-size = 1048576;
             # 2 GiB, exceeded only by the memhog subtest
             build-memory-max-bytes = 2147483648;
-            recursive-nix = true;
             # exercised by the fod-policy subtest
             fod-network.rules = [
               {

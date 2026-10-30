@@ -82,6 +82,7 @@ struct ReplayInner {
     /// An output's chunks are going out: since the last Output with no
     /// OutputRestart (a requeue) after it.
     streaming: bool,
+    /// Verdict events, kept past a buffer overflow.
     ending: Vec<AttachEvent>,
     /// The latest delivery's outputs, for catch_up.
     outputs: Option<Arc<KeptOutputs>>,
@@ -136,6 +137,9 @@ fn missed(outputs: Option<&KeptOutputs>) -> Vec<AttachEvent> {
 
 /// Bring a subscriber that missed events to the end of the build:
 /// `missed`, every output from the start out of the chunk cache if the
+/// build succeeded, then the verdict. Without a verdict it is told to
+/// resubmit. Once the verdict is sent, and with it the last chunk read,
+/// it logs how long after the build `ended`.
 async fn catch_up(
     tx: EventTx,
     id: String,
@@ -213,9 +217,7 @@ fn event_size(ev: &attach_event::Event) -> usize {
     match ev {
         attach_event::Event::Log(d) => d.len(),
         attach_event::Event::Output(o) => o.zstd_nar_chunk.len(),
-        attach_event::Event::OutputRestart(p)
-        | attach_event::Event::AddedPath(p)
-        | attach_event::Event::Dispatched(p) => p.len(),
+        attach_event::Event::OutputRestart(p) | attach_event::Event::Dispatched(p) => p.len(),
         attach_event::Event::Error(e) => e.len(),
         attach_event::Event::ExitCode(_) => 0,
     }

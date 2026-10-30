@@ -6,7 +6,7 @@
 //! performs self-reference rewriting and registration afterwards).
 //! Exits with the builder's exit code.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -34,7 +34,7 @@ use crate::tmpdir;
 pub fn run(build_json: &Path, socket: &Path) -> Result<()> {
     let build = BuildJson::load(build_json)?;
     let rt = rt::runtime("trib-attach").map_err(err_ctx("creating the tokio runtime"))?;
-    let code = rt.block_on(run_async(build, socket.to_owned(), build_json.to_owned()))?;
+    let code = rt.block_on(run_async(build, socket.to_owned()))?;
     // Unix exposes only the low 8 bits of the exit status; never let a
     // nonzero code collapse to an observed 0.
     process::exit(if code != 0 && code.trailing_zeros() >= 8 {
@@ -50,7 +50,7 @@ pub fn run(build_json: &Path, socket: &Path) -> Result<()> {
 const RECONNECT_ATTEMPTS: u32 = 30;
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
-async fn run_async(build: BuildJson, socket: PathBuf, build_json_path: PathBuf) -> Result<i32> {
+async fn run_async(build: BuildJson, socket: PathBuf) -> Result<i32> {
     if build
         .real_store_dir
         .as_deref()
@@ -87,9 +87,6 @@ async fn run_async(build: BuildJson, socket: PathBuf, build_json_path: PathBuf) 
     })
     .await??;
     let expected_outputs: Vec<String> = req.outputs.values().cloned().collect();
-    let top_tmp_dir = build_json_path
-        .parent()
-        .map_or_else(|| PathBuf::from("."), Path::to_owned);
 
     // The hub holds no durable state: when it restarts mid-build we
     // reconnect and resubmit the identical request. Its dedupe key
@@ -97,15 +94,7 @@ async fn run_async(build: BuildJson, socket: PathBuf, build_json_path: PathBuf) 
     // instead of building twice.
     let mut attempts = 0u32;
     loop {
-        match attempt_build(
-            &req,
-            &tmp_dir_pack,
-            &socket,
-            &expected_outputs,
-            &top_tmp_dir,
-        )
-        .await?
-        {
+        match attempt_build(&req, &tmp_dir_pack, &socket, &expected_outputs).await? {
             Outcome::Done(code) => return Ok(code),
             Outcome::Retry(e) => {
                 attempts += 1;
@@ -169,7 +158,6 @@ async fn attempt_build(
     tmp_dir_pack: &[u8],
     socket: &Path,
     expected_outputs: &[String],
-    top_tmp_dir: &Path,
 ) -> Result<Outcome> {
     let channel = match connect(socket).await {
         Ok(c) => c,
@@ -196,9 +184,6 @@ async fn attempt_build(
     };
 
     let mut unpackers: HashMap<String, Unpacker> = HashMap::default();
-    // BTreeSet dedupes events replayed across reconnects and gives
-    // result.json a stable order.
-    let mut added_paths: BTreeSet<String> = BTreeSet::new();
 
     loop {
         let ev = match stream.message().await {
@@ -227,9 +212,6 @@ async fn attempt_build(
             Some(attach_event::Event::Output(out)) => {
                 handle_output_chunk(&mut unpackers, expected_outputs, out).await?;
             }
-            Some(attach_event::Event::AddedPath(path)) => {
-                added_paths.insert(path);
-            }
             Some(attach_event::Event::Dispatched(worker)) => {
                 eprintln!("tribuchet: building on {worker}");
             }
@@ -244,9 +226,6 @@ async fn attempt_build(
             Some(attach_event::Event::ExitCode(code)) => {
                 if !unpackers.is_empty() {
                     return Err(err_msg("hub closed build with unfinished output transfers"));
-                }
-                if code == 0 && !added_paths.is_empty() {
-                    write_result_json(top_tmp_dir, &added_paths)?;
                 }
                 return Ok(Outcome::Done(code));
             }
@@ -336,15 +315,6 @@ async fn handle_output_chunk(
         tracing::debug!(path = out.store_path, "output unpacked");
     }
     Ok(())
-}
-
-/// Sidecar the patched external-derivation-builder reads to extend
-/// addedPaths before the output reference scan.
-fn write_result_json(top_tmp_dir: &Path, added: &BTreeSet<String>) -> Result<()> {
-    let path = top_tmp_dir.join("result.json");
-    let body = serde_json::json!({ "addedPaths": added });
-    fs::write(&path, serde_json::to_vec(&body)?)
-        .map_err(err_ctx(format!("writing {}", path.display())))
 }
 
 /// Stop in-flight unpackers; partial trees stay at the output paths

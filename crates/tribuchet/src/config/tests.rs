@@ -44,3 +44,30 @@ fn sandbox_defaults_off() {
     assert!(!parse("").sandbox);
     assert!(parse("sandbox = true").sandbox);
 }
+
+/// An unknown key fails the load, the removed holds, arbiter and
+/// recursive-nix keys among them: none is read, nothing turns the CPU
+/// arbiter off, and no worker seems to serve recursive Nix.
+#[test]
+fn unknown_keys_are_rejected() {
+    let unknown = |set: &str| format!("unknown field `{}`", set.split(' ').next().unwrap());
+    for set in [
+        "max-jobs = 2",
+        "cancel-grace-secs = 10",
+        "clientless-hold-secs = 2002",
+        "placement = {}",
+        "max-job-attempts = 5",
+        "max-resumed-losses = 20",
+    ] {
+        let err = toml::from_str::<HubConfig>(set).unwrap_err();
+        assert!(err.to_string().contains(&unknown(set)), "{set}: {err}");
+    }
+    for set in [
+        "cpu-arbiter = false",
+        "cpu-arbiter-max-frozen-secs = 590",
+        "recursive-nix = true",
+    ] {
+        let err = toml::from_str::<WorkerConfig>(&format!("hub = \"x\"\n{set}")).unwrap_err();
+        assert!(err.to_string().contains(&unknown(set)), "{set}: {err}");
+    }
+}

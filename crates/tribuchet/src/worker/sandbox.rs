@@ -50,6 +50,9 @@ pub struct SandboxSpec {
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
     pub cwd: String,
+    /// Fixed-output build: a private netns with the presto-pasta
+    /// user-mode NAT, as every build has a netns of its own; host
+    /// abstract sockets and loopback services stay unreachable.
     pub network: bool,
     /// Linux: private root directory. macOS: unused.
     pub root: PathBuf,
@@ -63,8 +66,8 @@ pub struct SandboxSpec {
     /// Scratch output store paths.
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub outputs: Vec<String>,
-    /// Input store paths visible to the builder; reference-scan
-    /// candidates alongside outputs.
+    /// Input store paths visible to the builder, temp-rooted again when
+    /// a restarted worker adopts the build.
     #[serde(default)]
     pub store_inputs: Vec<String>,
     /// Store objects that are themselves symlinks: (path inside the
@@ -82,9 +85,9 @@ pub struct SandboxSpec {
     /// Uids mapped in that namespace at in-ns 0 (1 or 65536).
     #[serde(default)]
     pub leased_uid_count: Option<u32>,
-    /// Fixed-output build: private netns with the presto-pasta
-    /// user-mode NAT; host abstract sockets and loopback services
-    /// stay unreachable.
+    /// Its network is a namespace of its own; set with `network`
+    /// (prepare). A spec with network but without it, as older workers sent
+    /// on a host without /dev/net/tun, is unconfined.
     #[serde(default)]
     pub net_isolation: bool,
     /// Flow policy applied to that network.
@@ -109,16 +112,26 @@ pub struct SandboxSpec {
     /// Secret files the build must never read (the worker TLS
     /// key). Defense in depth, the mount namespace already hides them.
     pub deny_read: Vec<PathBuf>,
-    /// Sandbox has the host daemon socket bind-mounted in; the
-    /// closure-delta producer also consults this flag.
-    #[serde(default)]
-    pub recursive_nix: bool,
 }
 
-/// Default daemon socket path inside the sandbox; `nix` looks here
-/// unless `NIX_REMOTE` overrides.
-#[cfg(target_os = "linux")]
-pub const NIX_DAEMON_SOCKET: &str = "/nix/var/nix/daemon-socket/socket";
+impl SandboxSpec {
+    /// Why a build with this spec may not run, if it may not: with
+    /// network but in the host's network, or with the host's nix-daemon
+    /// socket bound in (recursive Nix, which workers no longer serve). No
+    /// spec this worker sends is either, but one an older
+    /// worker persisted can still describe a running build: agents
+    /// outlive an upgrade.
+    pub fn unconfined(&self) -> Option<&'static str> {
+        if self.network && !self.net_isolation {
+            Some("with network in the host's network")
+        } else if (self.binds_ro.iter()).any(|(_, to)| to.starts_with("/nix/var/nix/daemon-socket"))
+        {
+            Some("with the host's nix-daemon socket")
+        } else {
+            None
+        }
+    }
+}
 
 /// Host path where the builder's output for `scratch` lands.
 pub fn output_host_path(spec: &SandboxSpec, scratch: &str) -> PathBuf {
@@ -143,12 +156,6 @@ pub struct PrepareOpts<'a> {
     pub emulator: Option<&'a Path>,
     /// Flow policy applied to a build's network.
     pub net_policy: NetPolicy,
-    /// Bind-mount the host nix-daemon socket into the sandbox so the
-    /// builder can register inner-build outputs.
-    pub recursive_nix: bool,
-    /// Host path of the daemon socket to expose; only consulted when
-    /// `recursive_nix` is set.
-    pub nix_daemon_socket: Option<&'a Path>,
 }
 
 /// Whether the build `a` gets network: its derivation is fixed-output by
@@ -226,11 +233,11 @@ pub fn prepare(
         leased_uid_count: opts.leased_uid_count,
         net_isolation: network,
         net_policy: opts.net_policy.clone(),
+        // filled in by the agent, like the namespace and cgroup
         net_fwd_fd: None,
         net_ipv6: false,
         emulator: opts.emulator.map(Path::to_path_buf),
         deny_read: opts.secrets.to_vec(),
-        recursive_nix: opts.recursive_nix,
     };
     if let Some(em) = opts.emulator {
         spec.binds_ro
@@ -241,20 +248,6 @@ pub fn prepare(
         // need a shell at /bin/sh.
         spec.binds_ro
             .push((sh.to_owned(), PathBuf::from("/bin/sh")));
-    }
-    if opts.recursive_nix {
-        let host = opts
-            .nix_daemon_socket
-            .unwrap_or_else(|| Path::new(NIX_DAEMON_SOCKET));
-        spec.binds_ro
-            .push((host.to_path_buf(), PathBuf::from(NIX_DAEMON_SOCKET)));
-        // The hub-side patched Nix points NIX_REMOTE at its own
-        // topTmpDir/.nix-socket (where its in-process recursive
-        // daemon would listen); redirect to the worker's daemon.
-        spec.env.insert(
-            "NIX_REMOTE".to_owned(),
-            format!("unix://{NIX_DAEMON_SOCKET}"),
-        );
     }
     spec.binds_ro.sort(); // deterministic mount order
     Ok(spec)
@@ -345,72 +338,8 @@ mod platform;
 mod tests {
     use super::*;
     use crate::build_json::tests::{HASH, INPUT_ADDRESSED, SRI};
-    use std::collections::BTreeMap;
     use std::{error, result};
     type Result<T> = result::Result<T, Box<dyn error::Error>>;
-
-    fn min_assignment() -> BuildAssignment {
-        BuildAssignment {
-            build_id: "0123456789abcdef0123456789abcdef".into(),
-            dedupe_key: "k".into(),
-            required_features: vec![],
-            local_networking: false,
-            system: "x86_64-linux".into(),
-            builder: "/nix/store/00000000000000000000000000000000-b/bin/b".into(),
-            args: vec![],
-            env: BTreeMap::default(),
-            outputs: BTreeMap::default(),
-            tmp_dir_in_sandbox: "/build".into(),
-            store_dir: "/nix/store".into(),
-            fixed_output: false,
-            inputs: vec![],
-            ..Default::default()
-        }
-    }
-
-    /// recursive-nix flag toggles a daemon-socket bind; without it,
-    /// no /nix/var path appears in binds_ro.
-    #[test]
-    fn recursive_nix_adds_the_daemon_socket_bind() -> Result<()> {
-        let host = tempfile::tempdir()?;
-        let host_sock = host.path().join("sock");
-        fs::File::create(&host_sock)?;
-
-        let off_dir = tempfile::tempdir()?;
-        let off = prepare(
-            &min_assignment(),
-            off_dir.path(),
-            &[],
-            &PrepareOpts {
-                recursive_nix: false,
-                nix_daemon_socket: Some(&host_sock),
-                ..Default::default()
-            },
-        )?;
-        assert!(
-            off.binds_ro
-                .iter()
-                .all(|(_, dst)| dst != Path::new(NIX_DAEMON_SOCKET))
-        );
-
-        let on_dir = tempfile::tempdir()?;
-        let on = prepare(
-            &min_assignment(),
-            on_dir.path(),
-            &[],
-            &PrepareOpts {
-                recursive_nix: true,
-                nix_daemon_socket: Some(&host_sock),
-                ..Default::default()
-            },
-        )?;
-        assert!(
-            on.binds_ro
-                .iter()
-                .any(|(src, dst)| src == &host_sock && dst == Path::new(NIX_DAEMON_SOCKET))
-        );
-        Ok(())
-    }
 
     /// Common fields for a /bin/sh test build rooted in `dir`;
     /// tests override what they exercise via struct update syntax.
@@ -423,6 +352,43 @@ mod tests {
             build_dir: dir.join("top/build"),
             ..SandboxSpec::default()
         }
+    }
+
+    /// What a spec may not run with, whoever wrote it.
+    #[test]
+    fn network_in_the_hosts_network_or_its_daemon_is_unconfined() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = |network, net_isolation, bind: &str| SandboxSpec {
+            network,
+            net_isolation,
+            binds_ro: vec![(PathBuf::from("/x"), PathBuf::from(bind))],
+            ..test_spec(dir.path())
+        };
+        let socket = "/nix/var/nix/daemon-socket/socket";
+        assert_eq!(spec(false, false, "/nix/store/x").unconfined(), None);
+        assert_eq!(spec(true, true, "/nix/store/x").unconfined(), None);
+        let host = Some("with network in the host's network");
+        assert_eq!(spec(true, false, "/nix/store/x").unconfined(), host);
+        let daemon = Some("with the host's nix-daemon socket");
+        assert_eq!(spec(false, false, socket).unconfined(), daemon);
+        assert_eq!(spec(true, true, socket).unconfined(), daemon);
+    }
+
+    /// The setup stage refuses an unconfined spec before it enters any
+    /// namespace: the build never runs in the host's network.
+    #[test]
+    fn the_setup_stage_refuses_an_unconfined_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = SandboxSpec {
+            network: true,
+            ..test_spec(dir.path())
+        };
+        let status = fs::File::create(dir.path().join("status")).unwrap();
+        let err = platform::stage::enter_and_exec(&spec, &status).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "refusing a build with network in the host's network"
+        );
     }
 
     /// A fixed-output build, from its env or structured attrs and its
@@ -443,6 +409,7 @@ mod tests {
         };
         let network = |a: &BuildAssignment| -> Result<(bool, bool)> {
             let spec = prepare(a, dir.path(), &[], &PrepareOpts::default())?;
+            assert!(spec.unconfined().is_none());
             Ok((spec.network, spec.net_isolation))
         };
         let fod = build(false, SRI, &[("outputHash", HASH)]);

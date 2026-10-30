@@ -214,11 +214,18 @@ pub(super) fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
 }
 
 impl WorkerCaps {
+    /// Never a build no worker serves (unserved).
     pub(super) fn serves(&self, system: &str, features: &[String]) -> bool {
         self.systems
             .get(system)
-            .is_some_and(|have| features.iter().all(|f| have.contains(f)))
+            .is_some_and(|have| !unserved(features) && features.iter().all(|f| have.contains(f)))
     }
+}
+
+/// Whether `features` require recursive-nix, which no worker supports
+/// though an older one may advertise it: no worker serves such a build.
+pub(super) fn unserved(features: &[String]) -> bool {
+    features.iter().any(|f| f == "recursive-nix")
 }
 
 impl HubState {

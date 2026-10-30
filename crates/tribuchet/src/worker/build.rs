@@ -5,6 +5,7 @@ use std::fs;
 use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use harmonia_store_path::{StoreDir, StorePath, StorePathSet};
 use harmonia_store_path_info::ValidPathInfo;
@@ -38,7 +39,7 @@ type Unpacker = (mpsc::Sender<Vec<u8>>, tokio::task::JoinHandle<Result<()>>);
 
 pub(super) struct ActiveBuild {
     pub(super) assignment: BuildAssignment,
-    pub(super) dir: PathBuf, // state_dir/builds/<id>
+    pub(super) dir: PathBuf, // state_dir/builds/<id>.<ns>, the run's own
     pub(super) ctx: Arc<WorkerCtx>,
     /// None while staged as lookahead beyond the free slots.
     pub(super) slot: Option<Slot>,
@@ -86,10 +87,15 @@ impl ActiveBuild {
         ctx: Arc<WorkerCtx>,
         wake: mpsc::UnboundedSender<Wake>,
     ) -> Result<Self> {
-        let dir = ctx.state_dir.join("builds").join(&assignment.build_id);
-        if dir.exists() {
-            fs::remove_dir_all(&dir).map_err(io_ctx("removing", &dir))?;
-        }
+        // A dir of its own: the hub may run a build id again while its
+        // earlier run's is still in use (killed for a cancel, or removed).
+        let run = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = ctx
+            .state_dir
+            .join(format!("builds/{}.{run}", assignment.build_id));
         fs::create_dir_all(dir.join("top/build"))
             .map_err(io_ctx("creating", &dir.join("top/build")))?;
         let chunks = ChunkStaging::new(ctx.chunks.clone());
@@ -430,16 +436,65 @@ pub(super) use validate::validate_assignment;
 mod import_pool;
 mod outputs;
 pub(super) use agent_exec::supervise_agent;
-pub(super) use outputs::pack_outputs_and_extras;
+pub(super) use outputs::pack_outputs;
+
+#[cfg(test)]
+#[path = "build/wait_tests.rs"]
+mod wait_tests;
 
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::time::Duration;
 
+    use super::wait_tests::waiting_build;
     use super::*;
     use crate::build_json::tests::{HASH, SRI};
 
-    fn base_assignment() -> BuildAssignment {
+    /// A build id run again gets a dir of its own, and its earlier run's
+    /// dir, perhaps still in use, is left be. Before, it was removed.
+    #[test]
+    fn a_build_id_run_again_has_a_dir_of_its_own() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let ctx = WorkerCtx::for_test(dir.path(), 1, vec![])?;
+        let run = || ActiveBuild::new(base_assignment(), ctx.clone(), mpsc::unbounded_channel().0);
+        let earlier = run()?;
+        fs::write(earlier.dir.join("build.log"), "running")?;
+        let again = run()?;
+        assert_ne!(again.dir, earlier.dir);
+        assert_eq!(
+            fs::read_to_string(earlier.dir.join("build.log"))?,
+            "running"
+        );
+        Ok(())
+    }
+
+    /// A build with network is refused, named, where the worker cannot
+    /// give it a network of its own (a Linux worker without /dev/net/tun,
+    /// any macOS worker), before any agent is asked: not run in the
+    /// worker's network.
+    #[test]
+    fn a_build_with_network_is_refused_where_it_cannot_be_isolated() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (out_tx, _out_rx) = mpsc::channel(8);
+        let a = BuildAssignment {
+            env: [("outputHash".to_owned(), HASH.to_owned())].into(),
+            outputs: [("out".to_owned(), SRI.to_owned())].into(),
+            ..base_assignment()
+        };
+        let (ctx, build, _woken) = waiting_build(dir.path(), a, &out_tx)?;
+        // Cancelled, so that a build not refused does not wait for its
+        // agent, which is down: it fails as cancelled instead.
+        ctx.cancelled.lock().unwrap().insert("test-key".into());
+        let refused = build.execute(&out_tx, Duration::from_secs(60)).err();
+        assert_eq!(
+            refused.map(|e| chain(&e)).as_deref(),
+            Some("refusing a build with network: this worker cannot give it a network of its own")
+        );
+        Ok(())
+    }
+
+    pub(super) fn base_assignment() -> BuildAssignment {
         BuildAssignment {
             build_id: "0123456789abcdef0123456789abcdef".into(),
             dedupe_key: "test-key".into(),
@@ -456,8 +511,6 @@ mod tests {
             .into(),
             tmp_dir_in_sandbox: "/build".into(),
             store_dir: "/nix/store".into(),
-            fixed_output: false,
-            inputs: vec![],
             ..Default::default()
         }
     }

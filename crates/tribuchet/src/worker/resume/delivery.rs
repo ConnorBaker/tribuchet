@@ -11,14 +11,12 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
-use super::BuildState;
+use super::{BuildState, unrecord};
 use crate::chunker::parse_hashes;
 use crate::chunkstore::Hash;
 use crate::errors::{Result, chain, err_msg};
 use crate::fsutil::io_ctx;
-use crate::proto::{
-    BuildResult, BuildUsage, ChunkFrame, Manifest, PathInfoMsg, WorkerMessage, worker_message,
-};
+use crate::proto::{BuildResult, BuildUsage, ChunkFrame, Manifest, WorkerMessage, worker_message};
 use crate::worker::build::ActiveBuild;
 use crate::worker::logtail::LogTail;
 use crate::worker::{WorkerCtx, msg, remove_build_dir};
@@ -31,35 +29,53 @@ pub(in crate::worker) fn spawn_resumable_reaper(ctx: Arc<WorkerCtx>) {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(Duration::from_mins(1)).await;
-            let mut expired = Vec::new();
-            {
-                let mut map = ctx.resumable.lock().unwrap();
-                map.retain(|key, e| match &e.finished {
-                    Some(fin)
-                        if !e.delivering
-                            && Arc::strong_count(fin) == 1
-                            && fin.finished_at.elapsed() > TTL =>
-                    {
-                        expired.push((key.clone(), fin.dir.clone()));
-                        false
-                    }
-                    _ => true,
-                });
-            }
-            for (key, dir) in expired {
-                remove_build_dir(&dir);
-                tracing::warn!(
-                    key,
-                    "dropping undelivered build result (no resume within TTL)"
-                );
-            }
+            let ctx = ctx.clone();
+            // Its file I/O never runs on a runtime worker.
+            let _ = tokio::task::spawn_blocking(move || reap(&ctx, TTL)).await;
         }
     });
+}
+
+/// The dir of a result finished over `ttl` ago that no session is sent.
+fn expired(e: &ResumableBuild, ttl: Duration) -> Option<&PathBuf> {
+    let fin = e.finished.as_ref()?;
+    let idle = !e.delivering && Arc::strong_count(fin) == 1;
+    (idle && fin.finished_at.elapsed() > ttl).then_some(&fin.dir)
+}
+
+/// Drop the results `expired` names, with no file I/O under the registry
+/// lock. Each one's state.json goes before its key: the hub, told by the
+/// next heartbeat without the key, may run the build again under the same
+/// build id, which a worker adopting from that state would take for this
+/// result. A result a session starts to deliver meanwhile keeps its key.
+pub(super) fn reap(ctx: &WorkerCtx, ttl: Duration) {
+    let candidates: Vec<(String, PathBuf)> = ctx
+        .resumable
+        .lock()
+        .unwrap()
+        .iter()
+        .filter_map(|(key, e)| Some((key.clone(), expired(e, ttl)?.clone())))
+        .collect();
+    for (key, dir) in candidates {
+        unrecord(&dir);
+        let mut map = ctx.resumable.lock().unwrap();
+        if map.get(&key).and_then(|e| expired(e, ttl)) != Some(&dir) {
+            continue;
+        }
+        map.remove(&key);
+        drop(map);
+        remove_build_dir(&dir);
+        tracing::warn!(
+            key,
+            "dropping undelivered build result (no resume within TTL)"
+        );
+    }
 }
 
 /// A build past staging: running, or finished with its result not yet
 /// delivered to any hub. Keyed by the assignment's dedupe_key, which
 /// survives hub restarts (build ids do not).
+#[derive(Default)]
 pub(in crate::worker) struct ResumableBuild {
     /// From the latest assignment; result messages carry this id.
     pub(in crate::worker) build_id: String,
@@ -77,6 +93,21 @@ pub(in crate::worker) struct ResumableBuild {
     /// Replays the log to the resumed session; joined before the
     /// result is delivered so logs arrive first.
     pub(in crate::worker) log_tail: Option<LogTail>,
+    /// It waits for a build agent (WorkerCtx::wait_for_agent).
+    pub(in crate::worker) waiting_for_agent: bool,
+    /// The number of its latest wait's start or end or takeover during a
+    /// wait, unique in the worker: a note is told for it only (tell_wait).
+    pub(in crate::worker) wait: u64,
+    /// The agent it waits for is the one running it, which did not
+    /// answer when this worker started (resume::wait_for_agent).
+    pub(in crate::worker) adopting: bool,
+    /// The hub cancelled the run for its latest assignment
+    /// (session::handle_cancel); a later assignment voids that while the
+    /// run goes on, held for its agent included (adopt_assignment).
+    pub(in crate::worker) cancelled: bool,
+    /// The worker's name as the latest assignment's hub knows it;
+    /// empty when unknown.
+    pub(in crate::worker) worker_name: String,
 }
 
 impl ResumableBuild {
@@ -93,11 +124,9 @@ impl ResumableBuild {
             key,
             Self {
                 build_id,
-                out_tx: None,
                 finished,
-                delivering: false,
                 dir,
-                log_tail: None,
+                ..Self::default()
             },
         );
     }
@@ -145,9 +174,6 @@ pub(in crate::worker) struct FinishedBuild {
     pub(in crate::worker) usage: Usage,
     pub(in crate::worker) error: String,
     pub(in crate::worker) outputs: Vec<PackedOutput>,
-    /// Recursive-nix closure-delta paths the builder registered with
-    /// the worker daemon; empty for non-recursive builds.
-    pub(in crate::worker) extras: Vec<PackedExtra>,
     /// Build dir holding the chunk frames, removed after delivery.
     pub(in crate::worker) dir: PathBuf,
     pub(in crate::worker) finished_at: Instant,
@@ -168,45 +194,39 @@ fn recipe(chunks: &[OutChunk]) -> (Vec<u8>, Vec<u64>) {
     (hashes, sizes)
 }
 
-/// One closure-delta path: PathInfo from the worker daemon plus its chunks.
-#[derive(Clone, serde::Serialize, serde::Deserialize)]
-pub(in crate::worker) struct PackedExtra {
-    /// Absolute store path of the registered extra.
-    pub(in crate::worker) path: String,
-    pub(in crate::worker) frames_file: PathBuf,
-    pub(in crate::worker) chunks: Vec<OutChunk>,
-    pub(in crate::worker) nar_sha256: Vec<u8>,
-    pub(in crate::worker) nar_size: u64,
-    pub(in crate::worker) references: Vec<String>,
-    /// Existing daemon signatures (`name:base64`).
-    pub(in crate::worker) sigs: Vec<String>,
-    /// Absolute store path or empty.
-    pub(in crate::worker) deriver: String,
-    /// Content-address string or empty.
-    pub(in crate::worker) ca: String,
-}
-
 #[derive(Clone, serde::Serialize, serde::Deserialize)]
 pub(in crate::worker) struct PackedOutput {
     pub(in crate::worker) scratch: String,
     pub(in crate::worker) frames_file: PathBuf,
     pub(in crate::worker) chunks: Vec<OutChunk>,
-    /// Store paths the NAR references (intersection with the
-    /// candidate set: inputs, sibling outputs, proxy-added paths).
-    #[serde(default)]
-    pub(in crate::worker) references: Vec<String>,
 }
 
 /// Record a build's result in the registry (persisted for redelivery
 /// across worker generations) and start delivering it. Shared by the
 /// normal execute path and re-adopted builds.
 pub(in crate::worker) fn record_finished(ctx: &Arc<WorkerCtx>, key: &str, fin: FinishedBuild) {
+    // build_id may have changed via a resume assignment meanwhile
+    let held = match ctx.resumable.lock().unwrap().get(key) {
+        Some(e) if e.dir == fin.dir => Some(e.build_id.clone()),
+        _ => None,
+    };
+    // Written under no lock, before the registry has the
+    // result: what removes a result's state.json (the reaper, an ack)
+    // waits for that, so this write never follows it.
+    if let Some(build_id) = held {
+        persist_finished(key, &build_id, &fin);
+    }
     {
         let mut map = ctx.resumable.lock().unwrap();
-        if let Some(e) = map.get_mut(key) {
-            // build_id may have changed via a resume assignment meanwhile
-            persist_finished(key, &e.build_id, &fin);
-            e.finished = Some(Arc::new(fin));
+        match map.get_mut(key) {
+            // A run killed for a cancel, its key since run anew.
+            Some(e) if e.dir != fin.dir => {
+                drop(map);
+                remove_build_dir(&fin.dir);
+                return;
+            }
+            Some(e) => e.finished = Some(Arc::new(fin)),
+            None => {}
         }
     }
     // A cancel flag the abort loop did not get to consume (the build
@@ -220,7 +240,7 @@ pub(in crate::worker) fn record_finished(ctx: &Arc<WorkerCtx>, key: &str, fin: F
 
 /// Persist for redelivery by a replacement worker; the rename
 /// atomically supersedes the running state.
-fn persist_finished(key: &str, build_id: &str, fin: &FinishedBuild) {
+pub(in crate::worker) fn persist_finished(key: &str, build_id: &str, fin: &FinishedBuild) {
     let state = BuildState::Finished {
         dedupe_key: key.to_string(),
         build_id: build_id.to_string(),
@@ -228,7 +248,6 @@ fn persist_finished(key: &str, build_id: &str, fin: &FinishedBuild) {
         usage: fin.usage,
         error: fin.error.clone(),
         outputs: fin.outputs.clone(),
-        extras: fin.extras.clone(),
     };
     let tmp = fin.dir.join("state.json.tmp");
     if let Ok(json) = serde_json::to_vec(&state)
@@ -257,7 +276,6 @@ pub(in crate::worker) fn execute_to_finished(
                 usage: Usage::default(),
                 error: e,
                 outputs: vec![],
-                extras: vec![],
                 dir: build.dir.clone(),
                 finished_at: Instant::now(),
             }
@@ -275,27 +293,6 @@ fn deliver(
         build_id: build_id.into(),
         exit_code: fin.exit_code,
         usage: Some(fin.usage.into()),
-        extras: fin
-            .extras
-            .iter()
-            .map(|e| {
-                let (hashes, sizes) = recipe(&e.chunks);
-                Manifest {
-                    build_id: String::new(),
-                    store_path: e.path.clone(),
-                    hashes,
-                    sizes,
-                    info: Some(PathInfoMsg {
-                        nar_sha256: e.nar_sha256.clone(),
-                        nar_size: e.nar_size,
-                        references: e.references.clone(),
-                        signatures: e.sigs.clone(),
-                        deriver: e.deriver.clone(),
-                        ca: e.ca.clone(),
-                    }),
-                }
-            })
-            .collect(),
         outputs: fin
             .outputs
             .iter()
@@ -316,21 +313,17 @@ fn deliver(
 }
 
 /// Answer the hub's Need: every needed chunk once, in recipe
-/// order across outputs then extras, then eof. Blocking.
+/// order across outputs, then eof. Blocking.
 fn send_chunks(
     fin: &FinishedBuild,
     build_id: &str,
     mut needed: HashSet<Hash>,
     out_tx: &mpsc::Sender<WorkerMessage>,
 ) -> Result<()> {
-    let files = fin
-        .outputs
-        .iter()
-        .map(|o| (&o.frames_file, &o.chunks))
-        .chain(fin.extras.iter().map(|e| (&e.frames_file, &e.chunks)));
-    for (path, chunks) in files {
+    for o in &fin.outputs {
+        let path = &o.frames_file;
         let f = fs::File::open(path).map_err(io_ctx("opening", path))?;
-        for c in chunks {
+        for c in &o.chunks {
             if !needed.remove(&c.hash) {
                 continue;
             }

@@ -206,9 +206,13 @@ again.
 Worker redeploys are plain unit restarts: builds run under the
 per-uid agent services, which hold the log and exit status until a
 worker collects them, and resume state is persisted in the build
-dirs. The replacement worker re-adopts running builds from their
-agents, supervises them to completion and redelivers finished
-results. The hub covers the
+dir of each run (`builds/<id>.<ns>`, one per run of a build, which no
+other run removes). The replacement worker re-adopts running builds
+from their agents, supervises them to completion and redelivers finished
+results. A worker runs min(`max-jobs`, reachable agents) builds; a
+running build whose agent does not answer keeps its key, its slot and
+its agent until the agent answers, and its clients are told it waits.
+The hub covers the
 session gap by requeueing instead of failing jobs whose worker
 session died; the attached client sees a pause, not an error. A full
 stop behaves the same way: builds keep running, and their results

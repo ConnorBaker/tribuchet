@@ -161,7 +161,9 @@ pub(super) fn spawn_builder(
     sandbox::prepare_root(&mut spec).map_err(err_ctx("creating the sandbox root skeleton"))?;
     // Isolated network builds hand their tap fd back over this
     // socketpair to the forwarder thread spawned below.
-    let net_fwd = if spec.net_isolation && spec.network {
+    let net_fwd = if spec.network {
+        // Decided per build where the datapath's host sockets live.
+        spec.net_ipv6 = presto_pasta::netdev::host_has_ipv6_default_route();
         let (ours, theirs) = socketpair(
             AddressFamily::UNIX,
             SocketType::DGRAM,

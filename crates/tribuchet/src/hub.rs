@@ -9,6 +9,7 @@
 //! - verifies output chunks against their manifest while relaying
 
 use std::collections::HashMap;
+use std::mem;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -47,7 +48,6 @@ use losses::Dispatch;
 use metrics::Metrics;
 use relay::{WorkerSession, run_job, send};
 use state::{Holding, HubState, Job, WorkerCaps};
-use std::mem;
 
 /// No worker message for this long tears the session down and fails
 /// its builds: heartbeats flow every 30s, so silence means a dead
@@ -218,6 +218,14 @@ async fn route_loop(
         }
         if let worker_message::Msg::Heartbeat(h) = &m {
             state.hold(worker, h.resumable_keys.iter().cloned().collect(), true);
+            let changed = h.max_jobs.is_some_and(|jobs| {
+                let mut caps = state.worker_caps.lock().unwrap();
+                caps.get_mut(&worker)
+                    .is_some_and(|c| mem::replace(&mut c.max_jobs, jobs) != jobs)
+            });
+            if changed {
+                state.regen_nix_config();
+            }
         }
         let Some(id) = msg_build_id(&m).map(str::to_string) else {
             continue;

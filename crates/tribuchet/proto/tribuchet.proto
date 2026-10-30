@@ -133,6 +133,9 @@ message Heartbeat {
   double load1 = 2;
   // Current Register.resumable_keys. Keys not listed are no longer held.
   repeated string resumable_keys = 3;
+  // Current Register.max_jobs: reachable build agents change. Unset by
+  // workers predating the field.
+  optional uint32 max_jobs = 4;
 }
 
 message BuildAssignment {
@@ -152,6 +155,10 @@ message BuildAssignment {
   repeated Manifest inputs = 11;
   repeated string required_features = 12;
   bool local_networking = 13;
+  // The name the hub knows the worker by (in tailscale mode the tailnet
+  // node name, not the worker's hostname), for the notes the worker
+  // sends the client. Empty from hubs predating the field.
+  string worker_name = 14;
   // BuildRequest's limits. The worker takes the lesser of each and its
   // own; 0 (none, or from hubs predating the fields) leaves its own.
   uint64 timeout_secs = 15;
@@ -193,11 +200,8 @@ message BuildResult {
   // lacks with Need and assembles the NAR.
   repeated Manifest outputs = 3;
   string error = 4;
-  // Inner outputs and AddToStore'd paths the build's outputs
-  // reference (recursive-nix). The hub registers each in the local
-  // store via AddToStoreNar. Attach receives an AddedPath event per
-  // registered extra.
-  repeated Manifest extras = 5; // with info
+  // Was the recursive-nix extras; never reuse.
+  reserved 5;
   // What the build used on the worker; all 0 when unknown.
   BuildUsage usage = 6;
 }
@@ -266,6 +270,8 @@ message BuildRequest {
 }
 
 message AttachEvent {
+  // Was added_path, a recursive-nix extra; never reuse.
+  reserved 6;
   oneof event {
     bytes log = 1;
     OutputNar output = 2;
@@ -275,10 +281,6 @@ message AttachEvent {
     // build was handed to another worker attempt and the output will
     // be streamed again from the start.
     string output_restart = 5;
-    // Store path the hub registered locally on attach's behalf
-    // (recursive-nix extra). Goes into result.json for Nix's output
-    // reference scan.
-    string added_path = 6;
     // Name of the worker the build was dispatched to, for the client
     // to report where the build runs.
     string dispatched = 7;
