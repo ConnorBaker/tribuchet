@@ -20,9 +20,7 @@ use std::io;
 use std::os::fd::OwnedFd;
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
-#[cfg(target_os = "linux")]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::{Child, Command, Stdio};
 
@@ -35,10 +33,10 @@ use rustix::pipe::{PipeFlags, pipe_with};
 
 #[cfg(target_os = "linux")]
 use super::binfmt;
+use crate::build_json;
 #[cfg(target_os = "linux")]
 use crate::fsutil::io_ctx;
 use crate::netpolicy::NetPolicy;
-#[cfg(target_os = "linux")]
 use crate::proto::BuildAssignment;
 
 // On macOS only the fields the shared packing code reads are used;
@@ -96,6 +94,14 @@ pub struct SandboxSpec {
     /// agent, which runs the presto-pasta forwarder for the netns.
     #[serde(default)]
     pub net_fwd_fd: Option<i32>,
+    /// Whether that network gives the guest IPv6. Set by the agent from
+    /// its own routes and addresses, which its datapath's host sockets
+    /// use (presto_pasta's `netdev::host_has_ipv6_default_route`). No
+    /// IPv6 without a default route the agent can use is Tribuchet's
+    /// choice, not pasta's: a guest IPv6 route would only make the guest
+    /// try IPv6 first (RFC 6724 rule 2) and wait out UDP timeouts there.
+    #[serde(default)]
+    pub net_ipv6: bool,
     /// Static emulator binary for foreign-system builds, bound at
     /// binfmt::INTERP_PATH and registered in a per-userns binfmt_misc
     /// instance.
@@ -135,9 +141,7 @@ pub struct PrepareOpts<'a> {
     /// Uids the build needs mapped (1 or 65536).
     pub leased_uid_count: Option<u32>,
     pub emulator: Option<&'a Path>,
-    /// Fixed-output builds get a private netns with user-mode NAT.
-    pub net_isolation: bool,
-    /// Flow policy applied to that network.
+    /// Flow policy applied to a build's network.
     pub net_policy: NetPolicy,
     /// Bind-mount the host nix-daemon socket into the sandbox so the
     /// builder can register inner-build outputs.
@@ -145,6 +149,16 @@ pub struct PrepareOpts<'a> {
     /// Host path of the daemon socket to expose; only consulted when
     /// `recursive_nix` is set.
     pub nix_daemon_socket: Option<&'a Path>,
+}
+
+/// Whether the build `a` gets network: its derivation is fixed-output by
+/// its own env, structured attrs (in `build_dir`) and output path, as
+/// attach tells it (build_json::fixed_output); not by the assignment's
+/// `fixed_output`, which any peer of the hub's socket can set.
+pub fn network(a: &BuildAssignment, build_dir: &Path) -> bool {
+    let env = |name: &str| a.env.get(name).map(String::as_str);
+    let attrs = build_json::read_attrs(build_dir, a.env.contains_key("NIX_ATTRS_JSON_FILE"));
+    build_json::fixed_output(&a.store_dir, &a.outputs, env, attrs.as_ref())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -183,13 +197,14 @@ pub fn prepare(
 ) -> Result<SandboxSpec, Error> {
     let build_dir = dir.join("top").join("build");
     fs::create_dir_all(&build_dir).map_err(io_ctx("creating", &build_dir))?;
+    let network = network(a, &build_dir);
     let mut spec = SandboxSpec {
         builder: a.builder.clone(),
         system: a.system.clone(),
         args: a.args.clone(),
         env: a.env.clone().into_iter().collect(),
         cwd: a.tmp_dir_in_sandbox.clone(),
-        network: a.fixed_output,
+        network,
         root: dir.join("root"),
         build_dir,
         // inputs live at their real store paths (daemon import)
@@ -209,10 +224,10 @@ pub fn prepare(
         cgroup: None,
         leased_userns: opts.leased_userns.clone(),
         leased_uid_count: opts.leased_uid_count,
-        // filled in by the agent, like the namespace and cgroup
-        net_isolation: opts.net_isolation && a.fixed_output,
+        net_isolation: network,
         net_policy: opts.net_policy.clone(),
         net_fwd_fd: None,
+        net_ipv6: false,
         emulator: opts.emulator.map(Path::to_path_buf),
         deny_read: opts.secrets.to_vec(),
         recursive_nix: opts.recursive_nix,
@@ -320,7 +335,7 @@ pub fn send_spec_to(spec: &SandboxSpec, w: OwnedFd) -> Result<(), Error> {
 }
 
 #[cfg(target_os = "linux")]
-pub use platform::{SETUP_STAGE_ARG, prepare_root, setup_error_detail, setup_stage};
+pub use platform::{SETUP_STAGE_ARG, net_config, prepare_root, setup_error_detail, setup_stage};
 
 #[cfg(target_os = "linux")]
 #[path = "sandbox/linux.rs"]
@@ -329,6 +344,7 @@ mod platform;
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
+    use crate::build_json::tests::{HASH, INPUT_ADDRESSED, SRI};
     use std::collections::BTreeMap;
     use std::{error, result};
     type Result<T> = result::Result<T, Box<dyn error::Error>>;
@@ -407,6 +423,38 @@ mod tests {
             build_dir: dir.join("top/build"),
             ..SandboxSpec::default()
         }
+    }
+
+    /// A fixed-output build, from its env or structured attrs and its
+    /// output path, gets network, in a network of its own; the hub's word
+    /// that a build is fixed-output gives none, nor does its absence take it.
+    #[test]
+    fn a_build_has_network_by_its_derivation_not_the_hubs_word() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let build = |hub: bool, out: &str, env: &[(&str, &str)]| BuildAssignment {
+            fixed_output: hub,
+            store_dir: "/nix/store".into(),
+            outputs: [("out".to_owned(), out.to_owned())].into(),
+            env: env
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+            ..BuildAssignment::default()
+        };
+        let network = |a: &BuildAssignment| -> Result<(bool, bool)> {
+            let spec = prepare(a, dir.path(), &[], &PrepareOpts::default())?;
+            Ok((spec.network, spec.net_isolation))
+        };
+        let fod = build(false, SRI, &[("outputHash", HASH)]);
+        assert_eq!(network(&fod)?, (true, true));
+        let claimed = build(true, INPUT_ADDRESSED, &[("outputHash", HASH)]);
+        assert_eq!(network(&claimed)?, (false, false));
+        let attrs = build(false, SRI, &[("NIX_ATTRS_JSON_FILE", "/build/.attrs.json")]);
+        assert_eq!(network(&attrs)?, (false, false));
+        let file = dir.path().join("top/build/.attrs.json");
+        fs::write(file, format!(r#"{{"outputHash": "{HASH}"}}"#))?;
+        assert_eq!(network(&attrs)?, (true, true));
+        Ok(())
     }
 
     /// The derivation env is client-controlled (LD_PRELOAD, …) and must

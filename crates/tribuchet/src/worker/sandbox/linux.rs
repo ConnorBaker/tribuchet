@@ -46,6 +46,15 @@ pub fn prepare_root(spec: &mut SandboxSpec) -> Result<(), Error> {
     Ok(())
 }
 
+/// presto-pasta configuration of an isolated network: the agent's
+/// datapath and the setup stage's interface and resolv.conf must agree.
+pub fn net_config(spec: &SandboxSpec) -> presto_pasta::Config {
+    presto_pasta::Config {
+        ipv6: spec.net_ipv6,
+        ..presto_pasta::Config::default()
+    }
+}
+
 /// Sandbox root skeleton: directories, /etc files, /dev symlinks.
 /// Runs only on the build's in-namespace tmpfs root.
 fn write_skeleton(spec: &SandboxSpec) -> Result<(), Error> {
@@ -98,18 +107,6 @@ fn write_skeleton(spec: &SandboxSpec) -> Result<(), Error> {
                 fs::write(root.join("etc").join(f), data)
                     .map_err(io_ctx("writing", &root.join("etc").join(f)))?;
             }
-        }
-        if spec.net_isolation {
-            // presto-pasta answers DNS on the gateway addresses; point
-            // the sandbox at them, not the host resolv.conf whose
-            // nameserver may be an unreachable loopback stub.
-            let net = presto_pasta::Config::default();
-            let conf = format!("nameserver {}\nnameserver {}\n", net.gateway4, net.gateway6);
-            fs::write(root.join("etc/resolv.conf"), conf)
-                .map_err(io_ctx("writing", &root.join("etc/resolv.conf")))?;
-        } else if let Ok(data) = fs::read("/etc/resolv.conf") {
-            fs::write(root.join("etc/resolv.conf"), data)
-                .map_err(io_ctx("writing", &root.join("etc/resolv.conf")))?;
         }
     }
     Ok(())

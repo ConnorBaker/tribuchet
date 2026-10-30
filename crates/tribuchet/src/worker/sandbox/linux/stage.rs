@@ -36,14 +36,14 @@ use std::process::exit;
 use std::{env, mem, ptr};
 
 use super::super::{SandboxSpec, binfmt};
-use super::{create_mount_points, exit_status_file, setup_error_file, write_skeleton};
+use super::{create_mount_points, exit_status_file, net_config, setup_error_file, write_skeleton};
 
 use crate::fsutil::io_ctx;
 
 // Interface name for the presto-pasta tap inside the build netns.
 // Addressing (link-local guest/gateway, DNS forwarded on the gateway
 // address so a loopback host resolver like systemd-resolved's stub
-// stays reachable) comes from presto_pasta::Config::default().
+// stays reachable) comes from net_config.
 const NET_IFNAME: &str = "eth0";
 
 // linux/if_tun.h
@@ -200,10 +200,9 @@ fn open_tap(name: &str) -> io::Result<OwnedFd> {
 /// until the datapath runs.
 /// The local tap fd is closed afterwards
 /// because the agent's copy keeps the interface carrier up.
-fn attach_net(sock: &OwnedFd) -> io::Result<()> {
-    let net = presto_pasta::Config::default();
+fn attach_net(sock: &OwnedFd, net: &presto_pasta::Config) -> io::Result<()> {
     let tap = open_tap(NET_IFNAME)?;
-    presto_pasta::netdev::configure(NET_IFNAME, &net)?;
+    presto_pasta::netdev::configure(NET_IFNAME, net)?;
     let fds = [tap.as_fd()];
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
     let mut cmsg = SendAncillaryBuffer::new(&mut space);
@@ -363,7 +362,7 @@ fn setup(p: &SetupParams) -> io::Result<()> {
         loopback_up().map_err(ioerr("bringing lo up"))?;
     }
     if let Some(sock) = net_fwd {
-        attach_net(&sock)?;
+        attach_net(&sock, &net_config(spec))?;
     }
 
     // CLONE_NEWPID only applies to children: fork so the builder

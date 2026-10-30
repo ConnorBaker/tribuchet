@@ -36,6 +36,8 @@ tokio-util.workspace = true
 bytes.workspace = true
 harmonia-file-nar.workspace = true
 harmonia-store-path.workspace = true
+harmonia-store-content-address.workspace = true
+harmonia-utils-hash.workspace = true
 harmonia-store-path-info.workspace = true
 harmonia-store-db.workspace = true
 rusqlite.workspace = true
@@ -46,7 +48,7 @@ sd-notify = "0.5.0"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # User-mode NAT datapath for fixed-output build network isolation.
-presto-pasta = "0.0.8"
+presto-pasta.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # getpeereid on the agent socket needs nix's socket module.

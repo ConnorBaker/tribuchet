@@ -14,9 +14,10 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
-use super::{ActiveBuild, pack_outputs_and_extras, unix_now};
-use crate::errors::chain;
-use crate::errors::{Result, err_ctx, err_msg};
+use super::ActiveBuild;
+use super::pack_outputs_and_extras;
+use super::unix_now;
+use crate::errors::{Result, chain, err_ctx, err_msg};
 use crate::fsutil::io_ctx;
 use crate::proto::WorkerMessage;
 use crate::tmpdir::pack_zstd_dir;
@@ -39,6 +40,15 @@ impl ActiveBuild {
         out_tx: &mpsc::Sender<WorkerMessage>,
         timeout: Duration,
     ) -> Result<FinishedBuild> {
+        // Network only in a network of its own: a Linux worker without
+        // /dev/net/tun has none to give, and a macOS worker none at all
+        // (Seatbelt's fixed-output profile allows every destination).
+        let network = sandbox::network(&self.assignment, &self.dir.join("top/build"));
+        if network && !self.ctx.fod_isolation {
+            return Err(err_msg(
+                "refusing a build with network: this worker cannot give it a network of its own",
+            ));
+        }
         #[cfg(target_os = "macos")]
         if requires_uid_range(&self.assignment) {
             return Err(err_msg(
@@ -99,12 +109,7 @@ impl ActiveBuild {
         #[cfg(target_os = "macos")]
         let (profile, sandbox_json, spec) = (
             if self.ctx.sandbox {
-                agents::seatbelt_profile(
-                    &outputs,
-                    &self.ctx.secret_paths,
-                    a.fixed_output,
-                    a.local_networking,
-                )?
+                agents::seatbelt_profile(&outputs, &self.ctx.secret_paths, a.local_networking)?
             } else {
                 String::new()
             },
@@ -227,7 +232,6 @@ impl ActiveBuild {
                 leased_userns: None,
                 leased_uid_count: Some(uid_count),
                 emulator: self.ctx.emulators.get(&a.system).map(PathBuf::as_path),
-                net_isolation: self.ctx.fod_isolation,
                 net_policy: self.ctx.fod_network.clone(),
                 recursive_nix: self.recursive_nix(),
                 nix_daemon_socket: None,

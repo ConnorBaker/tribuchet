@@ -19,7 +19,7 @@ blake3 = "1"
 fastcdc = "5"
 hyper-util = "0.1"
 rustix = { version = "1", features = ["event", "fs", "mount", "net", "pipe", "process", "stdio", "system", "thread"] }
-nix = { version = "0.31", features = ["process", "user"] }
+nix = { version = "0.31", features = ["net", "process", "user"] }
 libc = "0.2"
 prost = "0.14"
 getrandom = "0.4"
@@ -47,8 +47,16 @@ tokio-util = { version = "0.7", features = ["io"] }
 bytes = "1"
 harmonia-file-nar = { git = "https://github.com/nix-community/harmonia", rev = "10a2228f94956fb568dfc799a1c918484bf33653" }
 harmonia-store-path = { git = "https://github.com/nix-community/harmonia", rev = "10a2228f94956fb568dfc799a1c918484bf33653" }
+harmonia-store-content-address = { git = "https://github.com/nix-community/harmonia", rev = "10a2228f94956fb568dfc799a1c918484bf33653" }
+harmonia-utils-hash = { git = "https://github.com/nix-community/harmonia", rev = "10a2228f94956fb568dfc799a1c918484bf33653" }
 harmonia-store-path-info = { git = "https://github.com/nix-community/harmonia", rev = "10a2228f94956fb568dfc799a1c918484bf33653" }
 rusqlite = "0.40"
 harmonia-store-db = { git = "https://github.com/nix-community/harmonia", rev = "10a2228f94956fb568dfc799a1c918484bf33653" }
 harmonia-store-remote = { git = "https://github.com/nix-community/harmonia", rev = "10a2228f94956fb568dfc799a1c918484bf33653" }
 harmonia-store-ref-scan = { git = "https://github.com/nix-community/harmonia", rev = "10a2228f94956fb568dfc799a1c918484bf33653" }
+# presto-pasta 0.0.8 with fixes the FOD sandboxes need that are in no
+# release yet: a guest connect the host cannot make is answered at once,
+# and the caller can leave the guest without IPv6 where the host has no
+# IPv6 default route its connects can use. They are commits on its
+# v0.0.8 tag, written for an upstream pull request.
+presto-pasta = { git = "https://github.com/ConnorBaker/presto-pasta", rev = "eb64bdcced52217923c6f7f425e543c38f2a62b5" }

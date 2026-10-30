@@ -52,6 +52,7 @@ and owns transfer, scheduling and execution itself.
   image for hosts without Nix.
 
 [presto-pasta]: https://github.com/Mic92/presto-pasta
+[pasta]: https://passt.top/
 
 ## Getting started
 
@@ -252,23 +253,43 @@ and `connected_seconds`.
 
 On Linux workers with `/dev/net/tun`, fixed-output builds run in a
 private network namespace and reach the outside through the embedded
-[presto-pasta] user-mode NAT. The worker's loopback services and
-abstract sockets are never reachable from there. On top of that the
-optional `fod-network` setting filters which destinations such builds
-may connect to. It lives in the worker's freeform settings, so with
-the NixOS module it is plain Nix:
+[presto-pasta] user-mode NAT. A Linux worker without it refuses them
+instead of running them in its own network. The worker's loopback
+services and abstract sockets are never reachable from there: the
+worker refuses connections to loopback and unspecified addresses, and
+to every address on its own interfaces, whatever `fod-network` says.
+Nor are other non-public destinations (LAN and tailnet hosts, cloud
+metadata services) unless a `fod-network` rule allows them. The sandbox gets IPv6
+only where the worker has an IPv6 default route its connects can use:
+when the first IPv6 default route of the worker's main routing table
+leaves through an interface with a global or ULA address that is
+neither deprecated nor tentative. Elsewhere it gets none. That is
+Tribuchet's choice, not [pasta]'s, whose guest still gets IPv6 there:
+routes copied from an interface with a link-local address, or a
+default route via fe80::1 in its local mode. presto-pasta can give the
+sandbox only a default route, and one the worker cannot serve would
+make the guest try IPv6 first (RFC 6724 rule 2) and wait out UDP
+timeouts there. So a worker whose only IPv6 is a tailnet's, as with
+Tailscale (its own /128 address in the main table, the tailnet's
+prefix in a table of its own), gives the sandbox none, as do a worker
+with only link-local IPv6 and one whose default route's interface has
+no usable address. A connection the worker cannot make
+fails in the sandbox at once with the worker's error: network or host
+unreachable, permission denied when a firewall refuses it (host
+unreachable over IPv4, which has no ICMP code for it), or refused. Only
+a worker short of ports, memory or file descriptors leaves the sandbox
+to retry. On top of that the optional `fod-network` setting filters
+which destinations such builds may connect to. It lives in the worker's
+freeform settings, so with the NixOS module it is plain Nix:
 
 ```nix
 services.tribuchet-worker.settings.fod-network = {
-  # action when no rule matches (default: "allow")
+  # action when no rule matches a public destination (default:
+  # "allow"); a non-public one no rule matches is always refused
   default = "allow";
 
   # ordered rules, first match wins
   rules = [
-    {
-      action = "deny";
-      dst = "private"; # loopback, RFC 1918, link-local, ULA, CGNAT, ...
-    }
     {
       action = "allow";
       dst = "10.20.0.15"; # single IP or CIDR, IPv4 or IPv6

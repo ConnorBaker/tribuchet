@@ -49,10 +49,14 @@ GC by per-build temp roots. The worker must be a trusted daemon user
    a matching request attaches to the in-flight build's log and result,
    while a *different* request claiming an in-flight scratch path is
    rejected.
-   Otherwise it queues the request for a worker matching `system` (and
-   later: required features). A system no connected worker serves is
-   rejected immediately; otherwise submitters block and Nix's max-jobs
-   bounds parallelism.
+   Otherwise it queues the request for a worker matching `system` and
+   its required features. A build without network for a system that no
+   connected worker serves is declined, and Nix builds it locally, once
+   no worker is expected for it: `worker-grace-secs` after the hub's
+   start or after the last worker serving it left. A fixed-output build
+   is never declined, since a local build would run in the hub host's
+   network: it waits for a worker, and its clients are told. Otherwise
+   submitters block and Nix's max-jobs bounds parallelism.
 3. Staging: the assignment carries the input closure, with a manifest
    (Nix db metadata plus chunk list) inline for paths the hub has
    chunked before and does not know the worker to have. The worker asks
@@ -80,8 +84,8 @@ worker's Nix (its daemon serves only as the input store).
 Reference implementations: `nix/src/libstore/unix/build/` and
 `nix/src/libstore/darwin/build/sandbox-defaults.sb`.
 
-* Linux: `unshare(CLONE_NEWUSER|NEWNS|NEWPID|NEWIPC|NEWUTS)` (plus NEWNET
-  unless fixed-output), then a fork so the builder execs as PID 1 of the
+* Linux: `unshare(CLONE_NEWUSER|NEWNS|NEWPID|NEWIPC|NEWUTS|NEWNET)`,
+  then a fork so the builder execs as PID 1 of the
   new PID namespace — its death kills every descendant, so daemonized
   builder children cannot outlive the build. Input paths are bind-mounted
   read-only (`MS_NOSUID|MS_NODEV`) at their store paths inside a private
@@ -101,16 +105,19 @@ Reference implementations: `nix/src/libstore/unix/build/` and
   system=/path/to/static-qemu` advertises foreign systems; such builds
   get the emulator bound into the sandbox and registered in a per-userns
   binfmt_misc instance (kernel 6.7+); a nested user namespace drops the
-  registration-time root back to uid 1000 for the build. On root
-  workers with `/dev/net/tun`, fixed-output builds get a private
-  network namespace with user-mode NAT (the embedded
+  registration-time root back to uid 1000 for the build. A build with
+  network gets user-mode NAT into its namespace (the embedded
   [presto-pasta](https://github.com/Mic92/presto-pasta) datapath, run
-  by a helper process that drops to an unprivileged uid) instead of
-  the host namespace: host abstract sockets and loopback services are
-  unreachable. The worker's `[fod-network]` setting adds an ordered
-  allow/deny rule list (destination CIDR or the `private` keyword,
-  protocol, ports/port ranges; first match wins) evaluated for every
-  outbound connection of such builds.
+  in a thread of the build's agent), never the host's network; a
+  worker without `/dev/net/tun` refuses such a build. Loopback,
+  unspecified and the worker's own addresses are refused before any
+  rule; other non-public destinations, among them any on the worker's
+  own networks, unless a rule allows them; and the sandbox has IPv6
+  only when the worker has a usable IPv6 default route
+  (`netpolicy.rs`). The worker's `[fod-network]` setting adds an ordered
+  allow/deny rule list (a destination, required: an address, a CIDR,
+  `private` or `any`; protocol, ports/port ranges; first match wins)
+  evaluated for every outbound connection of such builds.
 * macOS: no mount namespace, but inputs already live at their real
   /nix/store paths thanks to the daemon import. The worker leases each
   build to a per-uid agent (`tribuchet agent`, a socket-activated
@@ -128,10 +135,12 @@ Reference implementations: `nix/src/libstore/unix/build/` and
   agent, but not with the worker or other builds. Since the agent, not
   the worker, owns the builder process, running builds survive worker
   restarts and are re-adopted.
-* Fixed-output derivations are detected via the `outputHash` env var —
-  or, under `__structuredAttrs`, inside the `__json` env blob — and get
-  network access (no NEWNET on Linux, network allowance in the macOS
-  profile).
+* A build has network iff it is fixed-output, told from the path Nix
+  chose for its one output, `out`, never from the environment it sets
+  for itself (`build_json.rs`): fixed-output where that path is the
+  store path of the content hash the derivation declares. An `__impure`
+  one gets none. It gets the network above on Linux; a macOS worker,
+  with no network of its own to give it, refuses it.
 
 Accepted tradeoffs: no recursive-nix, sandbox parity is ours to maintain,
 trusted worker pool assumed (output authenticity rests on the
@@ -289,9 +298,18 @@ reported at start, and nothing is frozen there.
   dedupe behaviour).
 * The Linux builder keeps the worker's kernel uid (remapped in the user
   namespace); there is no dedicated unprivileged build user yet.
+* A build's network is told from its output path, which build.json
+  does not say the type of: a fixed-output build Nix runs at another
+  path (`--check`, `--rebuild` or `--repair` of a valid output) or
+  under git hashing is not told fixed-output, and gets none.
 * Input chunks are verified against the hub's manifest and the daemon
   checks the NAR hash the hub declared, but both come from the hub: the
   worker trusts the mTLS-authenticated hub for input content.
+* With `externalBuilders.dynamic`, the hub's nix.conf fragment lists
+  only the systems a connected worker serves, and nix.conf lists none
+  of its own: with no connected worker for a system, Nix never asks the
+  hub, and the hub host's own nix-daemon builds a fixed-output build
+  for it, in the host's network.
 
 ## Deployment
 

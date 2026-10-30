@@ -189,6 +189,16 @@ in
             host = "fod-hosts.test";
           }
         '';
+        # --argstr state STATE: the worker state the e2e harness set up
+        environment.etc."tt/fod-ipv6.nix".text = ''
+          { state }:
+          import ${./tests/fod-ipv6.nix} {
+            bash = "${pkgs.bash}";
+            coreutils = "${pkgs.coreutils}";
+            hubIp = "${nodes.hub.networking.primaryIPAddress}";
+            inherit state;
+          }
+        '';
         environment.etc."tt/logbomb.nix".text = ''
           import ${./tests/logbomb.nix} { bash = "${pkgs.bash}"; }
         '';
@@ -262,7 +272,12 @@ in
       };
 
     worker =
-      { pkgs, nodes, ... }:
+      {
+        config,
+        pkgs,
+        nodes,
+        ...
+      }:
       {
         # Resolvable only via /etc/hosts; the FOD-via-files subtest
         # fetches the hub through this name.
@@ -284,6 +299,29 @@ in
         };
         systemd.tmpfiles.rules = [ "d /var/lib/dnsmasq-fod 0755 root root -" ];
         networking.nameservers = [ "127.0.0.1" ];
+        # Link-local IPv6 only: no IPv6 default route or global address
+        # until the e2e harness adds them. QEMU's user-mode network would
+        # advertise a default route, and the test VLAN's /64 on eth1 is
+        # an address of its own, so the worker gets neither and talks to
+        # the hub over IPv4.
+        #
+        # mkForce replaces qemu-vm.nix's definition, which differs from
+        # this one only by the forwardPorts and restrictNetwork options it
+        # splices in; the assertion keeps both unused here.
+        virtualisation.qemu.networkingOptions = lib.mkForce [
+          "-net nic,netdev=user.0,model=virtio"
+          "-netdev user,id=user.0,ipv6=off,\"$QEMU_NET_OPTS\""
+        ];
+        assertions = [
+          {
+            assertion = config.virtualisation.forwardPorts == [ ] && !config.virtualisation.restrictNetwork;
+            message = "the worker's networkingOptions drop forwardPorts and restrictNetwork";
+          }
+        ];
+        # The test framework sets the VLAN address, and the hosts entry
+        # other nodes get for it, at normal priority.
+        networking.interfaces.eth1.ipv6.addresses = lib.mkForce [ ];
+        networking.primaryIPv6Address = lib.mkForce "";
         # Private store image instead of the shared host store, so input
         # paths the worker lacks really travel over the wire.
         virtualisation.useNixStoreImage = true;
@@ -321,7 +359,13 @@ in
               {
                 action = "deny";
                 proto = "tcp";
+                dst = "any";
                 ports = [ "8766" ];
+              }
+              # the FOD subtests fetch from the hub on the test VLAN
+              {
+                action = "allow";
+                dst = "private";
               }
             ];
             emulate.aarch64-linux = "${pkgs.pkgsStatic.qemu-user}/bin/qemu-aarch64";

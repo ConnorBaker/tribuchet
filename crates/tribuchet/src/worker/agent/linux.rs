@@ -21,7 +21,6 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{self, Stdio};
 use std::process::{Child, Command};
-use std::sync::Arc;
 use std::{env, slice, thread};
 
 use rustix::io::{FdFlags, fcntl_setfd};
@@ -40,10 +39,9 @@ use sandbox_proto::agent::StartRequest;
 use super::{Build, Options, cgroup, make_readable, msg, spawn_plain, stage_scratch};
 use crate::errors::{Error, Result, chain, err_ctx};
 use crate::fsutil::{io_ctx, stat_field};
-use crate::netpolicy::NetPolicy;
-use crate::sd;
 use crate::worker::sandbox::{self, SandboxSpec};
 use crate::worker::userns::{self, UsernsHolder};
+use crate::{netpolicy, sd};
 
 /// Argv[1] marker of the re-exec'd userns filesystem helper.
 pub const FS_HELPER_ARG: &str = "__agent_fs";
@@ -181,9 +179,16 @@ pub(super) fn spawn_builder(
     let (child, spec_w) = sandbox::spawn(&spec, log)?;
     if let Some((ours, theirs)) = net_fwd {
         drop(theirs);
-        let policy = spec.net_policy.clone();
+        let net = presto_pasta::Config {
+            allow_flow: Some(
+                spec.net_policy
+                    .clone()
+                    .flow_filter(netpolicy::own_addresses),
+            ),
+            ..sandbox::net_config(&spec)
+        };
         let build_pid = child.id();
-        thread::spawn(move || net_forward(&ours, policy, build_pid));
+        thread::spawn(move || net_forward(&ours, net, build_pid));
     }
     // The setup stage waits for the spec on stdin; move it into the
     // build cgroup first so its cgroup namespace is rooted there.
@@ -209,7 +214,7 @@ pub(super) fn freeze_handle(
 /// Per-build network forwarder: receive the tap fd the setup stage
 /// created inside its netns, run the presto-pasta datapath on it and
 /// stop it (letting the netns go away) once the build process dies.
-fn net_forward(sock: &OwnedFd, policy: NetPolicy, build_pid: u32) {
+fn net_forward(sock: &OwnedFd, net: presto_pasta::Config, build_pid: u32) {
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
     let mut cmsg = RecvAncillaryBuffer::new(&mut space);
     let mut buf = [0u8; 8];
@@ -222,12 +227,6 @@ fn net_forward(sock: &OwnedFd, policy: NetPolicy, build_pid: u32) {
         return;
     };
     let Some(tap) = fds.next() else { return };
-    let net = presto_pasta::Config {
-        allow_flow: Some(Arc::new(move |d: &presto_pasta::FlowDst| {
-            policy.allows(d.proto, d.ip, d.port)
-        })),
-        ..presto_pasta::Config::default()
-    };
     let mut presto = presto_pasta::Presto::new(net, tap);
     // A pidfd stops the datapath (closing the tap fd and with it the
     // build netns) once the build process dies.
