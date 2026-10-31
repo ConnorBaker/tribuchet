@@ -16,6 +16,12 @@ pub const MAX_MSG_SIZE: usize = 64 * 1024 * 1024;
 /// worker); a patched Nix treats it as "build locally instead".
 pub const DECLINE_EXIT_CODE: i32 = 222;
 
+/// The feature of a worker that gives a build with network a network of
+/// its own, which every such build requires. Not a Nix system feature:
+/// the hub adds it to a fixed-output build's required features, and the
+/// prefix keeps it apart from those a derivation names for itself.
+pub const NETWORK: &str = "tribuchet-network";
+
 /// Cap on a single NAR transfer in either direction, enforced by both
 /// hub and worker; a `truncate -s 1P $out` build would otherwise tie
 /// up the peer and fill its disk.
