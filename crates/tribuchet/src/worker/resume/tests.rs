@@ -212,29 +212,31 @@ const SCENARIOS: &[&str] = &[
     // once its agent answers, its key goes as the kill is decided and its
     // state before the kill, then its agent is handed back: the cancel
     // does not wait unseen, nor the state outlive the kill.
-    "has | assign:old cancel:old cancelled:old held open gone idle nodir | adopt running k, kill none, cleanup none, other none",
+    "has | assign:old cancel:old cancelled:old held open gone idle removed | adopt running k, kill none, cleanup none, other none",
     // ... also while its log replay waits on a session that takes nothing,
-    // killed before it drains, not the replay stopped first, which would
-    // keep the run alive.
-    "has cap1 | assign:old cancel:old cancelled:old log:65536 replayed:8192 open gone killed replayed:8192 drain:old idle nodir | adopt running k, kill none, cleanup none, other none",
+    // killed and its agent handed back before it drains, not the replay
+    // stopped first, which would keep the run alive and its agent taken.
+    "has cap1 | assign:old cancel:old cancelled:old log:65536 replayed:8192 open gone killed replayed:8192 idle drain:old removed | adopt running k, kill none, cleanup none, other none",
     // Once adopted, a cancel kills it like any run.
     "has | assign:old open running cancel:old cancelled:old | adopt running k, kill running k, cleanup finished k, other finished k",
-    // Its agent no longer has it: dropped, its state, then its key, then its
-    // agent handed back: not after 7 s, nor its key first.
+    // Its agent no longer has it: its agent handed back, then dropped, its
+    // state, then its key: not after 7 s, nor its key first.
     "lost | fill assign:old open gone nodir idle | adopt running k",
-    // ... a cancel taken meanwhile leaves no flag, nor does a log replay
-    // keep its state (which fails its removal: "directory not empty").
-    "lost cap1 | fill log:1638400 assign:old open running cancel:old flagged drain:old gone idle nodir noflag | adopt running k",
+    // ... its agent handed back while its log replay waits on a session
+    // that takes nothing; a cancel taken meanwhile leaves no flag, nor does
+    // the replay keep its state (which fails its removal: "directory not
+    // empty").
+    "lost cap1 | fill log:1638400 assign:old open running idle cancel:old flagged drain:old gone nodir noflag | adopt running k",
     // Cancelled and its agent without it: its key goes as that is decided,
     // and its teardown leaves a new run of the key alone.
-    "lost | fill assign:old cancel:old open gone dir anew idle nodir running | adopt running k",
-    // ... while its log replay waits on a session that takes nothing, the
-    // replay is stopped before its dir goes, not left to write an offset
-    // there meanwhile ("directory not empty").
-    "lost cap1 | fill assign:old cancel:old cancelled:old log:1638400 replayed:8192 open gone drain:old idle nodir stopped:old | adopt running k",
+    "lost | fill assign:old cancel:old open gone dir anew idle removed running | adopt running k",
+    // ... while its log replay waits on a session that takes nothing, its
+    // agent is handed back, and the replay stopped before its dir goes,
+    // not left to write an offset there meanwhile ("directory not empty").
+    "lost cap1 | fill assign:old cancel:old cancelled:old log:1638400 replayed:8192 open gone idle drain:old removed stopped:old | adopt running k",
     // Left by an older worker with network in the host's network: killed,
     // not adopted, its key never offered.
-    "has net | gone open idle nodir gone | adopt running, kill none, cleanup none, other none",
+    "has net | gone open idle removed gone | adopt running, kill none, cleanup none, other none",
 ];
 
 /// Each held build's scenario, all at once (each waits on its agent).
@@ -284,14 +286,17 @@ fn run(row: &str) -> Result<()> {
             }
             // Until the agent was asked n times, answered or not; it
             // answers; until "k" is held, running, done or gone, until its
-            // agent is handed back, or asked to kill the run.
+            // agent and its slot are handed back, or its agent asked to kill
+            // the run.
             "asked" => until(row, || h.calls.asked.load(SeqCst) >= arg.parse().unwrap()),
             "open" => h.allow.store(usize::MAX, SeqCst),
             "held" => state(Some((true, false))),
             "running" => state(Some((false, false))),
             "done" => state(Some((false, true))),
             "gone" => state(None),
-            "idle" => until(row, || !ctx.agents.idle_sockets().is_empty()),
+            "idle" => until(row, || {
+                !ctx.agents.idle_sockets().is_empty() && ctx.free_slots() > 0
+            }),
             "killed" => until(&format!("killed while the replay waits: {row}"), || {
                 (h.calls.answered.lock().unwrap().iter()).any(|c| c.starts_with("kill"))
             }),
@@ -307,7 +312,9 @@ fn run(row: &str) -> Result<()> {
                 let error = if what == "ok" { "" } else { CANCELLED };
                 *got == [(arg.to_owned(), error.to_owned())]
             }),
+            // b1 is there or not; until it is not.
             "dir" | "nodir" => assert_eq!(build.exists(), what == "dir", "{step}: {row}"),
+            "removed" => until(&format!("{step}: {row}"), || !build.exists()),
             "fill" => fill(build, "top/build")?,
             // The run logs n bytes; until n were replayed; session s takes
             // what it is sent, slowly; "k" runs anew in b2.

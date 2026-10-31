@@ -149,9 +149,9 @@ fn kill_unconfined(ctx: &Arc<WorkerCtx>, st: ResumeState, dir: PathBuf, why: &'s
 
 /// Kill the held build `st` if its agent answered with it (`build`): its
 /// state.json goes before the kill, so a worker stopped meanwhile has
-/// nothing to adopt; its log tailer `tail`, which drains up to the end of
-/// the log the run still writes, stops after it, and its dir with it.
-/// Its agent and `slot`, handed back, end the teardown.
+/// nothing to adopt; its agent and `slot`, no longer used, are handed back
+/// after it; its log tailer `tail`, which drains up to the end of the log
+/// the run still writes, stops then, and its dir with it.
 fn kill_held(
     ctx: &WorkerCtx,
     st: ResumeState,
@@ -164,9 +164,9 @@ fn kill_held(
         unrecord(dir);
         kill(&st, build);
     }
-    remove_state(tail, dir);
     ctx.agents.release(st.agent_socket);
     drop(slot);
+    remove_state(tail, dir);
 }
 
 /// Ask `st`'s agent to adopt its build every AGENT_RETRY until it
@@ -265,12 +265,13 @@ fn wait_for_agent(ctx: &Arc<WorkerCtx>, st: ResumeState, dir: PathBuf) {
                     "its agent answered at last, without the build: {}",
                     chain(&e)
                 );
+                ctx.agents.release(st.agent_socket);
+                drop(slot);
                 if cancelled {
                     remove_state(tail, &dir);
                 } else {
                     drop_held(&ctx, &key, &dir);
                 }
-                ctx.agents.release(st.agent_socket);
             }
         }
     });
