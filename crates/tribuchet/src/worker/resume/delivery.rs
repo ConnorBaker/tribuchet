@@ -47,7 +47,8 @@ fn expired(e: &ResumableBuild, ttl: Duration) -> Option<&PathBuf> {
 /// lock. Each one's state.json goes before its key: the hub, told by the
 /// next heartbeat without the key, may run the build again under the same
 /// build id, which a worker adopting from that state would take for this
-/// result. A result a session starts to deliver meanwhile keeps its key.
+/// result. A result a session starts to deliver meanwhile keeps its key,
+/// as does one whose state.json stays.
 pub(super) fn reap(ctx: &WorkerCtx, ttl: Duration) {
     let candidates: Vec<(String, PathBuf)> = ctx
         .resumable
@@ -57,7 +58,10 @@ pub(super) fn reap(ctx: &WorkerCtx, ttl: Duration) {
         .filter_map(|(key, e)| Some((key.clone(), expired(e, ttl)?.clone())))
         .collect();
     for (key, dir) in candidates {
-        unrecord(&dir);
+        if !unrecord(&dir) {
+            tracing::warn!(key, "keeping an undelivered result whose state.json stays");
+            continue;
+        }
         let mut map = ctx.resumable.lock().unwrap();
         if map.get(&key).and_then(|e| expired(e, ttl)) != Some(&dir) {
             continue;

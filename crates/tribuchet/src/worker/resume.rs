@@ -296,10 +296,11 @@ fn drop_held(ctx: &WorkerCtx, key: &str, dir: &Path) {
 }
 
 /// Remove `dir`'s state.json, which a restarted worker adopts its build
-/// from; the rest of the dir can go later.
-pub(super) fn unrecord(dir: &Path) {
+/// from; the rest of the dir can go later. False if it is still there.
+pub(super) fn unrecord(dir: &Path) -> bool {
     // Whatever fails here fails the removal of the rest, which warns.
-    let _ = fs::remove_file(dir.join("state.json"));
+    let gone = fs::remove_file(dir.join("state.json"));
+    gone.map_or_else(|e| e.kind() == io::ErrorKind::NotFound, |()| true)
 }
 
 /// Remove a build dir once `tail`, its log tailer, has stopped: the

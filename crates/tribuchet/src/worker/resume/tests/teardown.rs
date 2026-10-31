@@ -4,6 +4,7 @@
 use std::os::unix::fs::PermissionsExt;
 
 use rustix::fs::{CWD, FileType, Mode, mknodat};
+use rustix::process::geteuid;
 
 use super::*;
 
@@ -74,6 +75,32 @@ fn reaped_results_leave_nothing_to_adopt_once_their_keys_are_gone() -> Result<()
         .collect();
     assert!(kept.is_empty(), "state outlived its key: {kept:?}");
     reaper.join().unwrap();
+    Ok(())
+}
+
+/// A result whose state.json the reaper cannot remove keeps its key: the
+/// hub, told the key is gone, may run the build again under the same id,
+/// which a restarted worker would take for this result. Here its dir is
+/// not writable; root writes it all the same, so the test shows nothing
+/// as root and is skipped.
+#[test]
+fn a_reaped_result_whose_state_stays_keeps_its_key() -> Result<()> {
+    if geteuid().is_root() {
+        return Ok(());
+    }
+    let dir = tempfile::tempdir()?;
+    let ctx = WorkerCtx::for_test(dir.path(), 4, vec![])?;
+    let build = dir.path().join("builds/k");
+    fs::create_dir_all(&build)?;
+    delivery::persist_finished("k", "old", &finished(&build));
+    let fin = Some(finished(&build));
+    ResumableBuild::insert(&ctx, "k".into(), "old".into(), build.clone(), fin);
+    thread::sleep(Duration::from_millis(1));
+    fs::set_permissions(&build, fs::Permissions::from_mode(0o500))?;
+    delivery::reap(&ctx, Duration::ZERO);
+    fs::set_permissions(&build, fs::Permissions::from_mode(0o700))?;
+    assert!(build.join("state.json").exists(), "its state.json went");
+    assert_eq!(held(&ctx, "k"), Some((false, true)), "its key went");
     Ok(())
 }
 
