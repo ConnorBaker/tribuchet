@@ -8,9 +8,60 @@
 //! says of an OOM kill in its unit. Each case sets its daemon up and puts
 //! it back; they share the hub's daemon, so they run one at a time.
 
+use std::panic::catch_unwind;
+use std::thread;
+
 use crate::harness::{
     Node, assert_journal, bash, count, ended, run, submit, succeed, wait_until_succeeds, write_file,
 };
+
+/// The hub's daemon as a case set it up, put back by its command when
+/// dropped, however the case ends: a case that fails leaves the next
+/// ones none of its setup.
+struct SetUp(String);
+
+impl SetUp {
+    fn new(setup: &str, back: &str) -> Self {
+        let back = Self(back.into());
+        succeed(Node::Hub, setup);
+        back
+    }
+}
+
+impl Drop for SetUp {
+    fn drop(&mut self) {
+        // A panic while a failed case unwinds would abort the run.
+        if thread::panicking() {
+            run(Node::Hub, &self.0);
+        } else {
+            succeed(Node::Hub, &self.0);
+        }
+    }
+}
+
+/// A case that fails puts the daemon back all the same: here one that
+/// capped its tasks.
+#[test]
+fn a_case_that_fails_puts_its_daemon_back() {
+    let property = "systemctl set-property --runtime nix-daemon.service";
+    let failed = catch_unwind(|| {
+        let _capped = SetUp::new(
+            &format!("{property} TasksMax=7"),
+            &format!("{property} TasksMax=infinity"),
+        );
+        panic!("the case fails, as this test means it to");
+    });
+    assert!(failed.is_err());
+    let tasks = succeed(
+        Node::Hub,
+        "systemctl show -p TasksMax --value nix-daemon.service",
+    );
+    assert_eq!(
+        tasks.trim(),
+        "infinity",
+        "the failed case's cap outlived it"
+    );
+}
 
 /// Asks for tt-`name` as root on the store itself (the daemon may refuse
 /// root), submitted as the unit `name`.
@@ -47,8 +98,7 @@ fn outcome(name: &str, secs: u64) -> (String, String) {
 #[test]
 fn refused_user() {
     let dropin = "/run/systemd/system/nix-daemon.service.d";
-    succeed(
-        Node::Hub,
+    let refusing = SetUp::new(
         &format!(
             "mkdir -p /run/refuse {dropin} && \
              printf 'include /etc/nix/nix.conf\\nallowed-users = nobody\\ntrusted-users =\\n' \
@@ -56,6 +106,9 @@ fn refused_user() {
              printf '[Service]\\nEnvironment=NIX_CONF_DIR=/run/refuse\\n' > {dropin}/refuse.conf && \
              systemctl daemon-reload && {{ systemctl kill --signal=SIGKILL nix-daemon.service || true; }} \
              && systemctl restart nix-daemon"
+        ),
+        &format!(
+            "rm {dropin}/refuse.conf && systemctl daemon-reload && systemctl restart nix-daemon"
         ),
     );
     ask("refused");
@@ -71,12 +124,7 @@ fn refused_user() {
         "is not allowed to connect to the Nix daemon",
     );
 
-    succeed(
-        Node::Hub,
-        &format!(
-            "rm {dropin}/refuse.conf && systemctl daemon-reload && systemctl restart nix-daemon"
-        ),
-    );
+    drop(refusing);
     ask("fixed");
     let (rc, log) = outcome("fixed", 180);
     assert_eq!(rc, "0", "{log}");
@@ -89,10 +137,10 @@ fn refused_user() {
 fn forkless() {
     // Socket-activated: started by a query, so that it has made the
     // threads it starts with (TasksMax counts them) before the cap.
-    succeed(
-        Node::Hub,
+    let capped = SetUp::new(
         "NIX_REMOTE=daemon nix-store -q --hash $(readlink -f /run/current-system) && \
          systemctl set-property --runtime nix-daemon.service TasksMax=1",
+        "systemctl set-property --runtime nix-daemon.service TasksMax=infinity",
     );
     // Its workers, the hub's pooled connections' among them, killed (a
     // worker's SIGTERM may be blocked): each new connection needs a fork.
@@ -118,10 +166,7 @@ fn forkless() {
     assert_journal(Node::Hub, "nix-daemon", "unable to fork");
     let told = count(Node::Hub, "tribuchet-hub", unrefused) - waits;
     assert!(told > 0, "the hub told of no unrefused close");
-    succeed(
-        Node::Hub,
-        "systemctl set-property --runtime nix-daemon.service TasksMax=infinity",
-    );
+    drop(capped);
     let (rc, log) = outcome("forkless", 300);
     assert_eq!(rc, "0", "{log}");
 }
@@ -133,10 +178,10 @@ fn forkless() {
 #[test]
 fn oom_kill_in_the_daemons_unit() {
     let since = succeed(Node::Hub, "date +%s");
-    succeed(
-        Node::Hub,
+    let _capped = SetUp::new(
         "sysctl -w vm.panic_on_oom=0 && systemctl start nix-daemon.service && \
          systemctl set-property --runtime nix-daemon.service MemoryMax=64M",
+        "systemctl set-property --runtime nix-daemon.service MemoryMax=infinity",
     );
     run(
         Node::Hub,
@@ -153,9 +198,6 @@ fn oom_kill_in_the_daemons_unit() {
         &format!("[ $({read} | grep -cxF '{oom}') -gt 0 ]"),
         30,
     );
-    let journal = succeed(
-        Node::Hub,
-        &format!("systemctl set-property --runtime nix-daemon.service MemoryMax=infinity; {read}"),
-    );
+    let journal = succeed(Node::Hub, &read);
     assert!(!journal.contains(" crashed"), "{journal}");
 }
