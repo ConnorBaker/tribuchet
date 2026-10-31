@@ -305,8 +305,10 @@ pub(super) fn unrecord(dir: &Path) -> bool {
 }
 
 /// Remove a build dir once `tail`, its log tailer, has stopped: the
-/// offset it writes there meanwhile would fail the removal.
+/// offset it writes there meanwhile would fail the removal. Its
+/// state.json goes first, not left to adopt while the tailer drains.
 fn remove_state(tail: Option<LogTail>, dir: &Path) {
+    unrecord(dir);
     if let Some(t) = tail {
         t.stop();
     }
