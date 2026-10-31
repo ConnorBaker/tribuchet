@@ -47,17 +47,20 @@ pub(super) fn init() -> Option<PathBuf> {
 pub(super) fn create(base: &Path, build_id: &str, owner_uid: u32) -> Result<PathBuf> {
     let dir = base.join(format!("build-{build_id}"));
     fs::create_dir(&dir).map_err(err_ctx(format!("creating cgroup {}", dir.display())))?;
-    hand_over(&dir, owner_uid)?;
+    hand_over(&dir, owner_uid, |p, uid, gid| chown(p, uid, gid))?;
     Ok(dir)
 }
 
-/// What of its cgroup `dir` the build's mapped root uid gets: the dir and
-/// the files it manages subgroups with. Never cgroup.freeze, by which it
-/// could thaw itself.
-fn hand_over(dir: &Path, owner_uid: u32) -> Result<()> {
-    chown(dir, Some(owner_uid), None)?;
-    for f in ["cgroup.subtree_control", "cgroup.threads"] {
-        chown(dir.join(f), Some(owner_uid), None)?;
+/// What of its cgroup `dir` the build's mapped root uid `owner_uid` gets,
+/// each path handed over by `chown`: the dir and the files it manages
+/// subgroups with. Never cgroup.freeze, by which it could thaw itself.
+fn hand_over(
+    dir: &Path,
+    owner_uid: u32,
+    mut chown: impl FnMut(&Path, Option<u32>, Option<u32>) -> io::Result<()>,
+) -> Result<()> {
+    for f in ["", "cgroup.subtree_control", "cgroup.threads"] {
+        chown(&dir.join(f), Some(owner_uid), None)?;
     }
     Ok(())
 }
@@ -238,16 +241,23 @@ mod tests {
         assert!(oom_killed(dir.path()));
     }
 
-    /// The build's mapped root uid is handed its cgroup, not cgroup.freeze.
-    /// Here that file is absent, so handing it over too fails with ENOENT
-    /// whatever uid runs the test.
+    /// The build's mapped root uid, and only its uid, is handed its cgroup
+    /// and the files it manages subgroups with, not cgroup.freeze.
     #[test]
     fn a_build_is_handed_its_cgroup_but_not_its_cgroup_freeze() {
-        let dir = tempfile::tempdir().unwrap();
-        for f in ["cgroup.subtree_control", "cgroup.threads"] {
-            fs::write(dir.path().join(f), "").unwrap();
-        }
-        hand_over(dir.path(), rustix::process::getuid().as_raw()).unwrap();
+        let dir = Path::new("/sys/fs/cgroup/agent.service/build-b");
+        let mut handed = Vec::new();
+        hand_over(dir, 100_000, |p, uid, gid| {
+            handed.push((p.to_owned(), uid, gid));
+            Ok(())
+        })
+        .unwrap();
+        let (control, threads) = ("cgroup.subtree_control", "cgroup.threads");
+        let to = |p: PathBuf| (p, Some(100_000), None);
+        assert_eq!(
+            handed,
+            [dir.to_owned(), dir.join(control), dir.join(threads)].map(to)
+        );
     }
 
     #[test]
