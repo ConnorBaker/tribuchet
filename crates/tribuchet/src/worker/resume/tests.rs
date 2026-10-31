@@ -231,9 +231,10 @@ const SCENARIOS: &[&str] = &[
     // and its teardown leaves a new run of the key alone.
     "lost | fill assign:old cancel:old open gone dir anew idle removed running | adopt running k",
     // ... while its log replay waits on a session that takes nothing, its
-    // agent is handed back, and the replay stopped before its dir goes,
-    // not left to write an offset there meanwhile ("directory not empty").
-    "lost cap1 | fill assign:old cancel:old cancelled:old log:1638400 replayed:8192 open gone idle drain:old removed stopped:old | adopt running k",
+    // agent is handed back and its state goes, not after the drain, and the
+    // replay is stopped before its dir goes, not left to write an offset
+    // there meanwhile ("directory not empty").
+    "lost cap1 | fill assign:old cancel:old cancelled:old log:1638400 replayed:8192 open gone idle unrecorded drain:old removed stopped:old | adopt running k",
     // Left by an older worker with network in the host's network: killed,
     // not adopted, its key never offered.
     "has net | gone open idle removed gone | adopt running, kill none, cleanup none, other none",
@@ -312,9 +313,12 @@ fn run(row: &str) -> Result<()> {
                 let error = if what == "ok" { "" } else { CANCELLED };
                 *got == [(arg.to_owned(), error.to_owned())]
             }),
-            // b1 is there or not; until it is not.
+            // b1 is there or not; until it is not; until its state is not.
             "dir" | "nodir" => assert_eq!(build.exists(), what == "dir", "{step}: {row}"),
             "removed" => until(&format!("{step}: {row}"), || !build.exists()),
+            "unrecorded" => until(&format!("{step}: {row}"), || {
+                !build.join("state.json").exists()
+            }),
             "fill" => fill(build, "top/build")?,
             // The run logs n bytes; until n were replayed; session s takes
             // what it is sent, slowly; "k" runs anew in b2.
