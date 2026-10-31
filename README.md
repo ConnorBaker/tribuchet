@@ -170,7 +170,11 @@ Import `tribuchet.nixosModules.default` (flake input
 
 The hub unit is socket-activated. The worker unit reloads instead of
 restarting on package or settings changes, so running builds survive
-deploys. The build agents and their builds together may use the host's
+deploys. Upgrade workers before or with the hub: a hub sends a
+fixed-output build only to a worker advertising `tribuchet-network`,
+which older workers never do, even with `/dev/net/tun`, so until an
+upgraded worker with `/dev/net/tun` registers every fixed-output build
+waits. The build agents and their builds together may use the host's
 memory less `services.tribuchet-worker.agentMemoryReserve` (8 GiB by
 default) and less a per-page bound on what zswap holds for them outside
 their charge (zsmalloc's fragmentation after frees can pass it until
@@ -254,10 +258,16 @@ and `connected_seconds`.
 On Linux workers with `/dev/net/tun`, fixed-output builds run in a
 private network namespace and reach the outside through the embedded
 [presto-pasta] user-mode NAT. A Linux worker without it refuses them
-instead of running them in its own network. The worker's loopback
-services and abstract sockets are never reachable from there: the
-worker refuses connections to loopback and unspecified addresses, and
-to every address on its own interfaces, whatever `fod-network` says.
+instead of running them in its own network, and does not advertise
+`tribuchet-network`, which the hub requires for them, so it is sent
+none. A worker gives a build a network of its own only on Linux with
+`/dev/net/tun`, so no current macOS worker advertises
+`tribuchet-network`: a darwin fixed-output build waits, its clients
+told, until such a worker registers or the client gives up. The
+worker's loopback services and abstract sockets are never reachable
+from there: the worker refuses connections to loopback and unspecified
+addresses, and to every address on its own interfaces, whatever
+`fod-network` says.
 Nor are other non-public destinations (LAN and tailnet hosts, cloud
 metadata services) unless a `fod-network` rule allows them. The sandbox gets IPv6
 only where the worker has an IPv6 default route its connects can use:

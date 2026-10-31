@@ -56,7 +56,8 @@ pub(super) struct Job {
     /// The client's zstd-packed build tmp dir, buffered so redispatch can
     /// resend it without another round-trip to the client.
     pub(super) tmp_dir_pack: Arc<Vec<u8>>,
-    /// requiredSystemFeatures; only workers advertising them get the job.
+    /// requiredSystemFeatures, and NETWORK for a build with network; only
+    /// workers advertising them get the job.
     pub(super) features: Vec<String>,
     pub(super) replay: Arc<Replay>,
     /// Dedupe registration, dropped on cancel, when given up, or with

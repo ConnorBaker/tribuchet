@@ -112,7 +112,7 @@ message PathInfoMsg {
 // "kvm" from the host.
 message SystemCaps {
   string system = 1;            // e.g. "x86_64-linux"
-  repeated string features = 2; // e.g. "kvm", "big-parallel"
+  repeated string features = 2; // e.g. "kvm", "big-parallel", "tribuchet-network"
 }
 
 message Register {

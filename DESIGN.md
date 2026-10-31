@@ -109,7 +109,9 @@ Reference implementations: `nix/src/libstore/unix/build/` and
   network gets user-mode NAT into its namespace (the embedded
   [presto-pasta](https://github.com/Mic92/presto-pasta) datapath, run
   in a thread of the build's agent), never the host's network; a
-  worker without `/dev/net/tun` refuses such a build. Loopback,
+  worker without `/dev/net/tun` refuses such a build, and does not
+  advertise the `tribuchet-network` feature that the hub requires of
+  a worker for one, so it is sent none. Loopback,
   unspecified and the worker's own addresses are refused before any
   rule; other non-public destinations, among them any on the worker's
   own networks, unless a rule allows them; and the sandbox has IPv6
@@ -139,8 +141,11 @@ Reference implementations: `nix/src/libstore/unix/build/` and
   chose for its one output, `out`, never from the environment it sets
   for itself (`build_json.rs`): fixed-output where that path is the
   store path of the content hash the derivation declares. An `__impure`
-  one gets none. It gets the network above on Linux; a macOS worker,
-  with no network of its own to give it, refuses it.
+  one gets none. A worker gives it a network of its own only on Linux
+  with `/dev/net/tun`, so no current macOS worker advertises
+  `tribuchet-network` (one refuses such a build): a darwin one waits,
+  its clients told, until such a worker registers or the client gives
+  up.
 
 Accepted tradeoffs: no recursive-nix, sandbox parity is ours to maintain,
 trusted worker pool assumed (output authenticity rests on the
@@ -329,6 +334,11 @@ command line. `nixosModules.default` ships hub and worker services
 socket-activated, the worker unit delegates its cgroup subtree for
 per-build limits and restarts on package bumps and settings changes
 while running builds keep going (KillMode=process plus re-adoption).
+Workers are upgraded before or with the hub: a hub sends a
+fixed-output build only to a worker advertising `tribuchet-network`,
+which workers older than it never do, even with `/dev/net/tun`, so
+until an upgraded worker with `/dev/net/tun` registers every
+fixed-output build waits.
 The agents run at OOMScoreAdjust=-1000 and their builds at 0, which a
 build cannot lower, so no agent is an OOM victim. Every agent and its
 builds run in `system-tribuchet\x2dagent.slice`, whose RAM plus the
