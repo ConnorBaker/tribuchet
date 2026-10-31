@@ -139,9 +139,16 @@ impl Held {
     }
 
     /// Assign the build to `session`, on the runtime, as a session does.
+    /// ... and, adopted, delivered to.
     fn assign(&self, session: &str, out: &tokio::sync::mpsc::Sender<WorkerMessage>) -> bool {
-        let _rt = self.rt.as_ref().unwrap().enter();
-        self.ctx.adopt_assignment(&assignment(session), out)
+        let adoption = {
+            let _rt = self.rt.as_ref().unwrap().enter();
+            self.ctx.adopt_assignment(&assignment(session), out)
+        };
+        if let Some(n) = adoption {
+            try_deliver(&self.ctx, "k", Some(n));
+        }
+        adoption.is_some()
     }
 }
 

@@ -33,6 +33,7 @@ pub use userns::{USERNS_HOLD_ARG, hold_stage as userns_hold_stage};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
+use std::num::NonZeroU64;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -64,6 +65,9 @@ type DaemonConn = DaemonClient<tokio::net::unix::OwnedReadHalf, tokio::net::unix
 
 /// The numbers of waits for an agent and their takeovers, none given twice.
 static WAITS: AtomicU64 = AtomicU64::new(1);
+
+/// Adoptions so far; numbered from it: none twice, none 0 (registration).
+static ADOPTIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Per-process context threaded through builds.
 struct WorkerCtx {
@@ -148,21 +152,19 @@ impl WorkerCtx {
     }
 
     /// Re-point an already-held build (same dedupe key) at the
-    /// assignment's new build_id and session; true if one existed. A
+    /// assignment's build_id and session: its adoption number if held. A
     /// tailer streams the log to the new session from the persisted
     /// offset on. The assignment voids a cancel of the one before while
     /// its run goes on (not yet taken, or held for its agent); a run killed
-    /// or failed for it is no result: false, and it starts anew. Runs in a
+    /// or failed for it is no result: None, and it starts anew. Runs in a
     /// tokio runtime: telling a waiting build's session spawns a task.
     fn adopt_assignment(
         self: &Arc<Self>,
         a: &BuildAssignment,
         out_tx: &mpsc::Sender<WorkerMessage>,
-    ) -> bool {
+    ) -> Option<u64> {
         let mut map = self.resumable.lock().unwrap();
-        let Some(e) = map.get_mut(&a.dedupe_key) else {
-            return false;
-        };
+        let e = map.get_mut(&a.dedupe_key)?;
         let voided = self.cancelled.lock().unwrap().remove(&a.dedupe_key);
         match &e.finished {
             Some(f) if f.error.ends_with(CANCELLED) => {
@@ -170,12 +172,15 @@ impl WorkerCtx {
                 map.remove(&a.dedupe_key);
                 drop(map);
                 remove_build_dir(&dir);
-                return false;
+                return None;
             }
-            None if e.cancelled && !voided && !e.adopting => return false,
+            None if e.cancelled && !voided && !e.adopting => return None,
             _ => {}
         }
         e.cancelled = false;
+        // No result goes to the new session before it is told it resumed.
+        let n = NonZeroU64::MIN.saturating_add(ADOPTIONS.fetch_add(1, Ordering::Relaxed));
+        (e.adoption, e.resuming) = (n.get(), true);
         e.build_id.clone_from(&a.build_id);
         e.out_tx = Some(out_tx.clone());
         e.worker_name.clone_from(&a.worker_name);
@@ -198,7 +203,7 @@ impl WorkerCtx {
             e.wait = WAITS.fetch_add(1, Ordering::Relaxed);
             self.tell_wait(&a.dedupe_key, e.wait, out_tx);
         }
-        true
+        Some(e.adoption)
     }
 
     /// Mark the build keyed `key` as waiting for a build agent, or not,

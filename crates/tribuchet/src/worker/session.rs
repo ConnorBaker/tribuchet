@@ -319,7 +319,7 @@ async fn handle_assignment(
     // re-dispatched a build we are running or have finished: adopt
     // the new build_id and deliver the result when there is one,
     // instead of building again.
-    if ctx.adopt_assignment(&a, out_tx) {
+    if let Some(adoption) = ctx.adopt_assignment(&a, out_tx) {
         tracing::info!(id = a.build_id, key = a.dedupe_key, "build resumed");
         out_tx
             .send(msg(worker_message::Msg::Resumed(Resumed {
@@ -327,7 +327,7 @@ async fn handle_assignment(
             })))
             .await?;
         let ctx = ctx.clone();
-        tokio::task::spawn_blocking(move || try_deliver(&ctx, &a.dedupe_key));
+        tokio::task::spawn_blocking(move || try_deliver(&ctx, &a.dedupe_key, Some(adoption)));
         return Ok(None);
     }
     tracing::info!(id = a.build_id, "build assigned");
