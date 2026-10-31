@@ -228,6 +228,10 @@ const SCENARIOS: &[&str] = &[
     // Cancelled and its agent without it: its key goes as that is decided,
     // and its teardown leaves a new run of the key alone.
     "lost | fill assign:old cancel:old open gone dir anew idle nodir running | adopt running k",
+    // ... while its log replay waits on a session that takes nothing, the
+    // replay is stopped before its dir goes, not left to write an offset
+    // there meanwhile ("directory not empty").
+    "lost cap1 | fill assign:old cancel:old cancelled:old log:1638400 replayed:8192 open gone drain:old idle nodir stopped:old | adopt running k",
     // Left by an older worker with network in the host's network: killed,
     // not adopted, its key never offered.
     "has net | gone open idle nodir gone | adopt running, kill none, cleanup none, other none",
@@ -261,6 +265,7 @@ fn run(row: &str) -> Result<()> {
     let (ctx, build, log) = (&h.ctx, &h.build, h.build.join("build.log"));
     let mut sessions = HashMap::new();
     let mut results: HashMap<&str, Vec<(String, String)>> = HashMap::new();
+    let mut drained = HashMap::new();
     for step in steps.split(' ') {
         let (what, arg) = step.split_once(':').unwrap_or((step, ""));
         let cap = if flag("cap1") { 1 } else { 64 };
@@ -317,13 +322,16 @@ fn run(row: &str) -> Result<()> {
                 fs::read_to_string(build.join("log.offset")).is_ok_and(|o| o == arg)
             }),
             "drain" => {
-                let mut rx = sessions.remove(arg).unwrap().1;
+                let (tx, mut rx) = sessions.remove(arg).unwrap();
+                drained.insert(arg, tx.downgrade());
                 thread::spawn(move || {
                     while rx.blocking_recv().is_some() {
                         thread::sleep(Duration::from_millis(5));
                     }
                 });
             }
+            // Nothing sends to drained session s any more: its replay ended.
+            "stopped" => assert!(drained[arg].upgrade().is_none(), "{step}: {row}"),
             "anew" => {
                 let anew = build.with_file_name("b2");
                 fs::create_dir_all(&anew)?;
