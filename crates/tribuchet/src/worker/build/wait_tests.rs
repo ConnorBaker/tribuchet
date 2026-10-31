@@ -142,7 +142,12 @@ fn every_wait_is_told_as_the_table_says() -> Result<()> {
             ..build.assignment.clone()
         };
         let (new_tx, mut new_rx) = mpsc::channel(4);
-        let take = || assert!(ctx.adopt_assignment(&again, &new_tx), "row {row}: not held");
+        let take = || {
+            assert!(
+                ctx.adopt_assignment(&again, &new_tx).is_some(),
+                "row {row}: not held"
+            )
+        };
         if takeover == Before {
             take();
         }
@@ -169,7 +174,7 @@ fn every_wait_is_told_as_the_table_says() -> Result<()> {
             take();
             new = told(&mut new_rx, true);
             assert!(
-                ctx.adopt_assignment(&back, &old_back),
+                ctx.adopt_assignment(&back, &old_back).is_some(),
                 "row {row}: not held"
             );
         }

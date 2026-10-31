@@ -88,6 +88,14 @@ pub(in crate::worker) struct ResumableBuild {
     /// A delivery is in flight; a concurrent re-assignment must not
     /// start a second one.
     pub(in crate::worker) delivering: bool,
+    /// The number of its latest adoption by an assignment, unique in the
+    /// worker (adopt_assignment); 0 for the one it was registered under.
+    pub(in crate::worker) adoption: u64,
+    /// The adoption its result was last delivered to.
+    pub(in crate::worker) delivered: Option<u64>,
+    /// Its latest adoption's session is not told it resumed yet (Resumed):
+    /// nothing is delivered to it until then (try_deliver).
+    pub(in crate::worker) resuming: bool,
     /// Build dir holding build.log, for log replay on resume.
     pub(in crate::worker) dir: PathBuf,
     /// Replays the log to the resumed session; joined before the
@@ -235,7 +243,7 @@ pub(in crate::worker) fn record_finished(ctx: &Arc<WorkerCtx>, key: &str, fin: F
     // Cancel handler only adds the flag while the entry is unfinished
     // (under the registry lock), so no new flag can appear afterwards.
     ctx.cancelled.lock().unwrap().remove(key);
-    try_deliver(ctx, key);
+    try_deliver(ctx, key, None);
 }
 
 /// Persist for redelivery by a replacement worker; the rename
@@ -404,44 +412,75 @@ pub(in crate::worker) fn ack_delivery(ctx: &Arc<WorkerCtx>, key: &str, build_id:
     }
 }
 
-/// Deliver `key`'s finished result if there is one and no other
-/// delivery is running, over the session that issued its latest
-/// assignment. The build is kept until the hub acknowledges the
-/// result; a failed or unacknowledged delivery is retried on the next
-/// assignment of the same key.
-pub(in crate::worker) fn try_deliver(ctx: &Arc<WorkerCtx>, key: &str) {
-    let (build_id, out_tx, fin, log_tail) = {
+/// What a claimed delivery takes: build id, session, result, log replay.
+type Claim = (
+    String,
+    mpsc::Sender<WorkerMessage>,
+    Arc<FinishedBuild>,
+    Option<LogTail>,
+);
+
+/// Claim the delivery of `e`'s result to its latest adoption, if its
+/// session was told it resumed and that adoption was delivered none.
+fn claim(e: &mut ResumableBuild) -> Option<Claim> {
+    let (Some(fin), Some(out_tx)) = (e.finished.clone(), e.out_tx.clone()) else {
+        return None;
+    };
+    if e.resuming || e.delivered == Some(e.adoption) {
+        return None;
+    }
+    e.delivering = true;
+    e.delivered = Some(e.adoption);
+    Some((e.build_id.clone(), out_tx, fin, e.log_tail.take()))
+}
+
+/// Deliver `key`'s finished result if there is one to its latest
+/// adoption, under its build id: once per adoption, never two at a time,
+/// and to a takeover only once its session was told it resumed, which
+/// `resumed`, that adoption's number, says. One taken meanwhile is
+/// delivered to as a running delivery ends. The build is kept until the
+/// hub acknowledges the result; a failed or unacknowledged delivery is
+/// retried on the next assignment of the same key, under its id or not.
+pub(in crate::worker) fn try_deliver(ctx: &Arc<WorkerCtx>, key: &str, resumed: Option<u64>) {
+    let mut next = {
         let mut map = ctx.resumable.lock().unwrap();
         let Some(e) = map.get_mut(key) else { return };
+        if resumed == Some(e.adoption) {
+            e.resuming = false;
+        }
         if e.delivering {
             return;
         }
-        let (Some(fin), Some(out_tx)) = (e.finished.clone(), e.out_tx.clone()) else {
-            return;
-        };
-        e.delivering = true;
-        (e.build_id.clone(), out_tx, fin, e.log_tail.take())
+        claim(e)
     };
-    // Flush any log replay first so the result arrives after the log.
-    if let Some(t) = log_tail {
-        t.stop();
-    }
-    let result = deliver(&fin, &build_id, &out_tx);
-    let mut map = ctx.resumable.lock().unwrap();
-    // The ack may already have removed the entry; nothing to update then.
-    if let Some(entry) = map.get_mut(key) {
-        entry.delivering = false;
-    }
-    match result {
-        Ok(()) => {
-            tracing::info!(id = build_id, "build result sent, awaiting chunk request");
+    while let Some((build_id, out_tx, fin, log_tail)) = next {
+        // Flush any log replay first so the result arrives after the log.
+        if let Some(t) = log_tail {
+            t.stop();
         }
-        Err(e) => {
-            tracing::warn!(
-                id = build_id,
-                "result delivery failed, keeping for resume: {}",
-                chain(&e)
-            );
+        match deliver(&fin, &build_id, &out_tx) {
+            Ok(()) => {
+                tracing::info!(id = build_id, "build result sent, awaiting chunk request");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    id = build_id,
+                    "result delivery failed, keeping for resume: {}",
+                    chain(&e)
+                );
+            }
         }
+        // Released or claimed anew in one step, so no other delivery
+        // starts between. The ack may already have removed the entry, or a
+        // new run of the key replaced it; nothing to update then.
+        let mut map = ctx.resumable.lock().unwrap();
+        let ours = map
+            .get_mut(key)
+            .filter(|e| (e.finished.as_ref()).is_some_and(|f| Arc::ptr_eq(f, &fin)));
+        next = ours.and_then(|e| {
+            let next = claim(e);
+            e.delivering = next.is_some();
+            next
+        });
     }
 }

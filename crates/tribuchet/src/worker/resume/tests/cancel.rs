@@ -2,6 +2,7 @@
 //! the key then gets.
 
 use super::*;
+use crate::proto::Resumed;
 
 /// An entry for "k" in b1 for the session "old": running, held for its
 /// agent, or finished with this error.
@@ -73,7 +74,7 @@ const ROWS: &[(Entry, &[Tell], Then)] = &[
     (
         Entry::Finished(""),
         &[Assign("new", true)],
-        (&[], &[], Some(("new", true)), true),
+        (&[], &[("new", "")], Some(("new", true)), true),
     ),
     // A cancel of a finished run, or one that beat it to the finish, is no
     // flag that would fail the key's next run here.
@@ -135,15 +136,20 @@ fn every_cancel_and_assignment_ends_as_the_table_says() -> Result<()> {
                     let taken = ctx.abort_reason("k", &b1.join("build.log"), None, None);
                     assert_eq!(taken.as_deref(), Some(CANCELLED), "row {row}");
                 }
+                // As handle_assignment: adopted, it is delivered to.
                 Assign(s, adopted) => {
                     let tx = if s == "old" { &old } else { &new };
-                    assert_eq!(
-                        ctx.adopt_assignment(&assignment(s), tx),
-                        adopted,
-                        "row {row}"
-                    );
+                    let adoption = ctx.adopt_assignment(&assignment(s), tx);
+                    assert_eq!(adoption.is_some(), adopted, "row {row}");
+                    if let Some(n) = adoption {
+                        let ctx = ctx.clone();
+                        bounded("delivered", move || try_deliver(&ctx, "k", Some(n)));
+                    }
                 }
-                End(error) => record_finished(&ctx, "k", ended(&b1, error)),
+                End(error) => {
+                    let (ctx, fin) = (ctx.clone(), ended(&b1, error));
+                    bounded("recorded", move || record_finished(&ctx, "k", fin));
+                }
                 Anew => {
                     fs::create_dir_all(&b2)?;
                     ResumableBuild::insert(&ctx, "k".into(), "new".into(), b2.clone(), None);
@@ -229,5 +235,312 @@ fn a_cancel_taken_as_a_held_builds_kill_is_decided_leaves_no_flag() -> Result<()
         1,
         "the first cancel came before the answer"
     );
+    Ok(())
+}
+
+/// Run `f` on a thread until it returns, for 60 s at most: a delivery that
+/// never ends fails its test instead of hanging the run.
+fn bounded(what: &str, f: impl FnOnce() + Send + 'static) {
+    let t = thread::spawn(f);
+    until(what, || t.is_finished());
+    t.join().unwrap();
+}
+
+/// A session: the build id and adoption of the assignment it was sent,
+/// and its ends.
+struct Session {
+    id: &'static str,
+    adoption: u64,
+    tx: tokio::sync::mpsc::Sender<WorkerMessage>,
+    rx: tokio::sync::mpsc::Receiver<WorkerMessage>,
+}
+
+impl Session {
+    /// The hub assigns "k" anew as `id` on a new session: adopted.
+    fn take_over(ctx: &Arc<WorkerCtx>, id: &'static str) -> Self {
+        let (tx, rx) = tokio::sync::mpsc::channel(16);
+        let adoption = ctx.adopt_assignment(&assignment(id), &tx);
+        let adoption = adoption.expect("not held");
+        Self {
+            id,
+            adoption,
+            tx,
+            rx,
+        }
+    }
+
+    /// What handle_assignment does after adopting: send Resumed, then
+    /// deliver for its adoption.
+    fn resume(&self, ctx: &Arc<WorkerCtx>) {
+        let resumed = Resumed {
+            build_id: self.id.into(),
+        };
+        self.tx
+            .try_send(msg(worker_message::Msg::Resumed(resumed)))
+            .unwrap();
+        let (ctx, n) = (ctx.clone(), self.adoption);
+        bounded("delivered", move || try_deliver(&ctx, "k", Some(n)));
+    }
+
+    /// The Resumed and Result messages it got so far, in order.
+    fn got(&mut self) -> Vec<String> {
+        let mut got = Vec::new();
+        while let Ok(m) = self.rx.try_recv() {
+            match m.msg {
+                Some(worker_message::Msg::Resumed(r)) => {
+                    got.push(format!("Resumed {}", r.build_id));
+                }
+                Some(worker_message::Msg::Result(r)) => got.push(format!("Result {}", r.build_id)),
+                _ => {}
+            }
+        }
+        got
+    }
+}
+
+/// "k" finished in `dir`/b1 under `id`, no session told yet.
+fn finished_k(dir: &Path, id: &str) -> Result<Arc<WorkerCtx>> {
+    let ctx = WorkerCtx::for_test(dir, 4, vec![])?;
+    let b1 = dir.join("builds/b1");
+    fs::create_dir_all(&b1)?;
+    let fin = Some(ended(&b1, ""));
+    ResumableBuild::insert(&ctx, "k".into(), id.into(), b1, fin);
+    Ok(ctx)
+}
+
+/// "k" finished in b1, its result being delivered to a session before
+/// that takes nothing (full): the context and that session's receiver,
+/// which `end_the_delivery_before` closes, failing the delivery.
+struct Delivering {
+    dir: tempfile::TempDir,
+    ctx: Arc<WorkerCtx>,
+    old_rx: tokio::sync::mpsc::Receiver<WorkerMessage>,
+    first: Option<thread::JoinHandle<()>>,
+}
+
+fn delivering() -> Result<Delivering> {
+    let dir = tempfile::tempdir()?;
+    let ctx = finished_k(dir.path(), "old")?;
+    let (old, old_rx) = tokio::sync::mpsc::channel(1);
+    old.try_send(msg(worker_message::Msg::Resumed(Default::default())))
+        .unwrap();
+    ctx.resumable.lock().unwrap().get_mut("k").unwrap().out_tx = Some(old);
+    let first_ctx = ctx.clone();
+    let first = thread::spawn(move || try_deliver(&first_ctx, "k", None));
+    until("delivering to the session before", || {
+        ctx.resumable.lock().unwrap()["k"].delivering
+    });
+    Ok(Delivering {
+        dir,
+        ctx,
+        old_rx,
+        first: Some(first),
+    })
+}
+
+impl Delivering {
+    /// The session before goes, which ends its delivery. Bounded: a
+    /// delivery that went on to a session that takes nothing would hang.
+    fn end_the_delivery_before(&mut self) {
+        self.old_rx.close();
+        let first = self.first.take().unwrap();
+        until("the delivery before ended", || first.is_finished());
+        first.join().unwrap();
+    }
+}
+
+/// A takeover told it resumed while the delivery to the session before
+/// runs is sent the result as that ends, not left to the reaper.
+#[test]
+fn a_takeover_during_a_delivery_is_sent_the_result() -> Result<()> {
+    let mut d = delivering()?;
+    let mut new = Session::take_over(&d.ctx, "new");
+    new.resume(&d.ctx);
+    d.end_the_delivery_before();
+    assert_eq!(new.got(), ["Resumed new", "Result new"], "new was sent");
+    Ok(())
+}
+
+/// ... and one told it resumed after that ended is sent it once, after
+/// Resumed: the delivery that ended makes none for it before.
+#[test]
+fn a_takeover_after_a_delivery_is_sent_the_result_once_after_resumed() -> Result<()> {
+    let mut d = delivering()?;
+    let mut new = Session::take_over(&d.ctx, "new");
+    d.end_the_delivery_before();
+    new.resume(&d.ctx);
+    assert_eq!(new.got(), ["Resumed new", "Result new"], "new was sent");
+    Ok(())
+}
+
+/// ... and once only, however often it asks: no delivery claims itself
+/// again as it ends.
+#[test]
+fn a_takeover_after_a_delivery_is_sent_the_result_once() -> Result<()> {
+    let mut d = delivering()?;
+    let mut new = Session::take_over(&d.ctx, "new");
+    d.end_the_delivery_before();
+    let mut got = Vec::new();
+    let (ctx, n) = (d.ctx.clone(), new.adoption);
+    let asked = thread::spawn(move || {
+        try_deliver(&ctx, "k", Some(n));
+        try_deliver(&ctx, "k", Some(n));
+    });
+    until("delivered, once or more", || {
+        got.extend(new.got());
+        asked.is_finished() || got.len() > 1
+    });
+    got.extend(new.got());
+    assert_eq!(got, ["Result new"], "new was sent");
+    Ok(())
+}
+
+/// A second takeover during the delivery, not yet told it resumed as that
+/// ends, is sent the result once, after its Resumed; the first, taken
+/// over in turn, none.
+#[test]
+fn a_second_takeover_is_sent_the_result_once_after_resumed() -> Result<()> {
+    let mut d = delivering()?;
+    let mut new = Session::take_over(&d.ctx, "new");
+    new.resume(&d.ctx);
+    let mut third = Session::take_over(&d.ctx, "third");
+    d.end_the_delivery_before();
+    third.resume(&d.ctx);
+    assert_eq!(
+        third.got(),
+        ["Resumed third", "Result third"],
+        "third was sent"
+    );
+    assert_eq!(new.got(), ["Resumed new"], "new was sent");
+    Ok(())
+}
+
+/// The same build id taken over on two sessions in turn: the first one's
+/// delivery, asked late, sends the second nothing before its Resumed; the
+/// second's sends it the result once, after.
+#[test]
+fn a_second_takeover_under_the_same_id_waits_for_its_resumed() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let ctx = finished_k(dir.path(), "old")?;
+    let mut s2 = Session::take_over(&ctx, "x");
+    let mut s3 = Session::take_over(&ctx, "x");
+    s2.resume(&ctx);
+    assert_eq!(
+        s3.got(),
+        Vec::<String>::new(),
+        "s3 was sent before its Resumed"
+    );
+    s3.resume(&ctx);
+    assert_eq!(s3.got(), ["Resumed x", "Result x"], "s3 was sent");
+    assert_eq!(s2.got(), ["Resumed x"], "s2 was sent");
+    Ok(())
+}
+
+/// A takeover's delivery asked late, after a new run of the key replaced
+/// its entry and was taken over in turn, sends that takeover nothing
+/// before its own Resumed: adoption numbers are unique in the worker.
+#[test]
+fn a_late_delivery_for_a_replaced_entry_waits_for_the_new_resumed() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let ctx = finished_k(dir.path(), "old")?;
+    let s2 = Session::take_over(&ctx, "x");
+    let b2 = dir.path().join("builds/b2");
+    fs::create_dir_all(&b2)?;
+    let fin = Some(ended(&b2, ""));
+    ResumableBuild::insert(&ctx, "k".into(), "anew".into(), b2, fin);
+    let mut s3 = Session::take_over(&ctx, "y");
+    let (c, n) = (ctx.clone(), s2.adoption);
+    bounded("delivered", move || try_deliver(&c, "k", Some(n)));
+    assert_eq!(
+        s3.got(),
+        Vec::<String>::new(),
+        "s3 was sent before its Resumed"
+    );
+    s3.resume(&ctx);
+    assert_eq!(s3.got(), ["Resumed y", "Result y"], "s3 was sent");
+    Ok(())
+}
+
+/// The hub requeues a job whose session died and assigns it again under
+/// the same build id: the worker's next session is sent the result, after
+/// its Resumed, whether the delivery to the session before failed (as the
+/// run ended, or later) or reached it unacknowledged.
+#[test]
+fn a_same_id_takeover_after_a_delivery_is_sent_the_result() -> Result<()> {
+    for before in ["failed at the end", "failed later", "unacknowledged"] {
+        let dir = tempfile::tempdir()?;
+        let ctx = WorkerCtx::for_test(dir.path(), 4, vec![])?;
+        let b1 = dir.path().join("builds/b1");
+        fs::create_dir_all(&b1)?;
+        let fin = (before == "failed later").then(|| ended(&b1, ""));
+        ResumableBuild::insert(&ctx, "k".into(), "x".into(), b1.clone(), fin);
+        let (s1, mut s1_rx) = tokio::sync::mpsc::channel(16);
+        ctx.resumable.lock().unwrap().get_mut("k").unwrap().out_tx = Some(s1);
+        if before != "unacknowledged" {
+            s1_rx.close();
+        }
+        let (c, fin) = (ctx.clone(), ended(&b1, ""));
+        if before == "failed later" {
+            bounded("delivered", move || try_deliver(&c, "k", None));
+        } else {
+            bounded("recorded", move || record_finished(&c, "k", fin));
+        }
+        let first = s1_rx.try_recv().ok().and_then(|m| m.msg);
+        let reached = matches!(first, Some(worker_message::Msg::Result(_)));
+        assert_eq!(reached, before == "unacknowledged", "{before}: s1 was sent");
+        drop(s1_rx);
+        let mut s2 = Session::take_over(&ctx, "x");
+        s2.resume(&ctx);
+        assert_eq!(s2.got(), ["Resumed x", "Result x"], "{before}: s2 was sent");
+    }
+    Ok(())
+}
+
+/// A takeover of a running build is sent nothing before its Resumed,
+/// also when the run ends between: its result waits for that.
+#[test]
+fn a_run_that_ends_before_its_takeovers_resumed_waits_for_it() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let ctx = WorkerCtx::for_test(dir.path(), 4, vec![])?;
+    let b1 = dir.path().join("builds/b1");
+    fs::create_dir_all(&b1)?;
+    ResumableBuild::insert(&ctx, "k".into(), "old".into(), b1.clone(), None);
+    let mut new = Session::take_over(&ctx, "new");
+    let (c, fin) = (ctx.clone(), ended(&b1, ""));
+    bounded("recorded", move || record_finished(&c, "k", fin));
+    assert_eq!(
+        new.got(),
+        Vec::<String>::new(),
+        "new was sent before its Resumed"
+    );
+    new.resume(&ctx);
+    assert_eq!(new.got(), ["Resumed new", "Result new"], "new was sent");
+    Ok(())
+}
+
+/// A delivery that ends after a new run of its key replaced its entry
+/// leaves that run's delivery marked as running: no second one starts
+/// beside it.
+#[test]
+fn a_delivery_leaves_a_new_runs_entry_alone() -> Result<()> {
+    let mut d = delivering()?;
+    let b2 = d.dir.path().join("builds/b2");
+    fs::create_dir_all(&b2)?;
+    let fin = Some(ended(&b2, ""));
+    ResumableBuild::insert(&d.ctx, "k".into(), "anew".into(), b2, fin);
+    let (anew, mut anew_rx) = tokio::sync::mpsc::channel(1);
+    anew.try_send(msg(worker_message::Msg::Resumed(Default::default())))
+        .unwrap();
+    d.ctx.resumable.lock().unwrap().get_mut("k").unwrap().out_tx = Some(anew);
+    let second_ctx = d.ctx.clone();
+    let second = thread::spawn(move || try_deliver(&second_ctx, "k", None));
+    until("delivering the new run's result", || {
+        d.ctx.resumable.lock().unwrap()["k"].delivering
+    });
+    d.end_the_delivery_before();
+    let marked = d.ctx.resumable.lock().unwrap()["k"].delivering;
+    anew_rx.close();
+    until("the new run's delivery ended", || second.is_finished());
+    assert!(marked, "the delivery before unmarked the new run's");
     Ok(())
 }
