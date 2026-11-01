@@ -230,6 +230,15 @@ A queued build that no connected worker can serve stays queued until
 one registers, and its clients are told so. A loss the worker resumes costs a build nothing; the fourth
 genuine loss (followed by a start-over) fails it, and so does the
 thirteenth loss on a resume (`hub/losses.rs`).
+The hub knows a reconnecting worker by name: the hostname it reports
+(not anything in its certificate), or with `auth = "tailscale"` its
+tailscale node's short name. No two workers may share a name, nor two
+workers one tailscale node. The hub does not check, so a shared name
+goes unnoticed, and a build kept for its worker through the reconnect
+grace can be released while that worker still runs it, and run twice.
+Give each worker its own hostname, and a container `--hostname`:
+podman otherwise uses its ID, new on every recreate, or with
+`--network=host` the host's own hostname.
 
 A build with no attach client is kept while no waiting build wants its
 slot. Under demand, one whose clients have all been gone 14 s is given
