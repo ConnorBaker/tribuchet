@@ -214,7 +214,11 @@ running build whose agent does not answer keeps its key, its slot and
 its agent until the agent answers, and its clients are told it waits.
 The hub covers the
 session gap by requeueing instead of failing jobs whose worker
-session died; the attached client sees a pause, not an error. A full
+session died; the attached client sees a pause, not an error. For
+`worker-grace-secs`, or until that worker registers again, such a
+job, once its assignment was sent, is kept for its worker (by name):
+a quick reconnect resumes it instead of another worker running it a
+second time. A full
 stop behaves the same way: builds keep running, and their results
 wait on disk until a worker starts again (or expire undelivered).
 A queued build that no connected worker can serve stays queued until
