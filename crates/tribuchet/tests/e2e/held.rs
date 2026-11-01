@@ -4,7 +4,7 @@
 //! userns helper the agent waits on (SIGSTOP from the test, never the agent
 //! itself): the agent runs, as in a long make-readable or remove. A build
 //! whose agent does not answer Adopt within AGENT_ANSWER (7 s) is held until
-//! it does, its client told it waits.
+//! it does, its client told it waits; an agent busy in Finish answers.
 
 use std::thread;
 use std::time::{Duration, Instant};
@@ -110,9 +110,9 @@ fn show(name: &str) {
 }
 
 /// A worker restarted while F's agent is in Finish, its make-readable
-/// helper stopped: the agent answers no Adopt, its accept thread in the
-/// Finish, so F is held and its client told; F is adopted once the helper
-/// goes on, and succeeds.
+/// helper stopped: the agent still answers Adopt, the Finish on a thread
+/// of its own, so F is adopted at once, held never and its client told
+/// nothing; F succeeds once the helper goes on.
 #[test]
 fn a_busy_finish() {
     let (held0, adopted0) = (seen(HELD), seen(ADOPTED));
@@ -143,7 +143,7 @@ fn a_busy_finish() {
     show("F");
     assert_eq!(
         (while_busy, done),
-        ((true, false, true), true),
+        ((false, true, false), true),
         "F (held, adopted, client told) while its agent was busy in Finish; F succeeded"
     );
 }

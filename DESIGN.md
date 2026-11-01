@@ -217,6 +217,14 @@ from their agents, supervises them to completion and redelivers finished
 results. A worker runs min(`max-jobs`, reachable agents) builds; a
 running build whose agent does not answer keeps its key, its slot and
 its agent until the agent answers, and its clients are told it waits.
+An agent answers Adopt and Status at once whatever Kill or Finish it runs
+(each on a thread of its own; Kill, Finish and Cleanup take turns, so no
+kill sweep kills another's helper), and once a Start has registered its
+build. It does not while a Start stages its build, while it runs a
+Cleanup (sent once the result is on disk, which a restarted worker
+delivers without asking the agent), or for up to 10 s behind a client
+that connects and sends nothing. Beyond those, an agent that does not
+answer is stopped or stalled from outside.
 The hub covers the
 session gap by requeueing instead of failing jobs whose worker
 session died; the attached client sees a pause, not an error. For
