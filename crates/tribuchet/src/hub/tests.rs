@@ -26,6 +26,7 @@ mod clientless_chain;
 mod clientless_farm;
 mod daemon;
 pub(super) mod fake_daemon;
+mod reconnect;
 mod unlisted;
 mod usage;
 
