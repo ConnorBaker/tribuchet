@@ -382,6 +382,60 @@ fn unreachable_agents_do_not_count_until_they_answer() -> Result<()> {
     Ok(())
 }
 
+/// Run one rescan on a thread of its own: whether it returned within
+/// 30 s.
+fn rescan_returns(ctx: &Arc<WorkerCtx>) -> bool {
+    let (done, finished) = mpsc::channel();
+    let task_ctx = ctx.clone();
+    thread::spawn(move || {
+        rescan_agents(&task_ctx, None);
+        let _ = done.send(());
+    });
+    finished.recv_timeout(Duration::from_secs(30)).is_ok()
+}
+
+/// A down agent that accepts a connection and never answers holds up
+/// no rescan: each call to it gives up after AGENT_ANSWER, so the
+/// rescan still returns another agent that answers again.
+#[test]
+fn a_silent_agent_does_not_stop_the_rescan() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (silent, back) = (dir.path().join("1.sock"), dir.path().join("2.sock"));
+    let _silent = sockpath::bind(&silent)?;
+    let ctx = WorkerCtx::for_test(dir.path(), 4, vec![silent.clone(), back.clone()])?;
+    ctx.agents.mark_down(&silent);
+    ctx.agents.mark_down(&back);
+    spawn_agent(&back, dir.path().join("a2"))?;
+    assert!(
+        rescan_returns(&ctx),
+        "the rescan still waits on the silent agent after 30 s"
+    );
+    assert_eq!(ctx.agents.down_sockets(), vec![silent]);
+    assert_eq!(ctx.jobs(), 1);
+    Ok(())
+}
+
+/// An agent that answers Status, then never answers Shutdown, holds
+/// up no rescan either: Shutdown gives up after AGENT_ANSWER too, and
+/// the agent still joins the pool.
+#[test]
+fn an_agent_silent_on_shutdown_does_not_stop_the_rescan() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let socket = dir.path().join("1.sock");
+    // It answers the first call, Status; the next, Shutdown, waits.
+    let allow = Arc::new(AtomicUsize::new(1));
+    let calls = fake_agent(&socket, "", None, allow, String::new)?;
+    let ctx = WorkerCtx::for_test(dir.path(), 4, vec![socket.clone()])?;
+    ctx.agents.mark_down(&socket);
+    assert!(
+        rescan_returns(&ctx),
+        "the rescan still waits on Shutdown after 30 s"
+    );
+    assert_eq!(calls.asked.load(SeqCst), 2, "Status and Shutdown");
+    assert_eq!(ctx.jobs(), 1);
+    Ok(())
+}
+
 /// A socket added to agent-sockets-dir after startup joins the
 /// pool, up to max-jobs.
 #[test]
