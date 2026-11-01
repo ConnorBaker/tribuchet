@@ -129,6 +129,7 @@
                 "arbiter"
                 "pairs"
                 "daemon"
+                "held"
               ]
           )
         )
