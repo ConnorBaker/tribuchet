@@ -2,14 +2,22 @@
 
 use crate::proto::BuildRequest;
 
+/// The output a build is known by (`out`, else the first by name) and
+/// its scratch path. build.json names no derivation path, but the scratch
+/// path joins to one: the output path when not yet valid, else a fallback
+/// hashed from the derivation path; only an impure derivation's is
+/// random (derivation-builder.cc, scratchPath, makeFallbackPath).
+pub(super) fn named_output(req: &BuildRequest) -> Option<(&String, &String)> {
+    req.outputs
+        .get_key_value("out")
+        .or_else(|| req.outputs.iter().next())
+}
+
 /// The derivation name. Nix names an output path `name` for `out` and
 /// `name-output` otherwise (derivations.cc, outputPathName), and names
 /// the scratch paths a build writes to the same way.
 pub(super) fn drv_name(req: &BuildRequest) -> Option<&str> {
-    let (output, path) = req
-        .outputs
-        .get_key_value("out")
-        .or_else(|| req.outputs.iter().next())?;
+    let (output, path) = named_output(req)?;
     let (_hash, name) = path.rsplit('/').next()?.split_once('-')?;
     if output == "out" {
         Some(name)
@@ -44,5 +52,7 @@ mod tests {
         );
         assert_eq!(drv_name(&req(&[("dev", &dev)])), Some("nix-expr-2.36.0pre"));
         assert_eq!(drv_name(&req(&[])), None);
+        let both = req(&[("dev", &dev), ("out", &out)]);
+        assert_eq!(named_output(&both).map(|(_, p)| p), Some(&out));
     }
 }
