@@ -44,6 +44,10 @@ message RequestJob {
   // `capacity`. The hub takes off the ones it sent since. Unset by
   // workers predating the field.
   optional uint64 assignments = 2;
+  // Of `capacity`, the slots no build holds: capacity less the one
+  // build staged ahead while every slot is busy. Unset by workers
+  // predating the field.
+  optional uint32 free_slots = 3;
 }
 
 message HubMessage {
