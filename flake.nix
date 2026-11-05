@@ -130,6 +130,7 @@
                 "pairs"
                 "daemon"
                 "held"
+                "spread"
               ]
           )
         )
