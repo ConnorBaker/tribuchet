@@ -27,6 +27,7 @@ mod fod_ipv6;
 mod harness;
 mod held;
 mod pairs;
+mod spread;
 
 use std::time::Instant;
 
