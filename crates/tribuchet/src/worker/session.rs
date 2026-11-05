@@ -197,11 +197,12 @@ async fn declare_capacity(
 ) -> Result<()> {
     let lookahead =
         env.ctx.jobs() > 0 && ready.is_empty() && active.values().all(|b| b.slot.is_some());
-    let capacity = env.ctx.free_slots() + usize::from(lookahead);
+    let free = env.ctx.free_slots();
     env.out_tx
         .send(msg(worker_message::Msg::RequestJob(RequestJob {
-            capacity: u32::try_from(capacity).unwrap_or(u32::MAX),
+            capacity: u32::try_from(free + usize::from(lookahead)).unwrap_or(u32::MAX),
             assignments: Some(env.assignments.load(Ordering::Relaxed)),
+            free_slots: u32::try_from(free).ok(),
         })))
         .await?;
     Ok(())
@@ -547,7 +548,30 @@ mod tests {
         let Some(worker_message::Msg::RequestJob(r)) = out_rx.recv().await.unwrap().msg else {
             panic!("expected RequestJob");
         };
-        assert_eq!(r.capacity, 0);
+        assert_eq!((r.capacity, r.free_slots), (0, Some(0)));
+        Ok(())
+    }
+
+    /// A declaration tells the hub which of its capacity are free slots,
+    /// apart from the one build staged ahead while every slot is busy.
+    #[tokio::test]
+    async fn a_declaration_tells_free_slots_from_the_lookahead() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let agents = ["1.sock", "2.sock"].map(|s| dir.path().join(s)).to_vec();
+        let ctx = WorkerCtx::for_test(dir.path(), 4, agents)?;
+        *ctx.held.lock().unwrap() = 1;
+        let (out_tx, mut out_rx) = mpsc::channel(1);
+        let env = LaunchEnv {
+            ctx: &ctx,
+            out_tx: &out_tx,
+            build_timeout: Duration::ZERO,
+            assignments: AtomicU64::default(),
+        };
+        declare_capacity(&HashMap::new(), &VecDeque::new(), &env).await?;
+        let Some(worker_message::Msg::RequestJob(r)) = out_rx.recv().await.unwrap().msg else {
+            panic!("expected RequestJob");
+        };
+        assert_eq!((r.capacity, r.free_slots), (2, Some(1)));
         Ok(())
     }
 }

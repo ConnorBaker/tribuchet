@@ -27,6 +27,7 @@ mod clientless_farm;
 mod daemon;
 pub(super) mod fake_daemon;
 mod reconnect;
+mod spread;
 mod unlisted;
 mod usage;
 
@@ -327,6 +328,7 @@ fn request_job(capacity: u32, assignments: Option<u64>) -> WorkerMessage {
         msg: Some(worker_message::Msg::RequestJob(RequestJob {
             capacity,
             assignments,
+            free_slots: None,
         })),
     }
 }
@@ -462,6 +464,7 @@ fn a_declaration_leaves_free_what_the_worker_has_not_been_sent() {
         a.declare(&RequestJob {
             capacity,
             assignments,
+            free_slots: None,
         });
         assert_eq!(
             a.free, free,

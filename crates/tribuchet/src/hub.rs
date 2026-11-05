@@ -143,6 +143,11 @@ struct Admission {
     /// The last declaration as received, for the dispatch log.
     capacity: u32,
     assignments: Option<u64>,
+    /// Of the declaration, what the worker stages beyond its free slots:
+    /// all of it from a worker predating `free_slots`.
+    lookahead: u32,
+    /// Heavy builds (placement::heavy) handed to this session, unsettled.
+    heavy: u32,
 }
 
 impl Admission {
@@ -158,6 +163,13 @@ impl Admission {
         self.free = r
             .capacity
             .saturating_sub(u32::try_from(unseen).unwrap_or(u32::MAX));
+        self.lookahead = r.capacity.saturating_sub(r.free_slots.unwrap_or(0));
+    }
+
+    /// Idle agents left: an assignment takes a free slot before the
+    /// lookahead.
+    fn idle(&self) -> u32 {
+        self.free.saturating_sub(self.lookahead)
     }
 }
 
@@ -377,7 +389,9 @@ async fn worker_loop(
                 _ = &mut route => break 'outer,
             }
         };
-        placement::dispatch(&register.worker_name, &job, resumed, &admission);
+        admission.lock().unwrap().heavy += u32::from(placement::heavy(&job.features));
+        let to = (worker_id, register.worker_name.as_str());
+        placement::dispatch(&state, to, &job, resumed, &admission);
         // Tell the attach client where its build runs.
         job.replay
             .publish(attach_event::Event::Dispatched(
@@ -460,10 +474,15 @@ async fn supervise_job(
     drop(dispatch_listed);
     let dispatched = dispatch.sent;
     router.unregister(&job.id);
-    if !dispatched {
-        // The worker will never count an assignment that was not sent.
+    {
         let mut a = admission.lock().unwrap();
-        a.sent = a.sent.saturating_sub(1);
+        a.heavy = a
+            .heavy
+            .saturating_sub(placement::heavy(&job.features).into());
+        if !dispatched {
+            // The worker will never count an assignment that was not sent.
+            a.sent = a.sent.saturating_sub(1);
+        }
     }
     // run_job counts the build verdict. Only session/hub-side errors
     // reach the branches below.
