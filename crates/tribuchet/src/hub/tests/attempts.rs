@@ -113,7 +113,7 @@ async fn taken(state: &Arc<HubState>, take: Take) -> Option<(Job, CapsGuard)> {
     match take {
         Take::Fresh(name) => {
             let w = register(state, name, &[]);
-            let j = state.take_job(&caps(name)).await?;
+            let j = state.take_job(&caps(name), None).await?;
             Some((j, w))
         }
         Take::Back(name) => back(state, name).await,
@@ -256,7 +256,10 @@ async fn an_assignment_the_worker_never_got_counts_no_loss() {
     let state = Arc::new(HubState::for_test(Duration::ZERO));
     let mut client = queued_build(&state).await;
     let w = register(&state, "w1", &[]);
-    let job = state.take_job(&caps("w1")).await.expect("not handed out");
+    let job = state
+        .take_job(&caps("w1"), None)
+        .await
+        .expect("not handed out");
     let router = Router::default();
     let in_rx = router.register(&job.id);
     let (out_tx, out_rx) = mpsc::channel(64);
@@ -277,7 +280,7 @@ async fn an_assignment_the_worker_never_got_counts_no_loss() {
     .await;
     drop(w);
     let _w2 = register(&state, "w2", &[]);
-    let taken = state.take_job(&caps("w2")).await;
+    let taken = state.take_job(&caps("w2"), None).await;
     assert_eq!(
         taken.map(|j| (j.attempts, j.resumed_losses, j.loss.is_some())),
         Some((0, 0, false))

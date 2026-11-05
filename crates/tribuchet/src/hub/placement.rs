@@ -1,9 +1,11 @@
 //! What placement knows of each worker session: its admission, which the
 //! clientless decider reads, and the dispatch log line. A queued build
-//! goes to the first worker with room that asks (HubState::take_job).
+//! goes to the first worker with room that asks (HubState::take_job),
+//! but a heavy one is left a while for a worker with more room (Spread).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use super::Admission;
 use super::naming::drv_name;
@@ -20,6 +22,10 @@ pub(super) struct Placement {
     /// Each worker session's admission, by session id.
     pub(super) sessions: HashMap<u64, Arc<Mutex<Admission>>>,
 }
+
+/// How long after it was first passed over a heavy build may be passed
+/// over again: the woken worker's time to ask, not a wait for room.
+pub(super) const GRACE: Duration = Duration::from_secs(2);
 
 /// A worker session's room, as its admission stands.
 pub(super) struct Room {
@@ -49,6 +55,50 @@ impl Placement {
             }
         };
         self.sessions.iter().map(room).collect()
+    }
+
+    /// What session `asker` sees of the others' room; None while it has
+    /// no heavy build in flight, when it passes nothing over.
+    pub(super) fn spread(&self, asker: u64) -> Option<Spread> {
+        let mine = self.sessions.get(&asker)?.lock().unwrap().heavy;
+        let others = || self.rooms().into_iter().filter(|r| r.id != asker);
+        (mine > 0).then(|| Spread {
+            mine,
+            rooms: others().collect(),
+        })
+    }
+}
+
+/// The other sessions' room as a session with `mine` heavy builds in
+/// flight asked for work, less what its scan of the queue left them.
+pub(super) struct Spread {
+    pub(super) mine: u32,
+    pub(super) rooms: Vec<Room>,
+}
+
+impl Spread {
+    /// The session to leave a heavy build to, at `now`: one that `serves`
+    /// it with an idle agent and fewer heavy builds than the asker, the
+    /// fewest first, while `since`, when it was first passed over, is
+    /// less than GRACE ago. That agent is then spoken for, and `since`
+    /// set if it was not.
+    pub(super) fn passes(
+        &mut self,
+        since: &mut Option<Instant>,
+        serves: impl Fn(u64) -> bool,
+        now: Instant,
+    ) -> Option<u64> {
+        if since.is_some_and(|s| now.duration_since(s) >= GRACE) {
+            return None;
+        }
+        let mine = self.mine;
+        let room = (self.rooms.iter_mut())
+            .filter(|r| r.idle > 0 && r.heavy < mine && serves(r.id))
+            .min_by_key(|r| (r.heavy, r.id))?;
+        room.idle -= 1;
+        room.heavy += 1;
+        since.get_or_insert(now);
+        Some(room.id)
     }
 }
 

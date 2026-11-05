@@ -510,6 +510,7 @@ mod tests {
             resumed_losses: 0,
             queued_at: Instant::now(),
             loss: None,
+            deferred: None,
         }
     }
 

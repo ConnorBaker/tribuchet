@@ -267,6 +267,28 @@ clients are told once (`hub/relay/daemon.rs`):
 | a request the daemon drops as its journal says a worker crashed | 3 |
 | anything else: a drop or close with no such word in the journal, no answer within a minute, a silent daemon's included | ∞ |
 
+## Placement
+
+A queued build goes to the first worker with room that asks for it, in
+queue order, except that heavy builds are spread: those that declare
+`big-parallel`, which nixpkgs gives builds that use every core. A worker
+that asks while it runs a heavy build passes a heavy one over while
+another connected worker that serves it has an idle agent (a free slot,
+not the one build a worker stages ahead while every slot is busy) and
+fewer heavy builds in flight; that worker is woken, and takes it when
+it asks. A build is passed over for at most 2 s from the first time,
+then the next worker that asks takes it, whatever it runs: so when
+every other worker runs as many heavy builds, or has no idle agent, the
+asker takes it at once. The asker goes on to the next build it can
+take, so no light build waits for a heavy one, and a light build is
+never passed over. The hub counts only the builds it has dispatched and
+the workers' own declarations: it keeps no history of builds and no
+profile of workers (`hub/placement.rs`). So it weighs heavy builds in
+flight, not a worker's size: a worker running one heavy build leaves the
+next to any worker that serves it with an idle agent and none running,
+however few agents that worker has. Every worker advertises big-parallel
+for its native systems (`worker/caps.rs`), one with two agents too.
+
 ## CPU arbitration
 
 The worker's CPU arbiter (`worker/arbiter.rs`) is always on; nothing
