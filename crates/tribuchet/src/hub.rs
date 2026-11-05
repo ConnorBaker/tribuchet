@@ -374,7 +374,7 @@ async fn worker_loop(
             }
             let free = admission.lock().unwrap().free;
             if free > 0
-                && let Some(job) = state.take_job(&caps).await
+                && let Some(job) = state.take_job(&caps, Some(worker_id)).await
             {
                 let mut a = admission.lock().unwrap();
                 a.free = a.free.saturating_sub(1);

@@ -261,6 +261,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 resumed_losses: 0,
                 queued_at: Instant::now(),
                 loss: None,
+                deferred: None,
             };
             tracing::info!(
                 id = job.id,
@@ -450,7 +451,7 @@ mod tests {
         let _events = submit(&state, fod).await;
         let without = state.worker_caps.lock().unwrap()[&1].clone();
         assert!(
-            state.take_job(&without).await.is_none(),
+            state.take_job(&without, None).await.is_none(),
             "handed to a worker without network"
         );
         let with = WorkerCaps {
@@ -458,7 +459,7 @@ mod tests {
             ..without
         };
         assert!(
-            state.take_job(&with).await.is_some(),
+            state.take_job(&with, None).await.is_some(),
             "not handed to one with"
         );
     }

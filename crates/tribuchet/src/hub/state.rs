@@ -17,7 +17,7 @@ use super::Loss;
 use super::chunkcache::ChunkCache;
 use super::losses;
 use super::metrics::Metrics;
-use super::placement::Placement;
+use super::placement::{self, Placement};
 use super::relay::{DAEMON_ANSWER, DaemonEvidence};
 use crate::config::NixConfig;
 use crate::fsutil::io_ctx;
@@ -78,6 +78,9 @@ pub(super) struct Job {
     /// it as a loss on a resume. Until the loss's grace ends, or the
     /// worker is back, the build is kept for that worker (Loss::awaited).
     pub(super) loss: Option<Loss>,
+    /// When it was first passed over for another worker, if it is heavy
+    /// (placement::Spread): none since it last entered the queue.
+    pub(super) deferred: Option<Instant>,
 }
 
 impl Job {
@@ -386,21 +389,49 @@ impl HubState {
             .max()
     }
 
-    /// The first queued job `caps`'s worker can take.
-    pub(super) async fn take_job(&self, caps: &WorkerCaps) -> Option<Job> {
+    /// The first queued job `caps`'s worker can take, as worker session
+    /// `asker`, if any: a heavy build it passes over (placement::Spread)
+    /// stays queued, the session it is left to woken.
+    pub(super) async fn take_job(&self, caps: &WorkerCaps, asker: Option<u64>) -> Option<Job> {
         loop {
-            let mut job = {
+            // Read before the queue lock, so that nothing more is taken
+            // under it; afresh on a rescan, which passes over again.
+            let mut spread = asker.and_then(|id| self.placement.lock().unwrap().spread(id));
+            let (taken, left) = {
                 let mut queue = self.queue.lock().await;
                 let holding = self.holding.lock().unwrap();
                 // A held key goes to its holder by take_job_by_key, this
                 // worker included: a fresh take would count the loss its
                 // Resumed is about to clear.
                 let workers = self.worker_caps.lock().unwrap();
-                let pos = queue.iter().position(|j| {
-                    caps.serves(&j.req.system, &j.features) && !j.kept(&workers, &holding)
+                let (now, mut left) = (Instant::now(), Vec::new());
+                let pos = queue.iter_mut().position(|j| {
+                    if !caps.serves(&j.req.system, &j.features) || j.kept(&workers, &holding) {
+                        return false;
+                    }
+                    let (system, features, first) =
+                        (&j.req.system, &j.features, j.deferred.is_none());
+                    let serves = |id| workers.get(&id).is_some_and(|c| c.serves(system, features));
+                    let spread = spread.as_mut().filter(|_| placement::heavy(features));
+                    let to = spread.and_then(|s| s.passes(&mut j.deferred, serves, now));
+                    if let Some(to) = to.filter(|_| first) {
+                        left.push((j.id.clone(), workers.get(&to).map(|c| c.name.clone())));
+                    }
+                    to.is_none()
                 });
-                queue.remove(pos?)?
+                (pos.and_then(|p| queue.remove(p)), left)
             };
+            for (id, to) in &left {
+                tracing::info!(
+                    id,
+                    to,
+                    "leaving a heavy build to a worker with an idle agent"
+                );
+            }
+            if !left.is_empty() {
+                self.notify.notify_waiters();
+            }
+            let mut job = taken?;
             // Abandoned while queued (every attach client gone): drop it
             // here, at the moment it would have occupied a build slot.
             if !job.replay.has_subscribers().await {
@@ -455,7 +486,7 @@ impl HubState {
     /// (the next attempt re-streams them from the start), and leaving
     /// their chunks to the cache while it waits, held or not.
     pub(super) async fn requeue(self: &Arc<Self>, mut job: Job) {
-        job.queued_at = Instant::now();
+        (job.queued_at, job.deferred) = (Instant::now(), None);
         for path in job.req.outputs.values() {
             job.replay
                 .publish(attach_event::Event::OutputRestart(path.clone()))

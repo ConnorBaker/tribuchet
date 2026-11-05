@@ -193,6 +193,7 @@ pub(super) fn job(n: usize, replay: Arc<Replay>) -> Job {
         resumed_losses: 0,
         queued_at: Instant::now(),
         loss: None,
+        deferred: None,
     }
 }
 
@@ -238,11 +239,11 @@ async fn restarted_worker_gets_its_build_back() {
     let _client = replay.subscribe().await;
     lose_session(&state, job(1, replay), register(&state, "w1", &[]), None).await;
     assert!(
-        state.take_job(&caps("w2")).await.is_none(),
+        state.take_job(&caps("w2"), None).await.is_none(),
         "build handed to another worker while its own reconnects"
     );
     let back = register(&state, "w1", &["k1"]);
-    assert!(state.take_job(&caps("w2")).await.is_none());
+    assert!(state.take_job(&caps("w2"), None).await.is_none());
     // Not counted: the dispatch to the worker that lost it settles it.
     let resumed = state.take_job_by_key(back.id).await;
     assert_eq!(
@@ -258,9 +259,9 @@ async fn build_goes_elsewhere_once_the_grace_ends() {
     let replay = Arc::new(Replay::default());
     let _client = replay.subscribe().await;
     lose_session(&state, job(1, replay), register(&state, "w1", &[]), None).await;
-    assert!(state.take_job(&caps("w2")).await.is_none());
+    assert!(state.take_job(&caps("w2"), None).await.is_none());
     tokio::time::sleep(Duration::from_millis(1100)).await;
-    assert!(state.take_job(&caps("w2")).await.is_some());
+    assert!(state.take_job(&caps("w2"), None).await.is_some());
 }
 
 /// The worker came back without the build (it was still staging):
@@ -273,7 +274,7 @@ async fn build_is_released_when_its_worker_returns_without_it() {
     let _client = replay.subscribe().await;
     lose_session(&state, job(1, replay), register(&state, "w1", &[]), None).await;
     let _back = register(&state, "w1", &[]);
-    assert!(state.take_job(&caps("w2")).await.is_some());
+    assert!(state.take_job(&caps("w2"), None).await.is_some());
 }
 
 /// No worker returns and none other serves the system: the build is
@@ -309,7 +310,7 @@ async fn client_waits_when_no_worker_returns() {
     assert!(waited >= 1200, "told after {waited} ms");
     let _back = register(&state, "w2", &[]);
     assert!(
-        state.take_job(&caps("w2")).await.is_some(),
+        state.take_job(&caps("w2"), None).await.is_some(),
         "the held build was not handed out"
     );
 }

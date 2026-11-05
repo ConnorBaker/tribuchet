@@ -43,14 +43,14 @@ async fn a_dead_session_still_registered_is_not_its_worker_back() {
     let session = (dead.id, dead.caps.name.clone());
     supervise_dead(&state, job(1, replay), session, true).await;
     assert!(
-        state.take_job(&caps("w2")).await.is_none(),
+        state.take_job(&caps("w2"), None).await.is_none(),
         "the dead session counted as its worker back"
     );
     drop(dead);
-    assert!(state.take_job(&caps("w2")).await.is_none());
+    assert!(state.take_job(&caps("w2"), None).await.is_none());
     let _back = register(&state, "w1", &[]);
     assert!(
-        state.take_job(&caps("w2")).await.is_some(),
+        state.take_job(&caps("w2"), None).await.is_some(),
         "the build was not kept queued for its worker"
     );
 }
@@ -67,7 +67,7 @@ async fn an_assignment_never_sent_is_kept_for_no_worker() {
     let _client = j.replay.subscribe().await;
     lose_session(&state, j, register(&state, "w1", &[]), None).await;
     assert!(
-        state.take_job(&caps("w2")).await.is_some(),
+        state.take_job(&caps("w2"), None).await.is_some(),
         "kept for a worker that never got the assignment"
     );
 }
@@ -85,7 +85,7 @@ async fn an_assignment_whose_send_fails_is_kept_for_no_worker() {
     drop(w1);
     supervise_dead(&state, job(1, replay), session, false).await;
     assert!(
-        state.take_job(&caps("w2")).await.is_some(),
+        state.take_job(&caps("w2"), None).await.is_some(),
         "kept for a worker whose assignment was never sent"
     );
 }
