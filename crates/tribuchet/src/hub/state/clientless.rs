@@ -180,7 +180,7 @@ impl HubState {
             let free: Vec<&WorkerCaps> = placement
                 .sessions
                 .iter()
-                .filter(|(_, a)| a.lock().unwrap().free > 0)
+                .filter(|(_, s)| s.admission.lock().unwrap().free > 0)
                 .filter_map(|(id, _)| workers.get(id))
                 .collect();
             queue

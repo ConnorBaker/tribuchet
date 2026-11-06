@@ -40,28 +40,32 @@ async fn the_usage_line_names_the_worker_and_the_output_path() {
 }
 
 /// What a build's run used is learned, here an OOM-killed run's peak: the
-/// next build of its pname is dispatched expecting it, where the first
-/// had only the prior. A failed run that was not OOM-killed teaches
-/// nothing: the next build of its pname takes its prefix's, `tt`.
+/// next build of its pname, submitted as the attach program does, is
+/// dispatched expecting it, where the first had only the prior. A failed
+/// run that was not OOM-killed teaches nothing: the next build of its
+/// pname takes its prefix's, `tt`.
 #[tokio::test]
 async fn a_run_teaches_the_next_dispatch_of_its_pname() {
     let log = Captured;
     let _guard = log.install();
     let state = Arc::new(HubState::for_test(Duration::from_secs(30)));
     let mut w = connect(&state, "w1", 1, &[]);
-    for n in 0..4 {
+    for n in 0..4u64 {
         let (pname, oom_killed) = if n < 2 {
             ("learn", true)
         } else {
             ("fail", false)
         };
-        let replay = Arc::new(Replay::default());
-        let mut client = replay.subscribe().await;
-        let mut j = job(n, replay);
-        let out = format!("/nix/store/{H}-tt-{pname}-{n}.0");
-        j.req.outputs.insert("out".to_owned(), out);
-        state.queue.lock().await.push_back(j);
-        w.to_hub.send(request_job(1, Some(n as u64))).await.unwrap();
+        let req = BuildRequest {
+            system: "x86_64-linux".into(),
+            builder: format!("/nix/store/{H}-bash/bin/bash"),
+            outputs: [("out".to_owned(), format!("/nix/store/{H}-tt-{pname}-{n}.0"))].into(),
+            tmp_dir_in_sandbox: "/build".into(),
+            store_dir: "/nix/store".into(),
+            ..Default::default()
+        };
+        let mut client = submit(&state, req).await;
+        w.to_hub.send(request_job(1, Some(n))).await.unwrap();
         let build_id = w.assignment().await.expect("not assigned").build_id;
         let usage = BuildUsage {
             wall_ms: 2000,
@@ -77,16 +81,17 @@ async fn a_run_teaches_the_next_dispatch_of_its_pname() {
             ..Default::default()
         };
         w.send(worker_message::Msg::Result(result)).await;
-        while client.recv().await.is_some() {}
+        while client.message().await.is_ok_and(|m| m.is_some()) {}
     }
-    let first = log.line(r#"drv="tt-learn-0.0""#);
-    assert!(first.contains("learned=\"prior\""), "{first}");
-    let second = log.line(r#"dispatching build id="00000000000000000000000000000001""#);
-    for field in ["learned=\"key\"", "expect_mem=5368709120"] {
+    let first = log.line("dispatching build");
+    assert!(first.contains(r#"drv="tt-learn-0.0""#), "{first}");
+    assert!(first.contains(r#"learned="prior""#), "{first}");
+    let second = log.line(r#"drv="tt-learn-1.0" resumed"#);
+    for field in [r#"learned="key""#, "expect_mem=5368709120"] {
         assert!(second.contains(field), "{field} missing from {second}");
     }
-    let failed = log.line(r#"dispatching build id="00000000000000000000000000000003""#);
-    assert!(failed.contains("learned=\"prefix\""), "{failed}");
+    let failed = log.line(r#"drv="tt-fail-3.0" resumed"#);
+    assert!(failed.contains(r#"learned="prefix""#), "{failed}");
 }
 
 /// A build that ran and the usage it reported, to learn from.
@@ -201,6 +206,19 @@ async fn a_history_named_as_a_temporary_file_or_lock_is_not_used() {
             "saved at {name}"
         );
     }
+}
+
+/// A requeued build keeps the expectation it was first queued with, not
+/// one taken again from what the history learned since.
+#[tokio::test]
+async fn a_requeued_build_keeps_its_expectation() {
+    let state = Arc::new(HubState::for_test(Duration::from_secs(30)));
+    let (mut j, _) = learned_build();
+    j.expected = placement::Expected::prior(true);
+    let _client = j.replay.subscribe().await;
+    state.requeue(j).await;
+    let kept = state.queue.lock().await.front().map(|j| j.expected);
+    assert_eq!(kept, Some(placement::Expected::prior(true)));
 }
 
 /// The lock is the file's path and ".lock", the file the documented swap

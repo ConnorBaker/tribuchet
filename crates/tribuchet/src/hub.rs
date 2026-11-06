@@ -147,8 +147,6 @@ struct Admission {
     /// Of the declaration, what the worker stages beyond its free slots:
     /// all of it from a worker predating `free_slots`.
     lookahead: u32,
-    /// Heavy builds (placement::heavy) handed to this session, unsettled.
-    heavy: u32,
 }
 
 impl Admission {
@@ -351,11 +349,11 @@ async fn worker_loop(
         false,
     );
     let admission = Arc::new(Mutex::new(Admission::default()));
-    state
-        .placement
-        .lock()
-        .unwrap()
-        .open(worker_id, admission.clone());
+    state.placement.lock().unwrap().open(
+        worker_id,
+        admission.clone(),
+        placement::size_of(&register),
+    );
     let mut route = tokio::spawn(route_loop(
         in_rx,
         router.clone(),
@@ -392,7 +390,6 @@ async fn worker_loop(
                 _ = &mut route => break 'outer,
             }
         };
-        admission.lock().unwrap().heavy += u32::from(placement::heavy(&job.features));
         let to = (worker_id, register.worker_name.as_str());
         placement::dispatch(&state, to, &job, resumed, &admission);
         // Tell the attach client where its build runs.
@@ -477,15 +474,11 @@ async fn supervise_job(
     drop(dispatch_listed);
     let dispatched = dispatch.sent;
     router.unregister(&job.id);
-    {
+    state.placement.lock().unwrap().settled(worker.0, &job.id);
+    if !dispatched {
+        // The worker will never count an assignment that was not sent.
         let mut a = admission.lock().unwrap();
-        a.heavy = a
-            .heavy
-            .saturating_sub(placement::heavy(&job.features).into());
-        if !dispatched {
-            // The worker will never count an assignment that was not sent.
-            a.sent = a.sent.saturating_sub(1);
-        }
+        a.sent = a.sent.saturating_sub(1);
     }
     // run_job counts the build verdict. Only session/hub-side errors
     // reach the branches below.

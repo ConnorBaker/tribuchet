@@ -1,6 +1,8 @@
 //! The `spread` phase (nix/tests/phase-spread.nix): a heavy build, which
 //! declares big-parallel, submitted while another runs goes to the other
-//! worker, which has idle agents. Two workers, the worker VM's and one on
+//! worker, which has idle agents and would be less full with it: by the
+//! prior for a build that declares big-parallel in round 0, by what the
+//! earlier rounds' builds of its pname used after. Two workers, the worker VM's and one on
 //! the hub VM, each with two agents.
 
 use crate::harness::{Node, ended, journal, submit, succeed, wait_until_succeeds};
@@ -59,7 +61,7 @@ fn a_second_heavy_goes_to_the_other_worker() {
         wait_until_succeeds(Node::Hub, &dispatched, 60);
         let first = dispatch_line(&a);
         assert!(
-            first.contains("heavy=true") && first.contains("idle_elsewhere=1"),
+            first.contains(r#"features="big-parallel""#) && first.contains("idle_elsewhere=1"),
             "round {round}: {first}"
         );
         launch(&b);

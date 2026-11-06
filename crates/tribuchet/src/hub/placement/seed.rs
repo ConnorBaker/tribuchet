@@ -10,7 +10,7 @@ use std::io::{self, BufRead};
 use std::path::Path;
 
 use super::history::{Build, History};
-use super::{heavy, lock_history, reserved_name};
+use super::{declares, lock_history, reserved_name};
 use crate::errors::{Result, err_ctx, err_msg};
 use crate::fsutil::io_ctx;
 use crate::hub::state::write_atomic;
@@ -73,7 +73,7 @@ pub(super) fn seed(history: &mut History, journal: impl BufRead) -> io::Result<u
         } else if let Some(f) = fields(&line, "dispatching build ") {
             if let (Some(id), Some(features)) = (f.get("id"), f.get("features")) {
                 let features: Vec<String> = features.split(',').map(str::to_owned).collect();
-                seen.declared.insert((*id).to_owned(), heavy(&features));
+                seen.declared.insert((*id).to_owned(), declares(&features));
             }
         } else if let Some(f) = fields(&line, "build usage ") {
             let num = |k| f.get(k).and_then(|v| v.parse::<u64>().ok());

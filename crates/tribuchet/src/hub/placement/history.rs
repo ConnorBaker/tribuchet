@@ -54,6 +54,15 @@ pub(in crate::hub) struct Demand {
     pub(in crate::hub) memory: f64,
 }
 
+impl Demand {
+    pub(in crate::hub) fn plus(self, other: Self) -> Self {
+        Self {
+            cores: self.cores + other.cores,
+            memory: self.memory + other.memory,
+        }
+    }
+}
+
 /// Where an expectation came from, most specific first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(in crate::hub) enum Level {
