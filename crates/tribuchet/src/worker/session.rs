@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -11,7 +12,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 use super::build::{ActiveBuild, StagingStatus, Wake, validate_assignment};
-use super::caps::system_caps;
+use super::caps::{build_memory, cores, own_cgroup, system_caps};
 use super::resume::{
     CANCELLED, ResumableBuild, ack_delivery, execute_to_finished, record_finished, serve_chunks,
     try_deliver,
@@ -67,6 +68,12 @@ pub(super) async fn session(opts: &WorkerConfig, ctx: &Arc<WorkerCtx>) -> Result
             caps: system_caps(opts, ctx),
             resumable_keys: ctx.resumable_keys(),
             max_jobs: u32::try_from(ctx.jobs()).unwrap_or(u32::MAX),
+            cores: cores(),
+            build_memory: build_memory(
+                Path::new("/sys/fs/cgroup"),
+                Path::new("/proc/meminfo"),
+                &own_cgroup(),
+            ),
         })))
         .await?;
 

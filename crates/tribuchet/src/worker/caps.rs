@@ -1,11 +1,14 @@
 //! Advertised system capabilities and feature probing.
 
 use std::env::consts;
+use std::fs;
 use std::os::unix::fs::PermissionsExt as _;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::thread;
 
 use super::WorkerCtx;
 use crate::config::WorkerConfig;
+use crate::fsutil::stat_field;
 use crate::proto::{BuildAssignment, NETWORK, SystemCaps};
 
 /// Nix's `uid-range` system feature: a full 65536-uid range with the
@@ -64,6 +67,43 @@ pub(super) fn system_caps(opts: &WorkerConfig, ctx: &WorkerCtx) -> Vec<SystemCap
         .collect()
 }
 
+/// The agents' slice under the cgroup root, where every agent and its
+/// builds run (nix/agent-memory.nix caps it).
+const AGENT_SLICE: &str = "system.slice/system-tribuchet\\x2dagent.slice";
+
+/// The CPUs this worker's builds share, for the hub's placement: the
+/// worker's own, as its affinity and CPU quota allow. The agents' are
+/// taken to be the same; nix/agent-memory.nix limits only their memory.
+pub(super) fn cores() -> Option<u32> {
+    let n = thread::available_parallelism().ok()?;
+    u32::try_from(n.get()).ok()
+}
+
+/// Bytes of memory this worker's builds may use, for the hub's
+/// placement: MemTotal from `meminfo`, or less where a cgroup under
+/// `cgroup` caps it: the agents' slice, or one at or above `own`, the
+/// worker's cgroup (a container's limit, which its spawned agents run
+/// under). None where meminfo does not read, as off Linux.
+pub(super) fn build_memory(cgroup: &Path, meminfo: &Path, own: &Path) -> Option<u64> {
+    let total = stat_field(&fs::read_to_string(meminfo).ok()?, "MemTotal:")?.saturating_mul(1024);
+    let max = |dir: &Path| {
+        let text = fs::read_to_string(dir.join("memory.max")).ok()?;
+        text.trim().parse::<u64>().ok()
+    };
+    let own = cgroup.join(own.strip_prefix("/").unwrap_or(own));
+    let above = own.ancestors().take_while(|d| d.starts_with(cgroup));
+    let caps = above.filter_map(max).chain(max(&cgroup.join(AGENT_SLICE)));
+    Some(caps.fold(total, u64::min))
+}
+
+/// The worker's cgroup, as /proc/self/cgroup names it (cgroup v2), else
+/// the root.
+pub(super) fn own_cgroup() -> PathBuf {
+    let text = fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
+    let path = text.lines().find_map(|l| l.strip_prefix("0::"));
+    PathBuf::from(path.unwrap_or("/"))
+}
+
 pub fn host_system() -> String {
     let arch = consts::ARCH;
     let os = match consts::OS {
@@ -78,6 +118,36 @@ mod tests {
     use std::sync::Arc;
 
     use super::*;
+
+    /// The slice's cap where it has one and it is below MemTotal; MemTotal
+    /// where the slice is uncapped (`max`) or absent; a cap above the
+    /// worker's own cgroup where it is lower still.
+    #[test]
+    fn build_memory_is_the_lowest_cap_or_mem_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let meminfo = dir.path().join("meminfo");
+        fs::write(&meminfo, "MemTotal:       4096 kB\nMemFree: 1 kB\n").unwrap();
+        let memory = || build_memory(dir.path(), &meminfo, Path::new("/"));
+        assert_eq!(memory(), Some(4 << 20), "no slice");
+        let slice = dir.path().join(AGENT_SLICE);
+        fs::create_dir_all(&slice).unwrap();
+        for (max, want) in [
+            ("max\n", 4 << 20),
+            ("1048576\n", 1 << 20),
+            ("8388608\n", 4 << 20),
+        ] {
+            fs::write(slice.join("memory.max"), max).unwrap();
+            assert_eq!(memory(), Some(want), "memory.max {max:?}");
+        }
+        let none = dir.path().join("none");
+        assert_eq!(build_memory(dir.path(), &none, Path::new("/")), None);
+        // A container's limit two levels above the worker's cgroup.
+        let own = Path::new("/machine.slice/c1/payload");
+        fs::create_dir_all(dir.path().join("machine.slice/c1/payload")).unwrap();
+        fs::write(dir.path().join("machine.slice/c1/memory.max"), "524288\n").unwrap();
+        let contained = build_memory(dir.path(), &meminfo, own);
+        assert_eq!(contained, Some(512 << 10), "a container's limit");
+    }
 
     #[test]
     fn uid_range_detection() {

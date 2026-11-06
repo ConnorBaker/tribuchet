@@ -18,6 +18,7 @@ fn heavy_worker(state: &Arc<HubState>, name: &str) -> Worker {
         }],
         resumable_keys: vec![],
         max_jobs: 2,
+        ..Register::default()
     };
     let (out_tx, from_hub) = mpsc::channel(256);
     let (to_hub, in_rx) = mpsc::channel(64);

@@ -282,8 +282,10 @@ every other worker runs as many heavy builds, or has no idle agent, the
 asker takes it at once. The asker goes on to the next build it can
 take, so no light build waits for a heavy one, and a light build is
 never passed over. The hub counts only the builds it has dispatched and
-the workers' own declarations: it keeps no history of builds and no
-profile of workers (`hub/placement.rs`). So it weighs heavy builds in
+the workers' own declarations: it keeps no history of builds, and does
+not weigh the size each worker reports as it registers, its cores and
+the memory its builds may use (`worker/caps.rs`; `hub/placement.rs`).
+So it weighs heavy builds in
 flight, not a worker's size: a worker running one heavy build leaves the
 next to any worker that serves it with an idle agent and none running,
 however few agents that worker has. Every worker advertises big-parallel
