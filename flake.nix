@@ -131,6 +131,7 @@
                 "daemon"
                 "held"
                 "spread"
+                "history"
               ]
           )
         )
