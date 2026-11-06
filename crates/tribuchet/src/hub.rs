@@ -303,6 +303,8 @@ impl WorkerHub for WorkerSvc {
         tracing::info!(
             worker = register.worker_name,
             caps = ?register.caps,
+            cores = register.cores,
+            build_memory = register.build_memory,
             "worker registered"
         );
 

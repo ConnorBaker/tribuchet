@@ -130,6 +130,13 @@ message Register {
   // Advisory capacity, summed across workers to size the max-jobs of
   // the generated nix.conf fragment. Not the RequestJob dispatch path.
   uint32 max_jobs = 4;
+  // What its builds may use, which the hub's placement weighs builds
+  // against: CPUs (the worker's own affinity and quota, its agents'
+  // taken to be the same), and bytes of memory (MemTotal, or less where
+  // the agents' slice or a cgroup above the worker's caps it). Unset
+  // where the worker cannot tell, and by workers predating the fields.
+  optional uint32 cores = 5;
+  optional uint64 build_memory = 6;
 }
 
 message Heartbeat {

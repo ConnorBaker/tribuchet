@@ -351,6 +351,7 @@ pub(super) fn connect(state: &Arc<HubState>, name: &str, slots: u32, held: &[&st
         }],
         resumable_keys: held.iter().map(|k| (*k).to_owned()).collect(),
         max_jobs: slots,
+        ..Register::default()
     };
     let (out_tx, from_hub) = mpsc::channel(256);
     let (to_hub, in_rx) = mpsc::channel(64);
@@ -587,6 +588,7 @@ async fn a_worker_advertising_recursive_nix_gets_no_build_requiring_it() {
         }],
         resumable_keys: vec![],
         max_jobs: 2,
+        ..Register::default()
     };
     let (out_tx, mut from_hub) = mpsc::channel(256);
     let (to_hub, in_rx) = mpsc::channel(64);

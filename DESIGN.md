@@ -282,8 +282,10 @@ every other worker runs as many heavy builds, or has no idle agent, the
 asker takes it at once. The asker goes on to the next build it can
 take, so no light build waits for a heavy one, and a light build is
 never passed over. The hub counts only the builds it has dispatched and
-the workers' own declarations: it keeps no history of builds and no
-profile of workers (`hub/placement.rs`). So it weighs heavy builds in
+the workers' own declarations: it keeps no history of builds, and does
+not weigh the size each worker reports as it registers, its cores and
+the memory its builds may use (`worker/caps.rs`; `hub/placement.rs`).
+So it weighs heavy builds in
 flight, not a worker's size: a worker running one heavy build leaves the
 next to any worker that serves it with an idle agent and none running,
 however few agents that worker has. Every worker advertises big-parallel
@@ -405,6 +407,9 @@ fixed-output build only to a worker advertising `tribuchet-network`,
 which workers older than it never do, even with `/dev/net/tun`, so
 until an upgraded worker with `/dev/net/tun` registers every
 fixed-output build waits.
+Every agent and its builds run in `system-tribuchet\x2dagent.slice`,
+where a host may cap their memory; the worker reports the slice's
+memory.max, when lower than MemTotal, as its memory.
 The e2e test consumes the same module. macOS hosts use the
 `darwinModules.default` nix-darwin module, which ships both services:
 the hub adopts its listeners from launchd (`launch_activate_socket`,
