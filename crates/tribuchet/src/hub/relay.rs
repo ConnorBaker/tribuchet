@@ -126,9 +126,11 @@ pub(super) async fn run_job(
             worker_message::Msg::Result(res) => {
                 if let Some(u) = &res.usage {
                     state.metrics.observe_usage(&job.req.system, u);
+                    state.placement.lock().unwrap().learn(job, res.exit_code, u);
                     tracing::info!(
                         id = job.id,
                         key = job.key,
+                        system = job.req.system,
                         drv = drv_name(&job.req).unwrap_or_default(),
                         out_path = named_output(&job.req).map_or("", |(_, p)| p.as_str()),
                         worker,

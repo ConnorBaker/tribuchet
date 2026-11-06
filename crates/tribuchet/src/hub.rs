@@ -41,6 +41,7 @@ mod state;
 mod submit;
 #[cfg(test)]
 mod testlog;
+pub use placement::seed_history;
 pub use serve::run;
 
 use crate::errors::{Error, Result, chain};
