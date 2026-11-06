@@ -1,30 +1,37 @@
 //! What placement knows of each worker session: its admission, which the
-//! clientless decider reads, and the dispatch log line; and what builds
-//! used, learned from their runs (history.rs), kept across restarts in a
-//! file. A queued build goes to the first worker with room that asks
-//! (HubState::take_job), but a heavy one is left a while for a worker
-//! with more room (Spread).
+//! clientless decider reads, its size, and what the builds handed to it
+//! are expected to use; what builds used, learned from their runs
+//! (history.rs) and kept across restarts in a file; and the dispatch log
+//! line. A queued build goes to the worker that asks for it unless
+//! another with an idle agent would be less full with it (rank.rs).
 
 use std::collections::HashMap;
 use std::fs::{self, File, TryLockError};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use super::Admission;
 use super::naming::drv_name;
 use super::state::{HubState, Job, write_newest};
-use crate::proto::BuildUsage;
+use crate::proto::{BuildUsage, Register};
 
 #[path = "placement/history.rs"]
 mod history;
+#[path = "placement/rank.rs"]
+mod rank;
 #[path = "placement/seed.rs"]
 mod seed;
 #[cfg(test)]
 #[path = "placement/tests.rs"]
 mod tests;
-pub(super) use history::{Build, Expected, History};
+#[cfg(test)]
+pub(super) use history::Level;
+pub(super) use history::{Build, Demand, Expected, History};
+#[cfg(test)]
+pub(super) use rank::GRACE;
+pub(super) use rank::{Room, Rooms, Size};
 pub use seed::seed_history;
 
 /// How often a changed history is written. It is a cache: a crash
@@ -36,40 +43,64 @@ pub(super) fn build_of(job: &Job) -> Build<'_> {
     Build {
         system: &job.req.system,
         name: drv_name(&job.req),
-        declared: heavy(&job.features),
+        declared: declares(&job.features),
     }
 }
 
-/// Whether a build is heavy: it declares big-parallel, as builds that
-/// use every core do (nixpkgs' requiredSystemFeatures).
-pub(super) fn heavy(features: &[String]) -> bool {
+/// Whether a build declares big-parallel, as nixpkgs' builds that use
+/// every core do: the class whose runs, or prior, an unseen key takes.
+pub(super) fn declares(features: &[String]) -> bool {
     features.iter().any(|f| f == "big-parallel")
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn as_f64(v: u64) -> f64 {
+    v as f64
+}
+
+/// A worker's size as it registered: its cores, else its agents (a
+/// worker predating the field), at least one, and the memory its builds
+/// may use. A worker can register 0 (no agents yet, an old one) and have
+/// idle agents later: as 0 cores it would be infinitely full, or NaN.
+pub(super) fn size_of(register: &Register) -> Size {
+    Size {
+        cores: f64::from(register.cores.unwrap_or(register.max_jobs).max(1)),
+        memory: register.build_memory.map(as_f64),
+    }
+}
+
+/// A worker session as placement sees it.
+pub(super) struct Session {
+    pub(super) admission: Arc<Mutex<Admission>>,
+    pub(super) size: Size,
+    /// What the builds handed to it and not yet settled are expected to
+    /// use, by build id.
+    pub(super) committed: HashMap<String, Demand>,
+}
+
+impl Session {
+    pub(super) fn load(&self) -> Demand {
+        (self.committed.values()).fold(Demand::default(), |sum, d| sum.plus(*d))
+    }
 }
 
 #[derive(Default)]
 pub(super) struct Placement {
-    /// Each worker session's admission, by session id.
-    pub(super) sessions: HashMap<u64, Arc<Mutex<Admission>>>,
+    /// Each worker session, by session id.
+    pub(super) sessions: HashMap<u64, Session>,
     /// What builds used, by key.
     pub(super) history: History,
 }
 
-/// How long after it was first passed over a heavy build may be passed
-/// over again: the woken worker's time to ask, not a wait for room.
-pub(super) const GRACE: Duration = Duration::from_secs(2);
-
-/// A worker session's room, as its admission stands.
-pub(super) struct Room {
-    pub(super) id: u64,
-    /// Agents with no build, apart from the lookahead.
-    pub(super) idle: u32,
-    /// Heavy builds in flight there.
-    pub(super) heavy: u32,
-}
-
 impl Placement {
-    pub(super) fn open(&mut self, id: u64, admission: Arc<Mutex<Admission>>) {
-        self.sessions.insert(id, admission);
+    pub(super) fn open(&mut self, id: u64, admission: Arc<Mutex<Admission>>, size: Size) {
+        let committed = HashMap::new();
+        let session = Session {
+            admission,
+            size,
+            committed,
+        };
+        self.sessions.insert(id, session);
     }
 
     pub(super) fn close(&mut self, id: u64) {
@@ -85,67 +116,50 @@ impl Placement {
         self.history.record(&build_of(job), exit_code, u);
     }
 
-    pub(super) fn rooms(&self) -> Vec<Room> {
-        let room = |(id, a): (&u64, &Arc<Mutex<Admission>>)| {
-            let a = a.lock().unwrap();
-            Room {
-                id: *id,
-                idle: a.idle(),
-                heavy: a.heavy,
-            }
-        };
-        self.sessions.iter().map(room).collect()
+    /// `job` went to `session`: its expected demand counts there until
+    /// it settles. The session's room with it.
+    pub(super) fn dispatched(&mut self, session: u64, job: &Job) -> Option<Room> {
+        let s = self.sessions.get_mut(&session)?;
+        s.committed.insert(job.id.clone(), job.expected.demand);
+        Some(room(session, s))
     }
 
-    /// What session `asker` sees of the others' room; None while it has
-    /// no heavy build in flight, when it passes nothing over.
-    pub(super) fn spread(&self, asker: u64) -> Option<Spread> {
-        let mine = self.sessions.get(&asker)?.lock().unwrap().heavy;
-        let others = || self.rooms().into_iter().filter(|r| r.id != asker);
-        (mine > 0).then(|| Spread {
-            mine,
-            rooms: others().collect(),
-        })
-    }
-}
-
-/// The other sessions' room as a session with `mine` heavy builds in
-/// flight asked for work, less what its scan of the queue left them.
-pub(super) struct Spread {
-    pub(super) mine: u32,
-    pub(super) rooms: Vec<Room>,
-}
-
-impl Spread {
-    /// The session to leave a heavy build to, at `now`: one that `serves`
-    /// it with an idle agent and fewer heavy builds than the asker, the
-    /// fewest first, while `since`, when it was first passed over, is
-    /// less than GRACE ago. That agent is then spoken for, and `since`
-    /// set if it was not.
-    pub(super) fn passes(
-        &mut self,
-        since: &mut Option<Instant>,
-        serves: impl Fn(u64) -> bool,
-        now: Instant,
-    ) -> Option<u64> {
-        if since.is_some_and(|s| now.duration_since(s) >= GRACE) {
-            return None;
+    /// The build left its worker: finished, failed, requeued or given up.
+    pub(super) fn settled(&mut self, session: u64, build_id: &str) {
+        if let Some(s) = self.sessions.get_mut(&session) {
+            s.committed.remove(build_id);
         }
-        let mine = self.mine;
-        let room = (self.rooms.iter_mut())
-            .filter(|r| r.idle > 0 && r.heavy < mine && serves(r.id))
-            .min_by_key(|r| (r.heavy, r.id))?;
-        room.idle -= 1;
-        room.heavy += 1;
-        since.get_or_insert(now);
-        Some(room.id)
+    }
+
+    pub(super) fn rooms(&self) -> Vec<Room> {
+        (self.sessions.iter()).map(|(id, s)| room(*id, s)).collect()
+    }
+
+    /// Every session's room as session `asker` asks for work.
+    pub(super) fn rooms_for(&self, asker: u64) -> Rooms {
+        Rooms {
+            asker,
+            rooms: self.rooms(),
+        }
     }
 }
 
-/// Log the dispatch of `job` to worker session `to` (id and name) with
-/// the declaration that admitted it, the features it declares, how many
-/// other workers that serve it have an idle agent, and each worker's
-/// heavy builds in flight, this one counted.
+fn room(id: u64, s: &Session) -> Room {
+    Room {
+        id,
+        idle: s.admission.lock().unwrap().idle(),
+        size: s.size,
+        load: s.load(),
+    }
+}
+
+/// Count `job`'s expected demand against worker session `to` (id and
+/// name), and log the dispatch with the declaration that admitted it,
+/// the features it declares, how many other workers that serve it have
+/// an idle agent, what it is expected to use, and the worker's size and
+/// expected load with it. Where that load is more memory than the worker
+/// has, say so: nothing holds a build back for memory (DESIGN.md,
+/// Placement).
 pub(super) fn dispatch(
     state: &HubState,
     to: (u64, &str),
@@ -157,21 +171,20 @@ pub(super) fn dispatch(
         let a = admission.lock().unwrap();
         (a.capacity, a.assignments, a.free, a.sent)
     };
-    let expected = state.placement.lock().unwrap().expect(job);
-    let (idle_elsewhere, mut heavy_builds) = {
+    let e = job.expected;
+    let (idle_elsewhere, room) = {
         let workers = state.worker_caps.lock().unwrap();
-        let rooms = state.placement.lock().unwrap().rooms();
+        let mut placement = state.placement.lock().unwrap();
+        let room = placement.dispatched(to.0, job);
         let serves = |r: &&Room| {
             (workers.get(&r.id)).is_some_and(|c| c.serves(&job.req.system, &job.features))
         };
+        let rooms = placement.rooms();
         let idle = rooms.iter().filter(|r| r.id != to.0 && r.idle > 0);
-        let name = |r: &Room| Some(format!("{}:{}", workers.get(&r.id)?.name, r.heavy));
-        (
-            idle.filter(serves).count(),
-            rooms.iter().filter_map(name).collect::<Vec<_>>(),
-        )
+        (idle.filter(serves).count(), room)
     };
-    heavy_builds.sort();
+    let load = room.as_ref().map(|r| r.load);
+    let memory = room.as_ref().and_then(|r| r.size.memory);
     tracing::info!(
         id = job.id,
         worker = to.1,
@@ -182,16 +195,29 @@ pub(super) fn dispatch(
         free,
         sent,
         features = job.features.join(","),
-        heavy = heavy(&job.features),
         idle_elsewhere,
-        heavy_builds = heavy_builds.join(","),
-        learned = expected.level.name(),
-        expect_mem = bytes(expected.demand.memory),
-        expect_cores = round3(expected.demand.cores),
-        expect_secs = expected.secs.map(round3),
-        oom_runs = expected.oom,
+        learned = e.level.name(),
+        expect_mem = bytes(e.demand.memory),
+        expect_cores = round3(e.demand.cores),
+        expect_secs = e.secs.map(round3),
+        oom_runs = e.oom,
+        load_mem = load.map(|l| bytes(l.memory)),
+        load_cores = load.map(|l| round3(l.cores)),
+        memory = memory.map(bytes),
+        cores = room.as_ref().map(|r| r.size.cores),
         "dispatching build"
     );
+    if let (Some(load), Some(memory)) = (load, memory)
+        && load.memory > memory
+    {
+        tracing::info!(
+            id = job.id,
+            worker = to.1,
+            load_mem = bytes(load.memory),
+            memory = bytes(memory),
+            "placed over predicted memory"
+        );
+    }
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]

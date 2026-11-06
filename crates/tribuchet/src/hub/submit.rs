@@ -12,6 +12,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 use super::metrics::Metrics;
 use super::naming::drv_name;
+use super::placement::Expected;
 use super::state::{HubState, Inflight, Job, Replay, Servability, unserved};
 use crate::proto::{
     AttachEvent, BuildMessage, BuildRequest, DECLINE_EXIT_CODE, NETWORK, attach_event,
@@ -249,7 +250,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 continue;
             };
             let rx = replay.subscribe().await;
-            let job = Job {
+            let mut job = Job {
                 id,
                 key,
                 req,
@@ -262,7 +263,9 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 queued_at: Instant::now(),
                 loss: None,
                 deferred: None,
+                expected: Expected::prior(false),
             };
+            job.expected = self.state.placement.lock().unwrap().expect(&job);
             tracing::info!(
                 id = job.id,
                 system = job.req.system,

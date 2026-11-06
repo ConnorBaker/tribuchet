@@ -26,8 +26,8 @@ mod clientless_chain;
 mod clientless_farm;
 mod daemon;
 pub(super) mod fake_daemon;
+mod rank;
 mod reconnect;
-mod spread;
 mod unlisted;
 mod usage;
 
@@ -194,6 +194,7 @@ pub(super) fn job(n: usize, replay: Arc<Replay>) -> Job {
         queued_at: Instant::now(),
         loss: None,
         deferred: None,
+        expected: placement::Expected::prior(false),
     }
 }
 
@@ -586,7 +587,6 @@ async fn a_worker_advertising_recursive_nix_gets_no_build_requiring_it() {
             system: "x86_64-linux".into(),
             features: features.to_vec(),
         }],
-        resumable_keys: vec![],
         max_jobs: 2,
         ..Register::default()
     };

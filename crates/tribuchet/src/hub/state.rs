@@ -17,7 +17,7 @@ use super::Loss;
 use super::chunkcache::ChunkCache;
 use super::losses;
 use super::metrics::Metrics;
-use super::placement::{self, Placement};
+use super::placement::{Expected, Placement};
 use super::relay::{DAEMON_ANSWER, DaemonEvidence};
 use crate::config::NixConfig;
 use crate::fsutil::io_ctx;
@@ -78,9 +78,13 @@ pub(super) struct Job {
     /// it as a loss on a resume. Until the loss's grace ends, or the
     /// worker is back, the build is kept for that worker (Loss::awaited).
     pub(super) loss: Option<Loss>,
-    /// When it was first passed over for another worker, if it is heavy
-    /// (placement::Spread): none since it last entered the queue.
+    /// When it was first passed over for another worker (placement::
+    /// Rooms): none since it last entered the queue.
     pub(super) deferred: Option<Instant>,
+    /// What it is expected to use, from the history as it was submitted:
+    /// take_job's scan reads it under the queue lock, where it takes no
+    /// placement lock.
+    pub(super) expected: Expected,
 }
 
 impl Job {
@@ -403,13 +407,13 @@ impl HubState {
     }
 
     /// The first queued job `caps`'s worker can take, as worker session
-    /// `asker`, if any: a heavy build it passes over (placement::Spread)
-    /// stays queued, the session it is left to woken.
+    /// `asker`, if any: a build it passes over to a less full worker
+    /// (placement::Rooms) stays queued, the session it is left to woken.
     pub(super) async fn take_job(&self, caps: &WorkerCaps, asker: Option<u64>) -> Option<Job> {
         loop {
             // Read before the queue lock, so that nothing more is taken
             // under it; afresh on a rescan, which passes over again.
-            let mut spread = asker.and_then(|id| self.placement.lock().unwrap().spread(id));
+            let mut rooms = asker.map(|id| self.placement.lock().unwrap().rooms_for(id));
             let (taken, left) = {
                 let mut queue = self.queue.lock().await;
                 let holding = self.holding.lock().unwrap();
@@ -425,8 +429,9 @@ impl HubState {
                     let (system, features, first) =
                         (&j.req.system, &j.features, j.deferred.is_none());
                     let serves = |id| workers.get(&id).is_some_and(|c| c.serves(system, features));
-                    let spread = spread.as_mut().filter(|_| placement::heavy(features));
-                    let to = spread.and_then(|s| s.passes(&mut j.deferred, serves, now));
+                    let demand = j.expected.demand;
+                    let to = (rooms.as_mut())
+                        .and_then(|r| r.passes(demand, &mut j.deferred, serves, now));
                     if let Some(to) = to.filter(|_| first) {
                         left.push((j.id.clone(), workers.get(&to).map(|c| c.name.clone())));
                     }
@@ -438,7 +443,7 @@ impl HubState {
                 tracing::info!(
                     id,
                     to,
-                    "leaving a heavy build to a worker with an idle agent"
+                    "leaving a build to a less full worker with an idle agent"
                 );
             }
             if !left.is_empty() {

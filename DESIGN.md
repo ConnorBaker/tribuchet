@@ -269,29 +269,155 @@ clients are told once (`hub/relay/daemon.rs`):
 
 ## Placement
 
-A queued build goes to the first worker with room that asks for it, in
-queue order, except that heavy builds are spread: those that declare
-`big-parallel`, which nixpkgs gives builds that use every core. A worker
-that asks while it runs a heavy build passes a heavy one over while
+A queued build goes to the least full worker with an idle agent that
+serves it, by what it and the builds already there are expected to use
+against what the worker has (`hub/placement/rank.rs`). Fullness is the
+larger of the expected cores of the worker's unsettled builds, this one
+counted, over its cores, and their expected memory over the memory its
+builds may use. Each worker reports both when it registers
+(`worker/caps.rs`): the CPUs its own affinity and CPU quota allow, which
+its agents are taken to share, and the lowest `memory.max` of its own
+cgroup and those above it (a container's limit), its agents' slice, and
+MemTotal; hub.toml holds no table of workers. Memory counts in a
+comparison only where every worker compared reported it, and a worker
+that reported no cores is counted by its agents, as a worker older than
+this field is during a rolling upgrade; a worker counts as one core at
+least: one that registered none, as it may with no agents yet, can have
+idle agents later, and as no cores it would be infinitely full, or NaN
+(which sorts first on x86). Both are as registered, for the session: one
+that registered no cores and `max_jobs` 0 counts as one core until it
+registers again. A hand-edited history with a peak of 0 on a worker
+reporting 0 bytes for its builds makes its memory ratio 0/0, a NaN,
+which `f64::max` discards for the cores' ratio: History::load does not
+check runs, as Run::of does. Memory has no such floor: a worker that
+reports 0 bytes for its builds is infinitely full by memory, and is not
+chosen where memory is compared. A build counts against its worker from
+its dispatch, just after the worker takes it from the queue, until it
+settles: a worker that asks in between ranks without it. After a hub
+restart the builds still running count against no worker until each is
+submitted again by its client and resumed by its worker; a worker
+registering again does not count them.
+
+What a build is expected to use comes from what builds of its key used
+on this farm (`hub/placement/history.rs`): its system and pname, the
+name up to its version or a hash. Each key keeps its last 8 runs that
+succeeded or were OOM-killed, as the workers measured them: the largest
+peak memory among them (an OOM-killed run's peak is a lower bound), and
+the medians of cores (CPU time over running time, frozen time not
+counted) and running time over the runs that succeeded. A failed run
+teaches nothing. A key with no run takes the longest dash-prefix of its
+pname that has one, then its class (its system and whether it declares
+`big-parallel`), then a fixed prior. A `big-parallel` declaration picks
+the class (its runs, and the cores a key without a succeeded run takes)
+and the prior; nothing else. Placement ranks by memory and cores only:
+the running time, the OOM kills and where an expectation came from are
+learned and logged at dispatch, for a replay of the journal to weigh,
+and unused. A run with no running time (a worker can report none)
+teaches no timing. Keys are never dropped. A build's expectation is
+taken once, as it is first queued; a requeued build keeps it.
+
+The history is kept in `placement-history.json` ([placement] `history`;
+a path ending .tmp or .lock, a history file's own temporary file's or
+lock's name, the hub warns of and neither loads nor saves, its "loaded …
+keys=0" then reading as if the file were empty). As the hub starts it
+takes the file's lock (`placement-history.json.lock`) and loads the
+file; a hub that finds the lock held, or cannot open it, warns, loads
+the file as it is, and never saves for its lifetime. It does not take
+the lock again at a later save: whatever holds the lock (another hub,
+the swap, seed-history writing a new file) can write the file meanwhile,
+so its copy may be stale, which it would save over the newer file if it
+took the lock later. It saves every 5 minutes when the history changed
+and at SIGTERM, off the runtime. Runs learned after the SIGTERM save are
+lost, and a hub that ends otherwise (its servers failing, the watchdog's
+abort) loses up to 5 minutes of them; a save that fails is not tried
+again until the history changes. A file that cannot be read or parsed,
+for any reason but its absence (the previous format, permissions, I/O
+errors), is warned of, and the hub starts empty and never saves over it:
+the file is the only record older than the journal's retention. Neither
+the permissions case nor the warning's text is covered by a test. A file
+that is a symlink becomes a regular file at the first save, its target
+left as it was; a dangling one counts as absent.
+
+To seed it from the hub's journal, while the hub runs: run `tribuchet
+seed-history --history SIDE` from the hub's package (the NixOS module
+puts no tribuchet on PATH) on `journalctl -u tribuchet-hub -o cat`, SIDE
+a new file beside the hub's, LIVE (it refuses one that exists, and a
+name ending .tmp or .lock, as a hub's temporary file and lock are, at
+which a hub takes no history either); it takes SIDE's lock, and the hub
+serves on. Then, from a root shell (`sudo -s`), swap SIDE in, as one
+command:
+
+```sh
+systemctl stop tribuchet-hub.socket tribuchet-hub.service; \
+flock -n LIVE.lock sh -ec 'test -f SIDE; if [ -e LIVE ]; then ln -T LIVE LIVE.$(date +%s); fi; mv -T SIDE LIVE' || echo 'NOT SWAPPED' >&2; \
+systemctl start tribuchet-hub.socket
+```
+
+One command, because `tribuchet attach` retries a build's connects 30
+times 2 s apart in all, not per outage. systemd stops the hub before its
+socket, which the NixOS module's hub unit requires (After= is systemd's
+own for a socket's service; without Requires=, the socket goes inactive
+while the hub is still saving, and whether connects are then refused is
+not settled: on systemd 255 user units they still succeeded, the hub
+holding the listening socket it inherited; the farm's is untested): the
+socket listens through the hub's SIGTERM save, connections queued then
+are closed unanswered as it stops (attach retries them), and connects
+are refused from then through the renames to the start. As the hub
+requires its socket, restarting the socket restarts the hub too. How
+long that save adds is not measured, and a wedged hub takes systemd's
+stop timeout, 90 s by default, longer than attach's budget. Where a hub
+holds the lock, SIDE is not a file (missing, a directory or a dangling
+symlink), or a backup of LIVE of the same second exists, the swap prints
+NOT SWAPPED and leaves LIVE as it was. The command exits 0 either way,
+its last step being the start, so read its output. Where it swaps, the
+old LIVE stays as LIVE.<seconds>. A directory or a symlink to one at
+that name, or a directory at LIVE, refuses the swap (`ln -T`, `mv -T`;
+plain mv would move SIDE into it and exit 0); a symlink at LIVE to a
+file or a directory is replaced and kept as LIVE.<seconds>, a dangling
+one replaced and not kept. Where SIDE is a symlink to LIVE or a hard
+link of it, the swap refuses at mv, after ln has left a stray
+LIVE.<seconds>, which refuses a retry in that second. A SIDE that is a
+symlink to a file is moved in as LIVE, the symlink itself (a relative
+one not beside LIVE then dangles, or names another file), and an empty
+or garbage SIDE is moved in too: the hub warns, runs empty and never
+saves over it. Only a hand-made SIDE gets there; seed-history writes a
+regular file. LIVE and SIDE go into the command unquoted (no spaces or
+quotes); SIDE beside LIVE is not enforced, and across filesystems mv
+copies, so that swap is not atomic. The command, the journal's unit and
+the cache directory are the NixOS module's names; the flakelet's hub is
+named by its `name`. The socket starts again either way; where that
+fails (its port taken), systemctl says so and exits 1, the swap made or
+not, and the hub stays down until the socket is started again (after
+`systemctl reset-failed tribuchet-hub.socket` if the start refuses).
+SIDE.lock, seed-history's, stays behind: leave it, and LIVE.lock, in
+place, as a lock file deleted while held lets the next taker lock a new
+file, and two writers write. What the hub learned since the journal was
+read is lost. The swap replaces the history and does not merge into it:
+SIDE holds only what the journal holds, so keys and runs older than the
+journal's retention are kept only in LIVE.<seconds>. Seed and swap only
+for a first deploy, or where the hub cannot read LIVE ("placement
+history unreadable"), not over a readable LIVE. Stopping the service but
+not the socket lets a queued connection start a hub during the swap: it
+finds the lock held, loads LIVE as it then is, and never saves, and the
+file stays intact.
+
+The worker that asks takes the first queued build it can, unless
 another connected worker that serves it has an idle agent (a free slot,
 not the one build a worker stages ahead while every slot is busy) and
-fewer heavy builds in flight; that worker is woken, and takes it when
-it asks. A build is passed over for at most 2 s from the first time,
-then the next worker that asks takes it, whatever it runs: so when
-every other worker runs as many heavy builds, or has no idle agent, the
-asker takes it at once. The asker goes on to the next build it can
-take, so no light build waits for a heavy one, and a light build is
-never passed over. The hub counts only the builds it has dispatched and
-the workers' own declarations. It learns what builds of each key use
-(`hub/placement/history.rs`, kept in `placement-history.json` and seeded
-from its journal by `tribuchet seed-history`) and logs that at dispatch,
-but does not place by it yet, nor by the size each worker reports as it
-registers, its cores and the memory its builds may use
-(`worker/caps.rs`). So it weighs heavy builds in flight, not a worker's
-size: a worker running one heavy build leaves the
-next to any worker that serves it with an idle agent and none running,
-however few agents that worker has. Every worker advertises big-parallel
-for its native systems (`worker/caps.rs`), one with two agents too.
+would be less full with it, or the asker has only that lookahead. That
+worker is woken, and takes it when it asks; the asker goes on to the
+next build. A tie stays with the asker. A build is passed over for at
+most 2 s from the first time, then the next worker that asks takes it,
+so none waits on another worker's ask.
+
+Nothing holds a build back for memory. A dispatch whose worker's
+expected memory, this build counted, is more than the worker's memory
+is logged as such ("placed over predicted memory"), and its dispatch
+line carries the worker's expected load and size. Holding builds for
+memory was replayed on an earlier model of this code and left out: no
+build in the copy of the hub's journal the figures come from
+(`hub/placement/history.rs`) was OOM-killed, and the holds delayed the
+builds they held.
 
 ## CPU arbitration
 

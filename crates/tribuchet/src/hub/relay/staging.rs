@@ -454,6 +454,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
+    use crate::hub::placement::Expected;
     use crate::hub::state::Replay;
     use crate::proto::{BuildRequest, CancelBuild};
 
@@ -511,6 +512,7 @@ mod tests {
             queued_at: Instant::now(),
             loss: None,
             deferred: None,
+            expected: Expected::prior(false),
         }
     }
 

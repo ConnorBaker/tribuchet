@@ -40,6 +40,7 @@ fn queued(system: &str, replay: Arc<Replay>) -> Job {
         queued_at: Instant::now(),
         loss: None,
         deferred: None,
+        expected: Expected::prior(false),
     }
 }
 

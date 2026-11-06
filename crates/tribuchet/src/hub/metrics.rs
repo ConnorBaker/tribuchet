@@ -383,6 +383,7 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
+    use crate::hub::placement::Expected;
     use crate::hub::state::{Job, Replay, WorkerCaps};
     use crate::proto::BuildRequest;
 
@@ -474,6 +475,7 @@ mod tests {
             queued_at: Instant::now(),
             loss: None,
             deferred: None,
+            expected: Expected::prior(false),
         };
         state.queue.lock().await.push_back(job("x86_64-linux"));
         state.queue.lock().await.push_back(job("x86_64-linux"));
