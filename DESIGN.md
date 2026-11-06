@@ -200,13 +200,13 @@ runtime's own timer fires (`sd.rs`), and tokio's eager driver hand-off
 keeps one blocked worker from stopping that timer (`rt.rs`).
 
 Hub restarts cancel nothing, without any state handoff: on SIGTERM the
-hub exits immediately and the replacement reconstructs its state from
-the edges. Workers re-register and announce the dedupe keys of builds
-they still hold (running, or finished but undelivered); attach clients
-reconnect and resubmit the identical request, whose deterministic
-dedupe key routes it back to the worker holding the build, which
-resumes (or just re-delivers the finished result) instead of building
-again.
+hub saves the placement history and exits, and the replacement
+reconstructs its state from the edges and that file. Workers re-register
+and announce the dedupe keys of builds they still hold (running, or
+finished but undelivered); attach clients reconnect and resubmit the
+identical request, whose deterministic dedupe key routes it back to the
+worker holding the build, which resumes (or just re-delivers the
+finished result) instead of building again.
 
 Worker redeploys are plain unit restarts: builds run under the
 per-uid agent services, which hold the log and exit status until a
@@ -282,11 +282,13 @@ every other worker runs as many heavy builds, or has no idle agent, the
 asker takes it at once. The asker goes on to the next build it can
 take, so no light build waits for a heavy one, and a light build is
 never passed over. The hub counts only the builds it has dispatched and
-the workers' own declarations: it keeps no history of builds, and does
-not weigh the size each worker reports as it registers, its cores and
-the memory its builds may use (`worker/caps.rs`; `hub/placement.rs`).
-So it weighs heavy builds in
-flight, not a worker's size: a worker running one heavy build leaves the
+the workers' own declarations. It learns what builds of each key use
+(`hub/placement/history.rs`, kept in `placement-history.json` and seeded
+from its journal by `tribuchet seed-history`) and logs that at dispatch,
+but does not place by it yet, nor by the size each worker reports as it
+registers, its cores and the memory its builds may use
+(`worker/caps.rs`). So it weighs heavy builds in flight, not a worker's
+size: a worker running one heavy build leaves the
 next to any worker that serves it with an idle agent and none running,
 however few agents that worker has. Every worker advertises big-parallel
 for its native systems (`worker/caps.rs`), one with two agents too.

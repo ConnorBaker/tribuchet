@@ -207,14 +207,22 @@ fn render_nix_config(caps: &HashMap<u64, WorkerCaps>, cfg: &NixConfig) -> String
     out
 }
 
+/// Write `content` to `path` through a temporary file, `path` and ".tmp",
+/// made anew (one left there is removed: a symlink is never followed),
+/// renamed into place, and removed where the write failed. A path's
+/// writers are serialised: the hub's by write_newest, the hub and
+/// seed-history by the path's lock.
 pub(super) fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = fs::File::create(&tmp).map_err(io_ctx("creating", &tmp))?;
-        f.write_all(content.as_bytes())?;
-        f.sync_all()?;
+    let tmp = path.with_added_extension("tmp");
+    let _ = fs::remove_file(&tmp);
+    let written = fs::File::create_new(&tmp)
+        .map_err(io_ctx("creating", &tmp))
+        .and_then(|mut f| f.write_all(content.as_bytes()).and_then(|()| f.sync_all()))
+        .and_then(|()| fs::rename(&tmp, path).map_err(io_ctx("renaming into", path)));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    fs::rename(&tmp, path).map_err(io_ctx("renaming into", path))
+    written
 }
 
 impl WorkerCaps {
@@ -285,14 +293,23 @@ impl HubState {
             (generation, render_nix_config(&caps, cfg))
         };
         let (written, path) = (self.nix_written.clone(), cfg.path.clone());
-        tokio::task::spawn_blocking(move || write_newest(&written, generation, &path, &content));
+        tokio::task::spawn_blocking(move || {
+            write_newest(&written, generation, &path, &content, "nix.conf fragment");
+        });
     }
 }
 
 /// Write `content`, rendering number `generation`, to `path` unless a
 /// newer rendering was written: whatever order the writes run in, the
-/// newest rendering is the one left, never stale content.
-fn write_newest(written: &StdMutex<u64>, generation: u64, path: &Path, content: &str) {
+/// newest rendering is the one left, never stale content. `what` names
+/// the file in a warning.
+pub(super) fn write_newest(
+    written: &StdMutex<u64>,
+    generation: u64,
+    path: &Path,
+    content: &str,
+    what: &str,
+) {
     let mut newest = written.lock().unwrap();
     if *newest > generation {
         return;
@@ -305,11 +322,7 @@ fn write_newest(written: &StdMutex<u64>, generation: u64, path: &Path, content: 
         return;
     }
     if let Err(e) = write_atomic(path, content) {
-        tracing::warn!(
-            error = %e,
-            path = %path.display(),
-            "failed to write nix.conf fragment"
-        );
+        tracing::warn!(error = %e, path = %path.display(), "failed to write the {what}");
     }
 }
 

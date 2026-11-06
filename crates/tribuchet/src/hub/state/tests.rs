@@ -1,3 +1,4 @@
+use std::os::unix::fs::symlink;
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 
@@ -253,9 +254,56 @@ fn the_newest_nix_conf_rendering_is_the_one_left() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("nix.conf");
     let written = StdMutex::new(0);
-    write_newest(&written, 2, &path, "two");
-    write_newest(&written, 1, &path, "one");
+    write_newest(&written, 2, &path, "two", "fragment");
+    write_newest(&written, 1, &path, "one", "fragment");
     assert_eq!(fs::read_to_string(&path).unwrap(), "two");
+}
+
+/// A write that fails leaves no temporary file: here the rename, onto a
+/// directory.
+#[test]
+fn a_failed_write_leaves_no_temporary_file() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("h.json");
+    fs::create_dir_all(path.join("in-the-way")).unwrap();
+    assert!(write_atomic(&path, "{}").is_err());
+    assert!(
+        !dir.path().join("h.json.tmp").exists(),
+        "the temporary file is left"
+    );
+}
+
+/// A symlink at the temporary name is replaced, not followed: what it
+/// points at, here another history, is not written.
+#[test]
+fn a_symlink_at_the_temporary_name_is_not_followed() {
+    let dir = tempfile::tempdir().unwrap();
+    let (path, live) = (dir.path().join("h.seeded"), dir.path().join("h.json"));
+    fs::write(&live, "live").unwrap();
+    symlink(&live, dir.path().join("h.seeded.tmp")).unwrap();
+    write_atomic(&path, "seeded").unwrap();
+    assert_eq!(
+        fs::read_to_string(&live).unwrap(),
+        "live",
+        "written through"
+    );
+    assert_eq!(fs::read_to_string(&path).unwrap(), "seeded");
+    assert!(!fs::symlink_metadata(&path).unwrap().is_symlink());
+}
+
+/// Files of one stem have temporary files of their own: a side file
+/// seeded beside the hub's does not write through the hub's.
+#[test]
+fn files_of_one_stem_write_through_temporary_files_of_their_own() {
+    let dir = tempfile::tempdir().unwrap();
+    let (live, side) = (dir.path().join("h.json"), dir.path().join("h.seeded"));
+    fs::create_dir_all(dir.path().join("h.json.tmp")).unwrap();
+    write_atomic(&side, "seeded").unwrap();
+    assert_eq!(fs::read_to_string(&side).unwrap(), "seeded");
+    assert!(
+        write_atomic(&live, "live").is_err(),
+        "the hub's temporary file is in the way"
+    );
 }
 
 #[test]

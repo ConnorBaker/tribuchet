@@ -300,6 +300,12 @@ in
       environment.etc."tribuchet/hub.toml".source = hubToml;
       systemd.services.tribuchet-hub = {
         wantedBy = [ "multi-user.target" ];
+        # Stopped before its socket, which then listens through the hub's
+        # last save: the order DESIGN.md's swap and --help describe.
+        # Requires= makes it; After= is systemd's own for a socket's
+        # service, written out.
+        requires = [ "tribuchet-hub.socket" ];
+        after = [ "tribuchet-hub.socket" ];
         restartTriggers = [ hubToml ];
         serviceConfig = {
           Type = "notify";

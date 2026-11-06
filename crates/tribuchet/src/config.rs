@@ -102,6 +102,19 @@ pub struct HubConfig {
     /// Cache directory override. Defaults to XDG_CACHE_HOME/tribuchet.
     #[serde(default)]
     pub chunk_cache_dir: Option<PathBuf>,
+    /// What placement learns.
+    #[serde(default)]
+    pub placement: PlacementConfig,
+}
+
+/// The `[placement]` table.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct PlacementConfig {
+    /// What builds used, kept across restarts. Defaults to
+    /// XDG_CACHE_HOME/tribuchet/placement-history.json.
+    #[serde(default)]
+    pub history: Option<PathBuf>,
 }
 
 fn default_chunk_cache_bytes() -> u64 {
@@ -120,6 +133,11 @@ fn cache_dir() -> PathBuf {
 /// XDG_CACHE_HOME/tribuchet/chunks.
 pub fn default_chunk_cache_dir() -> PathBuf {
     cache_dir().join("chunks")
+}
+
+/// XDG_CACHE_HOME/tribuchet/placement-history.json.
+pub fn default_placement_history() -> PathBuf {
+    cache_dir().join("placement-history.json")
 }
 
 /// A hub-maintained nix.conf fragment. A local nix.conf `include`s the

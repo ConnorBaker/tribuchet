@@ -88,10 +88,10 @@ async fn run_async(build: BuildJson, socket: PathBuf) -> Result<i32> {
     .await??;
     let expected_outputs: Vec<String> = req.outputs.values().cloned().collect();
 
-    // The hub holds no durable state: when it restarts mid-build we
-    // reconnect and resubmit the identical request. Its dedupe key
-    // matches the build still running on the worker, which resumes
-    // instead of building twice.
+    // When the hub restarts mid-build we reconnect and resubmit the
+    // identical request; its build state is not kept across restarts.
+    // Its dedupe key matches the build still running on the worker,
+    // which resumes instead of building twice.
     let mut attempts = 0u32;
     loop {
         match attempt_build(&req, &tmp_dir_pack, &socket, &expected_outputs).await? {
