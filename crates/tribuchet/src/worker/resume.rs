@@ -528,4 +528,44 @@ impl ResumeState {
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use super::*;
+
+    mod lifecycle;
+
+    #[test]
+    fn a_finished_state_written_before_usage_existed_still_loads() {
+        let old = r#"{"phase":"finished","dedupe_key":"k","build_id":"b","exit_code":0,"error":"","outputs":[]}"#;
+        let Ok(BuildState::Finished {
+            usage, exit_code, ..
+        }) = serde_json::from_str(old)
+        else {
+            panic!("old finished state did not load");
+        };
+        assert_eq!((exit_code, usage), (0, Usage::default()));
+    }
+
+    #[test]
+    fn a_finished_state_keeps_its_usage() {
+        let u = Usage {
+            wall_ms: 1500,
+            cpu_usec: 2_000_000,
+            peak_memory_bytes: 1 << 30,
+            oom_killed: true,
+            frozen_ms: 500,
+        };
+        let st = BuildState::Finished {
+            dedupe_key: "k".into(),
+            build_id: "b".into(),
+            exit_code: 1,
+            usage: u,
+            error: String::new(),
+            outputs: vec![],
+        };
+        let json = serde_json::to_string(&st).unwrap();
+        let Ok(BuildState::Finished { usage, .. }) = serde_json::from_str(&json) else {
+            panic!("finished state did not round trip");
+        };
+        assert_eq!(usage, u);
+    }
+}
