@@ -34,7 +34,7 @@ let
         # who may write a build's cgroup.freeze
         P1 = "1 20 20 0";
         P2 = "1 20 20 0";
-        # the bound
+        # a follower held frozen for as long as the leader fills every CPU
         L4 = "4 42 60 0";
         F4 = "4 60 60 0";
         # a client's timeout and max-silent-time

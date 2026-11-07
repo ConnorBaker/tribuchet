@@ -42,7 +42,8 @@ const ROWS: [Row; 3] = [
         frozen: (0, 0),
     },
     // Only running time counts toward the build timeout and silence: the
-    // follower, frozen about 10 s, passes 5 s inside its timeout.
+    // follower, frozen until the leader ends (more than 9 s), passes 5 s
+    // inside its timeout.
     Row {
         name: "deadline",
         work: ["K", "D"],

@@ -426,8 +426,20 @@ turns it off: where parallel builds each fill every CPU, it finishes
 the leader, and the builds on average, earlier, on less CPU. While the
 oldest parallel build (by its start, persisted with it, so the same
 after a worker restart; ties by key) keeps every CPU busy, the other
-parallel builds are frozen. No build is
-frozen more than 10 s in any 30 s, and builds stay frozen only while
+parallel builds are frozen. A frozen build is thawed at the first
+200 ms sample at which the leader leaves a CPU spare or has ended, when
+the memory rule below needs the room, when its lease ends, or when the
+freeze is not reached within 5 s; nothing bounds how long it may stay
+frozen otherwise. An earlier bound (no build frozen more than 10 s in
+any 30 s, so that a follower ran at least two thirds of the time) is
+not kept, by decision of 2026-11-07. Measured on synthetic workloads
+before it was added (2026-10-27), arbitration finished builds 7.1-8.2%
+earlier on average and the oldest 33-34% earlier; re-measured with it,
+the mean gain was gone and the oldest finished 18-21% earlier, and a
+later run with it on a 4-vCPU mix of small builds found no measurable
+benefit, a harness that could not test oversubscription. The workloads
+differed between those runs, so how much of the loss was the bound's
+is not cleanly attributed. Builds stay frozen only while
 what they pin together (each its memory.current less its page cache;
 swap is no room) fits each capped cgroup's headroom and the host's
 MemAvailable (`worker/arbiter/memory.rs`). The worker freezes and thaws
@@ -466,8 +478,28 @@ reported at start, and nothing is frozen there.
 * An output delivery fails its build when the hub's chunk cache cannot
   store or read back a chunk of it.
 * A freeze still counts against wall-clock timers the worker does not
-  own: a build's own (test drivers, watchdogs), and Nix's `timeout`
-  where Nix is not patched to leave it to the external builder.
+  own. A build's own (test drivers, watchdogs): one whose tests time
+  out by the wall clock fails if it is frozen longer than their slack.
+  A frozen fixed-output build's connections: the remote side's send or
+  idle timeout, and presto-pasta's reclaim of a flow with no traffic
+  either way for 3 min (a stalled transfer keeps its flow alive with
+  zero-window probes, so the remote's send timeout is the likelier
+  end). A Nix client's `timeout` and `max-silent-time` where Nix is
+  not patched to leave them to the external builder: such a client
+  counts both by the wall clock, and a frozen build writes no log, so
+  its max-silent-time can end the attach during a freeze, and the
+  clientless rule may then give the build up. Each build's frozen time
+  is recorded with its exit code (`frozen_ms` and `exit_code` on the
+  hub's `build usage` line), so the failure rate of frozen builds is
+  measured on the farm.
+* With no bound on frozen time, a follower waits on the parallel
+  builds older than it. A leader that hangs while spinning on every
+  CPU holds every younger parallel build on its worker frozen until
+  its own running-time timeout ends it (`build-timeout-secs`, 24 h by
+  default, or its client's lesser one); the next oldest then leads. The
+  wait is bounded, since a build started later never leads over an
+  older one, but can reach that timeout once for each older parallel
+  build.
 * The frozen builds' memory rule is a margin, not a bound: a leader that
   grows faster than one 200 ms sample can still fill a capped slice.
 * Within the agents' slice the kernel's OOM killer kills one process,
