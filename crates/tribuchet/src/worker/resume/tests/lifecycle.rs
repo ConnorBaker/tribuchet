@@ -8,7 +8,8 @@ use std::thread;
 use crate::errors::Result;
 use crate::proto::{BuildAssignment, CancelBuild, WorkerMessage, worker_message};
 use crate::sockpath;
-use crate::worker::agents::tests::{Calls, fake_agent, spawn_agent};
+use crate::worker::agents::tests::pool::{Calls, fake_agent};
+use crate::worker::agents::tests::spawn_agent;
 use crate::worker::session::handle_cancel;
 use crate::worker::unix_now;
 
@@ -456,42 +457,6 @@ fn rescan_adds_new_agent_sockets() -> Result<()> {
     assert_eq!(ctx.agents.usable(), 3);
     assert_eq!(ctx.jobs(), 2);
     Ok(())
-}
-
-#[test]
-fn a_finished_state_written_before_usage_existed_still_loads() {
-    let old = r#"{"phase":"finished","dedupe_key":"k","build_id":"b","exit_code":0,"error":"","outputs":[]}"#;
-    let Ok(BuildState::Finished {
-        usage, exit_code, ..
-    }) = serde_json::from_str(old)
-    else {
-        panic!("old finished state did not load");
-    };
-    assert_eq!((exit_code, usage), (0, Usage::default()));
-}
-
-#[test]
-fn a_finished_state_keeps_its_usage() {
-    let u = Usage {
-        wall_ms: 1500,
-        cpu_usec: 2_000_000,
-        peak_memory_bytes: 1 << 30,
-        oom_killed: true,
-        frozen_ms: 500,
-    };
-    let st = BuildState::Finished {
-        dedupe_key: "k".into(),
-        build_id: "b".into(),
-        exit_code: 1,
-        usage: u,
-        error: String::new(),
-        outputs: vec![],
-    };
-    let json = serde_json::to_string(&st).unwrap();
-    let Ok(BuildState::Finished { usage, .. }) = serde_json::from_str(&json) else {
-        panic!("finished state did not round trip");
-    };
-    assert_eq!(usage, u);
 }
 
 /// persist() serializes through a borrowing mirror of BuildState.

@@ -421,4 +421,163 @@ pub(super) fn shutdown(socket: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
-pub(super) mod tests;
+pub(super) mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::os::fd::IntoRawFd;
+    use std::{env, thread};
+
+    use crate::tmpdir::pack_zstd_dir;
+    use crate::worker::agent;
+
+    pub(in crate::worker) mod pool;
+
+    /// A dev-mode agent: self-bound socket, same uid.
+    pub(in crate::worker) fn spawn_agent(socket: &Path, state_dir: PathBuf) -> Result<()> {
+        let listener = sockpath::bind(socket)?;
+        thread::spawn(move || {
+            let _ = agent::run(&agent::Options {
+                socket: None,
+                listen_fd: Some(listener.into_raw_fd()),
+                state_dir,
+                worker_uid: None,
+                uid_base: None,
+                dedicated_uid: false,
+            });
+        });
+        Ok(())
+    }
+
+    /// A dev-mode agent plus a staged tmp dir pack for it, shared by
+    /// the tests below.
+    pub(in crate::worker) fn spawn_test_agent(dir: &Path) -> Result<(PathBuf, PathBuf)> {
+        let socket = dir.join("agent.sock");
+        spawn_agent(&socket, dir.join("state"))?;
+        // build dir carrying .attrs.json, like the client pack
+        let build = dir.join("top/build");
+        fs::create_dir_all(&build)?;
+        fs::write(build.join(".attrs.json"), "{}")?;
+        let pack_path = dir.join("top.tmpdir.zst");
+        fs::write(&pack_path, pack_zstd_dir(&build)?)?;
+        Ok((socket, pack_path))
+    }
+
+    pub(in crate::worker) fn start_request(
+        build_id: &str,
+        script: String,
+        outputs: Vec<String>,
+    ) -> StartRequest {
+        StartRequest {
+            build_id: build_id.into(),
+            builder: "/bin/sh".into(),
+            args: vec!["-c".into(), script],
+            // A real assignment's env carries PATH; the scripts here
+            // need it for mkdir.
+            env: HashMap::from([
+                ("NIX_BUILD_TOP".into(), "/build".into()),
+                ("PATH".into(), env::var("PATH").unwrap_or_default()),
+            ]),
+            tmp_dir_in_sandbox: "/build".into(),
+            profile: String::new(),
+            sandbox_json: None,
+            outputs,
+            memory_max_bytes: None,
+        }
+    }
+
+    /// Full lifecycle against a real agent on the same uid, without a
+    /// seatbelt profile (not permitted inside the Nix build sandbox):
+    /// Start with a tmp dir tar, exit notice, Adopt of the finished
+    /// build, Finish, Cleanup.
+    #[test]
+    fn agent_runs_a_build_end_to_end() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (socket, pack_path) = spawn_test_agent(dir.path())?;
+        let build_id = "0123456789abcdef0123456789abcdef";
+        let output = dir.path().join("fake-output");
+        let req = start_request(
+            build_id,
+            format!(
+                "test -f .attrs.json || exit 2; \
+                 test \"$NIX_BUILD_TOP\" = \"$PWD\" || exit 3; \
+                 echo built; mkdir {out}; echo data > {out}/file",
+                out = output.display()
+            ),
+            vec![output.to_string_lossy().into_owned()],
+        );
+        let log_path = dir.path().join("build.log");
+        let log_w = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+        let build = AgentBuild::start(&socket, &req, &fs::File::open(&pack_path)?, &log_w)?;
+        assert!(build.pid > 0);
+        let exit = build.wait_exit()?;
+        assert_eq!(exit.exit_code, 0);
+        assert!(exit.peak_memory_bytes > 0, "no memory reported");
+
+        let log = fs::read_to_string(&log_path)?;
+        assert!(log.contains("built"), "log: {log}");
+
+        let (_, exit) = AgentBuild::adopt(&socket, build_id)?;
+        assert_eq!(exit, Some(0));
+
+        finish(&socket, build_id)?;
+        assert_eq!(fs::read_to_string(output.join("file"))?, "data\n");
+
+        cleanup(&socket, build_id)?;
+        assert!(!output.exists());
+        assert!(!build.scratch_dir.exists());
+        Ok(())
+    }
+
+    /// The generated seatbelt profile, applied by a real agent: the
+    /// derivation env arrives, worker secrets are unreadable, writes
+    /// stay confined to the scratch dir and the declared output.
+    /// Skipped inside the Nix build sandbox (sandbox_init is not
+    /// permitted there); `nix develop -c cargo test` runs it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_profile_confines_the_builder() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (socket, pack_path) = spawn_test_agent(dir.path())?;
+        let build_id = "00000000000000000000000000000001";
+        // Canonical paths: the profile's path filters only match
+        // canonical paths and macOS temp dirs live under the /var
+        // symlink. Real outputs are /nix/store paths, already canonical.
+        let dir_path = dir.path().canonicalize()?;
+        let output = dir_path.join("fake-output");
+        let secret = dir_path.join("secret");
+        fs::write(&secret, "key-material")?;
+        let outside = dir_path.join("outside");
+        let outputs = vec![output.to_string_lossy().into_owned()];
+        let mut req = start_request(
+            build_id,
+            // Each escape attempt exits with its own code so a failure
+            // names the broken rule.
+            format!(
+                "test \"$NIX_BUILD_TOP\" = \"$PWD\" || exit 3; \
+                 cat {secret} 2>/dev/null && exit 4; \
+                 echo escaped > {outside} 2>/dev/null && exit 5; \
+                 echo scratch > scratch-file || exit 6; \
+                 mkdir {out} && echo data > {out}/file",
+                secret = secret.display(),
+                outside = outside.display(),
+                out = output.display()
+            ),
+            outputs.clone(),
+        );
+        req.profile = seatbelt_profile(&outputs, &[secret], false)?;
+        let log_w = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir_path.join("build.log"))?;
+        let build = AgentBuild::start(&socket, &req, &fs::File::open(&pack_path)?, &log_w)?;
+        assert_eq!(build.wait_exit()?.exit_code, 0);
+        assert!(!outside.exists());
+        finish(&socket, build_id)?;
+        assert_eq!(fs::read_to_string(output.join("file"))?, "data\n");
+        cleanup(&socket, build_id)?;
+        Ok(())
+    }
+}
