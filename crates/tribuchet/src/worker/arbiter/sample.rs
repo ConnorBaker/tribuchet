@@ -84,9 +84,9 @@ pub(crate) fn frozen_usec(dir: &Path) -> Option<u64> {
 /// frozen_usec, which Linux 6.18 added: cgroup-v2.rst there, "exists in
 /// non-root cgroups"), checked on this process's own cgroup, which
 /// `proc_cgroup` (/proc/self/cgroup) names, on kernel `release`. The
-/// arbiter relies on it to bound freezes (bound.rs) and to keep them out
-/// of a build's running time; without it neither works and nothing says
-/// so, so the arbiter is off on such a host instead.
+/// arbiter relies on it to keep freezes out of a build's running time;
+/// without it that fails and nothing says so, so the arbiter is off on
+/// such a host instead.
 pub(super) fn require_frozen_time(proc_cgroup: &str, release: &str) -> Result<()> {
     counts_frozen_time(cgroup_path(proc_cgroup).as_deref(), release)
 }
@@ -166,7 +166,7 @@ mod tests {
     /// The arbiter is off, naming the kernel, where the worker's own
     /// cgroup counts no frozen time (Linux before 6.18, or no cgroup v2
     /// of its own), and on where it does, rather than start unchecked
-    /// with its bound and notes failing silently.
+    /// with its running-time count failing silently.
     #[test]
     fn the_arbiter_is_off_on_a_kernel_that_counts_no_frozen_time() {
         let dir = tempfile::tempdir().unwrap();

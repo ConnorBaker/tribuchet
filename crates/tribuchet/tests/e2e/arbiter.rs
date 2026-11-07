@@ -1,11 +1,11 @@
 //! The `arbiter` phase: the CPU arbiter on the real kernel's freezer, on a
 //! 4-core worker (nix/tests/phase-arbiter.nix). No build is marked: every
 //! one is subject to it. The oldest parallel build leads while it fills
-//! every CPU, and the younger parallel ones freeze, 10 s of any 30 s at most;
+//! every CPU, and the younger parallel ones stay frozen until it does not;
 //! only a build's own agent, and root, may write its cgroup.freeze; no
 //! freeze outlives the worker that made it; a client's timeout counts only
 //! its build's running time. Which build the arbiter freezes and when, from
-//! what it samples, is its unit tests' (worker/arbiter/policy.rs, bound.rs,
+//! what it samples, is its unit tests' (worker/arbiter/policy.rs,
 //! tests.rs).
 
 use std::collections::HashSet;
@@ -321,50 +321,37 @@ fn no_freeze_outlives_its_worker() {
 
 /// L4 fills every CPU for 42 s while F4 (4 spinners, 60 s of wall time)
 /// runs under a client that gives up after 80 s and asks for a timeout of
-/// 55 s, which F4's frozen time does not count toward: F4 is frozen no
-/// more than 10 s of any 30 s by its cgroup's count, thawed at the bound
-/// though L4 still fills every CPU, frozen again, thawed within a sample
-/// of L4 leaving slack, and finishes in time.
+/// 55 s, which F4's frozen time does not count toward: F4, once frozen,
+/// stays frozen for as long as L4 fills every CPU, its cgroup counting far
+/// more than the 10 s a freeze was once bounded to, is thawed within two
+/// samples of L4 leaving slack, and finishes in time.
 #[test]
-fn the_bound() {
+fn the_leader_holds_its_followers() {
     let l4 = launch_seen("L4", None);
     let f4 = launch_seen("F4", Some("timeout 80 nix-build --option timeout 55"));
     monitor("/tmp/monitor4.jsonl", 200, &[("L4", &l4), ("F4", &f4)]);
     let done = [ok("L4"), ok("F4")];
     let rows = rows("/tmp/monitor4.jsonl", 200);
     let (l, f) = (samples(&rows, "L4"), samples(&rows, "F4"));
-    // The most F4's cgroup counted in any 30 s: the bound, a sample and the call.
-    let mut j = 0;
-    let mut window = -1;
-    for s in &f {
-        while j + 1 < f.len() && f[j + 1].0 <= s.0 - 30.0 {
-            j += 1;
-        }
-        window = window.max(s.3 - f[j].3);
-    }
-    // L4's runnable threads at F4's first thaw after a freeze.
+    // F4's first freeze, its first thaw after, and what its cgroup
+    // counted frozen in between.
     let first = f.iter().position(|s| s.1);
-    let thawed = first.and_then(|i| f[i..].iter().find(|s| !s.1));
-    let l4_then = thawed.and_then(|t| l.iter().rfind(|s| s.0 <= t.0).map(|s| s.2));
-    let freezes = f.windows(2).filter(|w| w[1].1 && !w[0].1).count();
-    // L4's last drop below 4 runnable threads: F4 then, and its thaw after.
+    let thaw = first.and_then(|i| f[i..].iter().find(|s| !s.1));
+    let held = first.zip(thaw).map(|(i, t)| t.3 - f[i].3);
+    // L4's last drop below 4 runnable threads, and F4's first thaw after it.
     let slack = (0..l.len())
         .find(|&i| l[i..].iter().all(|s| s.2 < 4))
         .map(|i| l[i].0);
-    let at_slack = slack.and_then(|t| f.iter().rfind(|s| s.0 < t).map(|s| s.1));
-    let latency = slack.and_then(|t| f.iter().find(|s| s.0 >= t && !s.1).map(|s| s.0 - t));
+    let latency = slack.zip(thaw).map(|(s, t)| t.0 - s);
     assert_eq!(
         (
             done,
-            (9_500_000..=10_500_000).contains(&window),
-            l4_then.is_some_and(|r| r >= 4),
-            freezes >= 2,
-            at_slack,
-            latency.is_some_and(|d| d <= 0.4),
+            held.is_some_and(|us| us > 20_000_000),
+            latency.is_some_and(|d| (0.0..=0.4).contains(&d)),
         ),
-        ([true, true], true, true, true, Some(true), true),
-        "L4 and F4 succeeded; F4 frozen {window} µs in a 30 s window; L4 at F4's first thaw \
-         {l4_then:?}; F4 frozen {freezes} times, {at_slack:?} at L4's slack, thawed {latency:?} s after"
+        ([true, true], true, true),
+        "L4 and F4 succeeded; F4 frozen {held:?} µs in its first freeze; \
+         first thawed {latency:?} s after L4's slack"
     );
 }
 

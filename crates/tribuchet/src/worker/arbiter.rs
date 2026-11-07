@@ -1,16 +1,14 @@
 //! CPU arbitration among a worker's builds: Inelastic-First by freezing.
 //! The oldest parallel build (by its persisted start; ties by key) leads;
 //! while it keeps every CPU busy, the other parallel builds are frozen,
-//! thawing at the first 200 ms sample it leaves slack or ends. Always on,
+//! thawing at the first 200 ms sample it leaves slack or ends, however
+//! long that is: no bound on a build's frozen time. Always on,
 //! with no way to turn it off, wherever the kernel counts each cgroup's
-//! frozen time (cgroup.stat.local frozen_usec, Linux 6.18), which its
-//! bound and the builds' running time need: on a host
+//! frozen time (cgroup.stat.local frozen_usec, Linux 6.18), which the
+//! builds' running time needs: on a host
 //! without that count it is off, and the worker says so at start. Every
 //! build with a cgroup of its own takes part, whatever it declares.
-//! That count also bounds it ([`bound`]): a build whose cgroup has been
-//! frozen for 10 s of the last 30 s is thawed, and not frozen again until
-//! that falls, which bounds what freezing takes from any span of its wall
-//! time. Nor are builds held frozen that together pin more than the
+//! Builds are not held frozen that together pin more than the
 //! memory caps above them, or the host, leave room for ([`memory`]).
 //! Frozen time counts toward neither a build's timeout nor its
 //! max-silent-time ([`Tracking::frozen`]), its client's or the worker's
@@ -22,7 +20,6 @@
 //! made it, and the worker unit's ExecStopPost thaws every build as root
 //! once the worker has exited, should an agent not.
 
-mod bound;
 mod memory;
 mod policy;
 mod sample;
@@ -40,7 +37,6 @@ use std::time::{Duration, Instant};
 
 use crate::errors::chain;
 use crate::worker::resume::ResumeState;
-use bound::{FROZEN_PER_WINDOW, FROZEN_WINDOW, FrozenTime};
 use policy::{Action, Policy};
 
 pub(crate) use sample::{cgroup_path, frozen_usec, subgroups};
@@ -76,9 +72,6 @@ struct Tracked {
     order: u64,
     /// May be frozen: it has a handle, and no freeze of it went unreached.
     eligible: bool,
-    /// Its cgroup's frozen time over the last FROZEN_WINDOW: within the
-    /// bound, it may be frozen.
-    frozen_time: FrozenTime,
     samples: VecDeque<u32>,
     /// Asked to be frozen, and not thawed since.
     frozen: bool,
@@ -160,12 +153,7 @@ impl Arbiter {
             .and_then(|n| u32::try_from(n.get()).ok())
             .unwrap_or(1);
         let arbiter = Self::with_cpus(true, ncpus);
-        tracing::info!(
-            ncpus,
-            frozen_per_window_secs = FROZEN_PER_WINDOW.as_secs(),
-            frozen_window_secs = FROZEN_WINDOW.as_secs(),
-            "CPU arbiter on"
-        );
+        tracing::info!(ncpus, "CPU arbiter on");
         let a = arbiter.clone();
         thread::spawn(move || {
             loop {
@@ -229,7 +217,6 @@ impl Arbiter {
             cgroup,
             freeze,
             order,
-            frozen_time: FrozenTime::default(),
             samples: VecDeque::with_capacity(WINDOW),
             frozen: false,
             unreached: None,
@@ -260,28 +247,21 @@ impl Arbiter {
             .iter()
             .filter_map(|(key, t)| Some((key.clone(), t.cgroup.clone()?)))
             .collect();
-        // Demand, the time frozen so far by the cgroup's own count, the
-        // memory it would pin frozen (memory.rs), and whether a freeze
-        // asked for is reached.
+        // Demand, the memory it would pin frozen (memory.rs), and whether
+        // a freeze asked for is reached.
         let available = memory::available(&self.memory);
         let counts: Vec<_> = dirs
             .into_iter()
             .map(|(key, cg)| {
                 let held = memory::held(&cg, &self.memory);
                 let reached = sample::frozen_reached(&cg);
-                (
-                    key,
-                    sample::runnable_threads(&cg),
-                    frozen_usec(&cg),
-                    held,
-                    reached,
-                )
+                (key, sample::runnable_threads(&cg), held, reached)
             })
             .collect();
         let mut state = self.lock();
         let State { builds, policy, .. } = &mut *state;
         let mut held = HashMap::new();
-        for (key, runnable, frozen_us, h, reached) in counts {
+        for (key, runnable, h, reached) in counts {
             let Some(t) = builds.get_mut(&key) else {
                 continue;
             };
@@ -291,19 +271,6 @@ impl Arbiter {
             t.samples.push_back(runnable);
             if let Some(h) = h {
                 held.insert(key, h);
-            }
-            // Frozen for FROZEN_PER_WINDOW of the last FROZEN_WINDOW, or
-            // not counted: the policy thaws it now, and freezes it again
-            // only once it is within the bound. By the cgroup's own count,
-            // so that a worker restart grants no build more (bound.rs).
-            if t.frozen_time.record(now, frozen_us) {
-                tracing::info!(
-                    id = t.build_id,
-                    frozen_in_window_ms = t.frozen_time.in_window(now).as_millis(),
-                    bound_secs = FROZEN_PER_WINDOW.as_secs(),
-                    window_secs = FROZEN_WINDOW.as_secs(),
-                    "frozen for its bound in the window; thawed, not frozen again until under it"
-                );
             }
             // A freeze not reached in FREEZE_TIMEOUT is undone and not
             // asked again: tasks that do not reach the freezer would keep
@@ -334,9 +301,7 @@ impl Arbiter {
             .map(|(key, t)| policy::Build {
                 key,
                 order: t.order,
-                eligible: t.eligible
-                    && t.frozen_time.within()
-                    && !unfit.iter().any(|(k, _)| *k == key),
+                eligible: t.eligible && !unfit.iter().any(|(k, _)| *k == key),
                 runnable: t.samples.back().copied().unwrap_or(0),
                 mean: sample::mean(&t.samples),
                 frozen: t.frozen,

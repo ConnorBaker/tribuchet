@@ -51,19 +51,22 @@ fn a_tracked_build_reports_its_cgroups_frozen_time() {
 }
 
 /// A change to the cgroup files: a build's memory.current, frozen_usec,
-/// whether cgroup.events says frozen, or (before it is adopted) whether its
-/// cgroup.freeze asks for frozen or its agent sent no handle; the slice's
-/// memory.max and memory.current.
+/// runnable threads, whether cgroup.events says frozen, or (before it is
+/// adopted) whether its cgroup.freeze asks for frozen or its agent sent no
+/// handle; the slice's memory.max and memory.current; or a build's end
+/// (its `Tracking` is dropped, as when its supervision ends).
 #[derive(Clone, Copy)]
 enum Set {
     Holds(&'static str, u64),
     Count(&'static str, u64),
+    Threads(&'static str, usize),
     Reached(&'static str, bool),
     Stuck(&'static str),
     Bare(&'static str),
     Cap(u64, u64),
+    Ends(&'static str),
 }
-use Set::{Bare, Cap, Count, Holds, Reached, Stuck};
+use Set::{Bare, Cap, Count, Ends, Holds, Reached, Stuck, Threads};
 
 /// Changes (a first step's before the builds are tracked), then this many
 /// samples, then what each build's cgroup.freeze was written ("key=writes",
@@ -109,18 +112,26 @@ const SCENARIOS: &[(&[(&str, u64)], &[Step])] = &[
             "lead= f1=1 f2=",
         )],
     ),
-    // The bound is the cgroup's own count over the last 30 s: arriving
-    // with 6 s of it, a build is frozen, thawed at the sample its count
-    // reaches 10 s though the leader still fills every CPU, and frozen
-    // again only once those 10 s cannot all lie in the window: 24 s on.
+    // Frozen time is not bounded: a follower stays frozen, its cgroup
+    // counting 10 s frozen and then 40 s, for as long as the leader fills
+    // every CPU, and is thawed at the first sample the leader leaves one
+    // spare ...
     (
         LF,
         &[
-            (&[Count("f", 6 * S)], 26, "lead= f=1"),
-            (&[Count("f", 9_800_000)], 1, "lead= f=1"),
-            (&[Count("f", 10 * S)], 1, "lead= f=10"),
-            (&[], 93, "lead= f=10"),
-            (&[], 1, "lead= f=101"),
+            (&[], 26, "lead= f=1"),
+            (&[Count("f", 10 * S)], 50, "lead= f=1"),
+            (&[Count("f", 40 * S)], 150, "lead= f=1"),
+            (&[Threads("lead", 3)], 1, "lead= f=10"),
+        ],
+    ),
+    // ... or ends.
+    (
+        LF,
+        &[
+            (&[], 26, "lead= f=1"),
+            (&[Count("f", 40 * S)], 200, "lead= f=1"),
+            (&[Ends("lead")], 1, "lead= f=10"),
         ],
     ),
     // A freeze not reached within FREEZE_TIMEOUT (25 samples) is undone,
@@ -155,7 +166,7 @@ fn every_scenario_freezes_and_thaws_as_the_table_says() {
         fs::write(dir.path().join("meminfo"), "MemAvailable: 104857600 kB\n").unwrap();
         let mut a = arbiter();
         Arc::get_mut(&mut a).unwrap().memory = memory::Roots::under(dir.path());
-        let mut bare = Vec::new();
+        let (mut bare, mut tracking) = (Vec::new(), HashMap::new());
         for &(key, _) in builds {
             fs::write(busy_cgroup(&slice, key, 4).join("cgroup.freeze"), "").unwrap();
         }
@@ -169,6 +180,11 @@ fn every_scenario_freezes_and_thaws_as_the_table_says() {
                         "cgroup.stat.local",
                         format!("frozen_usec {us}"),
                     ),
+                    Threads(k, n) => (
+                        slice.join(k),
+                        "cgroup.threads",
+                        format!("{}\n", rustix::thread::gettid().as_raw_nonzero()).repeat(n),
+                    ),
                     Reached(k, r) => (
                         slice.join(k),
                         "cgroup.events",
@@ -177,6 +193,10 @@ fn every_scenario_freezes_and_thaws_as_the_table_says() {
                     Stuck(k) => (slice.join(k), "cgroup.freeze", "1".into()),
                     Bare(k) => {
                         bare.push(k);
+                        continue;
+                    }
+                    Ends(k) => {
+                        tracking.remove(k);
                         continue;
                     }
                     Cap(max, current) => {
@@ -195,6 +215,12 @@ fn every_scenario_freezes_and_thaws_as_the_table_says() {
                 };
                 let freeze = (!bare.contains(&key)).then(|| open().unwrap());
                 a.insert(key, key, started, Some(cg.clone()), freeze);
+                let untracks = Tracking {
+                    arbiter: a.clone(),
+                    key: key.into(),
+                    most_usec: AtomicU64::new(0),
+                };
+                tracking.insert(key, untracks);
             }
             for _ in 0..samples {
                 now += SAMPLE_EVERY;
