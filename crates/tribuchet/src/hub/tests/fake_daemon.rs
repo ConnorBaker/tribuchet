@@ -230,7 +230,8 @@ pub(super) fn hub_scripted(
 pub(in crate::hub) type Client = mpsc::Receiver<Result<AttachEvent, Status>>;
 
 /// The notes on the hub's daemon a client got so far, and its error.
-pub(in crate::hub) fn told(client: &mut Client) -> (Vec<String>, Option<String>) {
+pub(in crate::hub) async fn told(client: &mut Client) -> (Vec<String>, Option<String>) {
+    tokio::task::yield_now().await;
     let (mut notes, mut error) = (Vec::new(), None);
     while let Ok(Ok(AttachEvent { event: Some(e) })) = client.try_recv() {
         match e {

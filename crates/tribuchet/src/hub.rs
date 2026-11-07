@@ -33,6 +33,8 @@ mod chunkcache;
 pub(crate) use chunkcache::ChunkCache;
 mod losses;
 mod metrics;
+#[cfg(test)]
+mod model;
 mod naming;
 mod placement;
 mod relay;

@@ -43,10 +43,8 @@ type EventTx = mpsc::Sender<Result<AttachEvent, Status>>;
 /// streams chunks forever grows root-hub memory without bound.
 const MAX_REPLAY_BYTES: usize = 256 * 1024 * 1024;
 
-/// Per-subscriber channel headroom beyond the buffered backlog. An
-/// attach client that falls this far behind gets no live events until
-/// it has room again, or catches up once its build ends (replay.rs),
-/// instead of the hub buffering the whole build a second time for it.
+/// Events read from the replay for an attach client that it has not
+/// taken yet; its reader waits there, not the build (replay.rs).
 const SUB_CHANNEL_SLACK: usize = 1024;
 
 pub(super) struct Job {

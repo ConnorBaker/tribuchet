@@ -7,12 +7,10 @@ use hyper_util::rt::TokioIo;
 use tonic::transport::{Endpoint, Server, Uri};
 use tower::service_fn;
 
-use chunkcache::ChunkCache;
 use state::{FLOOR, Replay};
 use submit::AttachSvc;
 use testlog::Captured;
 
-use crate::chunkstore::{Hash, io_hook};
 use crate::config::NixConfig;
 use crate::proto::attach_hub_client::AttachHubClient;
 use crate::proto::{
@@ -84,26 +82,6 @@ pub(super) async fn try_submit(
         .build(tokio_stream::iter(submission))
         .await
         .map(tonic::Response::into_inner)
-}
-
-/// `n` chunks of 16 KiB, admitted to `cache` off the runtime as an
-/// output's: its recipe and their frames.
-pub(super) fn cached_output(cache: &ChunkCache, n: u8) -> (Vec<(Hash, usize)>, Vec<Vec<u8>>) {
-    io_hook::off_runtime(|| {
-        (0..n)
-            .map(|i| {
-                let mut raw = vec![0u8; 16 * 1024];
-                blake3::Hasher::new()
-                    .update(&[i])
-                    .finalize_xof()
-                    .fill(&mut raw);
-                let hash = *blake3::hash(&raw).as_bytes();
-                let frame = zstd::bulk::compress(&raw, 3).unwrap();
-                cache.admit(hash, &frame).unwrap();
-                ((hash, raw.len()), frame)
-            })
-            .unzip()
-    })
 }
 
 /// Heartbeats on `to_hub` every minute, as a worker sends them every

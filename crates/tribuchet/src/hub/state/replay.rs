@@ -1,17 +1,15 @@
 //! Buffered per-build event replay for dedupe subscribers.
 
+use std::collections::{HashMap, VecDeque};
+use std::mem;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::Duration;
-use std::{iter, mem};
 
-use tokio::sync::mpsc::error::TrySendError;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::time::Instant;
 use tonic::Status;
-
-const SUB_STALL: Duration = Duration::from_mins(1);
 
 /// How long after its build ends a client catching up can count on the
 /// outputs staying in the hub's cache. UNMEASURED: no client stalled in
@@ -21,24 +19,32 @@ const CATCH_UP_PIN: Duration = Duration::from_mins(10);
 
 use super::{EventTx, MAX_REPLAY_BYTES, SUB_CHANNEL_SLACK};
 use crate::chunker::Recipe;
-use crate::chunkstore::PinGuard;
+use crate::chunkstore::{Hash, PinGuard};
 use crate::hub::chunkcache::ChunkCache;
 use crate::proto::{AttachEvent, OutputNar, attach_event};
 
-/// Said to a subscriber that missed events, before it is served again.
+/// Said to a client that missed log lines, before what follows them.
 const TRUNCATED: &str =
     "tribuchet: part of this build's log was dropped for this client; outputs follow in full\n";
 
+/// Said to a client behind what the log keeps while the build runs: a
+/// resubmit would come back to this same log (upstream's status and words).
+const EXHAUSTED: &str = "build output exceeded the replay buffer; retry after it finishes";
+
 /// Buffered event log of one in-flight build; late identical submissions
 /// (dedupe) replay the buffer and then follow live. The buffer holds the
-/// compressed output chunks too, capped at MAX_REPLAY_BYTES. A
-/// subscriber that misses events (it stalled, or came after the cap)
-/// is served the outputs from the hub's chunk cache when the build ends.
+/// compressed output chunks too, capped at MAX_REPLAY_BYTES. Each client
+/// reads at its own pace (`read`), publish waits for none; past the cap it
+/// may miss log lines, told so, but gets each chunk from the cache, unless
+/// it is behind even what the log keeps of those: then it is refused
+/// while the build runs, and resubmits once it ended.
 #[derive(Default)]
 pub(in crate::hub) struct Replay {
     /// The build's id, for the warnings.
     id: String,
     inner: Mutex<ReplayInner>,
+    /// Woken at each event and at the build's end.
+    grew: Notify,
     /// The waits (`Wait` bits) the clients were told of since the build
     /// was last dispatched.
     told_waiting: AtomicU8,
@@ -62,32 +68,67 @@ pub(in crate::hub) enum Wait {
     Daemon = 2,
 }
 
+/// What an event held costs beyond the bytes it holds (`cost`).
+const HELD: usize = mem::size_of::<Held>();
+
 #[derive(Default)]
 struct ReplayInner {
-    events: Vec<AttachEvent>,
+    /// The log from `base` on; the events before it went past the cap.
+    events: VecDeque<Held>,
+    base: usize,
+    /// Of those that went, all but the log lines and the chunks a restart
+    /// superseded: a chunk without its bytes (read back from the cache),
+    /// restarts, ends, verdicts.
+    went: VecDeque<Held>,
+    /// One past the last log line that went.
+    lost: usize,
+    /// One past the last event that went from `went` too, once it alone
+    /// was past the cap: a client behind it cannot have the outputs whole.
+    forgot: usize,
+    /// The `cost` of what `events` and `went` hold, at most `cap` (else
+    /// MAX_REPLAY_BYTES). Not counted: the two deques' spare room, which
+    /// neither gives back; at worst about 2.7 times the cap (a cap's worth
+    /// of empty lines, then of chunk records).
     bytes: usize,
-    /// Buffer cap hit: the backlog is incomplete, so late dedupe
-    /// subscribers cannot replay it.
-    overflowed: bool,
-    subs: Vec<EventTx>,
-    /// Attached but missing events: get no live ones, and catch_up
-    /// once the build ends. While no output is being delivered they
-    /// rejoin once they have room, the outputs they may hold part of
-    /// restarted.
-    behind: Vec<EventTx>,
-    /// Back from `behind`. Sent live events without waiting: one full
-    /// again goes back behind at once instead of holding the build up
-    /// for SUB_STALL each time it stalls.
-    rejoined: Vec<EventTx>,
-    /// An output's chunks are going out: since the last Output with no
-    /// OutputRestart (a requeue) after it.
-    streaming: bool,
-    /// Verdict events, kept past a buffer overflow.
-    ending: Vec<AttachEvent>,
-    /// The latest delivery's outputs, for catch_up.
+    cap: Option<usize>,
+    /// Per output: its last restart, and its chunks since.
+    paths: HashMap<String, Output>,
+    /// The latest delivery's outputs, read from the cache for a chunk
+    /// whose bytes went.
     outputs: Option<Arc<KeptOutputs>>,
     /// When the build ended (`finish`).
     ended: Option<Instant>,
+    subs: Vec<EventTx>,
+    /// The cap was reached: warned once.
+    overflowed: bool,
+}
+
+struct Held {
+    /// Its place in the log.
+    seq: usize,
+    event: AttachEvent,
+    /// A chunk's place in its output since the output's last restart.
+    nth: usize,
+}
+
+/// What holding `ev` costs: the event and the bytes it holds.
+fn cost(ev: &AttachEvent) -> usize {
+    HELD + match ev.event.as_ref() {
+        Some(attach_event::Event::Log(l)) => l.len(),
+        Some(attach_event::Event::Output(o)) => o.store_path.len() + o.zstd_nar_chunk.len(),
+        Some(
+            attach_event::Event::Error(s)
+            | attach_event::Event::OutputRestart(s)
+            | attach_event::Event::Dispatched(s),
+        ) => s.len(),
+        Some(attach_event::Event::ExitCode(_)) | None => 0,
+    }
+}
+
+#[derive(Default)]
+struct Output {
+    restart: usize,
+    chunks: usize,
 }
 
 /// A delivery's outputs, pinned in the hub's chunk cache so a
@@ -122,86 +163,202 @@ fn event(ev: attach_event::Event) -> AttachEvent {
     AttachEvent { event: Some(ev) }
 }
 
-/// What a subscriber that missed events is sent before anything else:
-/// the note, and a restart of every output it may hold part of (only
-/// kept outputs ever went out).
-fn missed(outputs: Option<&KeptOutputs>) -> Vec<AttachEvent> {
-    let restarts = outputs
-        .into_iter()
-        .flat_map(|kept| &kept.outputs)
-        .map(|(path, _)| event(attach_event::Event::OutputRestart(path.clone())));
-    iter::once(event(attach_event::Event::Log(TRUNCATED.into())))
-        .chain(restarts)
-        .collect()
+/// Where one client is in the log.
+#[derive(Default)]
+struct Cursor {
+    at: usize,
+    /// Told of the lines missed since the last line sent.
+    told: bool,
+    /// It missed some of the log, or came after the build's end.
+    behind: bool,
 }
 
-/// Bring a subscriber that missed events to the end of the build:
-/// `missed`, every output from the start out of the chunk cache if the
-/// build succeeded, then the verdict. Without a verdict it is told to
-/// resubmit. Once the verdict is sent, and with it the last chunk read,
-/// it logs how long after the build `ended`.
-async fn catch_up(
-    tx: EventTx,
-    id: String,
-    outputs: Option<Arc<KeptOutputs>>,
-    ending: Vec<AttachEvent>,
-    ended: Instant,
-) {
-    let gone = || {
-        Err(Status::unavailable(
-            "build is no longer in flight; resubmit",
-        ))
-    };
-    for ev in missed(outputs.as_deref()) {
-        if tx.send(Ok(ev)).await.is_err() {
-            return;
+enum Next {
+    Send(AttachEvent),
+    /// A chunk whose bytes went, from the cache.
+    Read(Arc<KeptOutputs>, String, Hash, usize),
+    /// The verdict, and when the build ended if the client is behind.
+    Verdict(AttachEvent, Option<Instant>),
+    Resubmit,
+    /// Behind what the log keeps, the build still on.
+    Exhausted,
+    Wait,
+}
+
+impl ReplayInner {
+    /// The step after `c`.
+    fn next(&self, c: &mut Cursor) -> Next {
+        loop {
+            let (held, gone) = if c.at < self.base {
+                if c.at < self.forgot {
+                    return match self.ended {
+                        Some(_) => Next::Resubmit,
+                        None => Next::Exhausted,
+                    };
+                }
+                if c.at < self.lost && !c.told {
+                    (c.told, c.behind) = (true, true);
+                    return Next::Send(event(attach_event::Event::Log(TRUNCATED.into())));
+                }
+                let i = self.went.partition_point(|h| h.seq < c.at);
+                match self.went.get(i) {
+                    Some(held) => (held, true),
+                    None => {
+                        c.at = self.base;
+                        continue;
+                    }
+                }
+            } else {
+                match self.events.get(c.at - self.base) {
+                    Some(held) => (held, false),
+                    None => break,
+                }
+            };
+            let i = held.seq;
+            c.at = i + 1;
+            match held.event.event.as_ref() {
+                Some(attach_event::Event::Log(_)) => {
+                    c.told = false;
+                    return Next::Send(held.event.clone());
+                }
+                Some(attach_event::Event::Output(o)) => {
+                    let path = &o.store_path;
+                    // One a later restart superseded: that restart follows.
+                    if self.superseded(path, i) {
+                        continue;
+                    }
+                    if !gone || o.eof {
+                        return Next::Send(held.event.clone());
+                    }
+                    let recipe = self.outputs.as_ref().and_then(|kept| {
+                        let (_, recipe) = kept.outputs.iter().find(|(p, _)| p == path)?;
+                        Some((kept.clone(), *recipe.get(held.nth)?))
+                    });
+                    return match recipe {
+                        Some((kept, (hash, size))) => Next::Read(kept, path.clone(), hash, size),
+                        None => Next::Resubmit,
+                    };
+                }
+                Some(attach_event::Event::ExitCode(_) | attach_event::Event::Error(_)) => {
+                    let ended = self.ended.filter(|_| c.behind);
+                    return Next::Verdict(held.event.clone(), ended);
+                }
+                _ => return Next::Send(held.event.clone()),
+            }
+        }
+        if self.ended.is_some() {
+            Next::Resubmit
+        } else {
+            Next::Wait
         }
     }
-    let succeeded = ending
-        .iter()
-        .any(|e| matches!(e.event, Some(attach_event::Event::ExitCode(0))));
-    if ending.is_empty() || (succeeded && outputs.is_none()) {
-        let _ = tx.send(gone()).await;
-        return;
+
+    /// Whether a restart of `path` after `i` superseded its event `i`.
+    fn superseded(&self, path: &str, i: usize) -> bool {
+        self.paths.get(path).is_some_and(|p| i < p.restart)
     }
-    if let Some(kept) = outputs.filter(|_| succeeded) {
-        for (path, recipe) in &kept.outputs {
-            let nar = |zstd_nar_chunk, eof| {
-                Ok(event(attach_event::Event::Output(OutputNar {
-                    store_path: path.clone(),
-                    zstd_nar_chunk,
-                    eof,
-                })))
-            };
-            for (hash, size) in recipe.iter() {
-                let Ok(frame) = kept.cache.read_checked(hash, *size).await else {
+
+    /// Past the cap, drop the oldest events: a log line for good, a chunk's
+    /// bytes to be read back from the cache; then, if what went alone is
+    /// past it, the oldest of that, a client behind it resubmitting.
+    fn trim(&mut self, id: &str) {
+        while self.bytes > self.cap.unwrap_or(MAX_REPLAY_BYTES) {
+            if let Some(mut held) = self.events.pop_front() {
+                self.base += 1;
+                self.bytes -= cost(&held.event);
+                match held.event.event.as_mut() {
+                    Some(attach_event::Event::Log(_)) => self.lost = held.seq + 1,
+                    Some(attach_event::Event::Output(o))
+                        if self.superseded(&o.store_path, held.seq) => {}
+                    ev => {
+                        if let Some(attach_event::Event::Output(o)) = ev {
+                            o.zstd_nar_chunk = Vec::new();
+                        }
+                        self.bytes += cost(&held.event);
+                        self.went.push_back(held);
+                    }
+                }
+            } else if let Some(held) = self.went.pop_front() {
+                self.bytes -= cost(&held.event);
+                self.forgot = held.seq + 1;
+            } else {
+                return;
+            }
+            if !mem::replace(&mut self.overflowed, true) {
+                tracing::warn!(
+                    id,
+                    "replay buffer cap reached; clients behind it miss its oldest log lines, \
+                     and once only chunk records are left, are refused until the build ends"
+                );
+            }
+        }
+    }
+}
+
+/// One client reading the log from the start at its own pace, until the
+/// verdict. Its stream ends without one once the build ended without one,
+/// or a chunk it needs left the cache: attach then resubmits (attach.rs).
+/// Behind what the log keeps while the build runs, it is refused
+/// (EXHAUSTED), which attach does not retry.
+async fn read(replay: Arc<Replay>, tx: EventTx) {
+    let id = &replay.id;
+    let mut c = Cursor {
+        behind: replay.inner.lock().await.ended.is_some(),
+        ..Cursor::default()
+    };
+    loop {
+        let grew = replay.grew.notified();
+        tokio::pin!(grew);
+        grew.as_mut().enable();
+        let next = replay.inner.lock().await.next(&mut c);
+        let ev = match next {
+            Next::Send(ev) => ev,
+            Next::Read(kept, path, hash, size) => {
+                let Ok(frame) = kept.cache.read_checked(&hash, size).await else {
                     tracing::warn!(
                         id,
                         path,
                         "output chunk left the hub's cache; client resubmits"
                     );
-                    let _ = tx.send(gone()).await;
-                    return;
+                    break;
                 };
-                if tx.send(nar(frame, false)).await.is_err() {
-                    return;
+                event(attach_event::Event::Output(OutputNar {
+                    store_path: path,
+                    zstd_nar_chunk: frame,
+                    eof: false,
+                }))
+            }
+            Next::Verdict(ev, ended) => {
+                if tx.send(Ok(ev)).await.is_ok()
+                    && let Some(ended) = ended
+                {
+                    tracing::info!(
+                        id,
+                        after_end_ms =
+                            u64::try_from(ended.elapsed().as_millis()).unwrap_or(u64::MAX),
+                        "attach subscriber caught up"
+                    );
+                }
+                break;
+            }
+            Next::Resubmit => break,
+            Next::Exhausted => {
+                let _ = tx.send(Err(Status::resource_exhausted(EXHAUSTED))).await;
+                break;
+            }
+            Next::Wait => {
+                tokio::select! {
+                    () = &mut grew => continue,
+                    () = tx.closed() => break,
                 }
             }
-            if tx.send(nar(Vec::new(), true)).await.is_err() {
-                return;
-            }
-        }
-    }
-    for ev in ending {
+        };
         if tx.send(Ok(ev)).await.is_err() {
-            return;
+            break;
         }
     }
-    tracing::info!(
-        id,
-        after_end_ms = u64::try_from(ended.elapsed().as_millis()).unwrap_or(u64::MAX),
-        "attach subscriber caught up"
-    );
+    let mut inner = replay.inner.lock().await;
+    inner.subs.retain(|s| !s.same_channel(&tx));
 }
 
 /// Release a finished build's outputs from the cache's pin once
@@ -213,17 +370,6 @@ async fn unpin_after(kept: Weak<KeptOutputs>) {
     }
 }
 
-fn event_size(ev: &attach_event::Event) -> usize {
-    match ev {
-        attach_event::Event::Log(d) => d.len(),
-        attach_event::Event::Output(o) => o.zstd_nar_chunk.len(),
-        attach_event::Event::OutputRestart(p) | attach_event::Event::Dispatched(p) => p.len(),
-        attach_event::Event::Error(e) => e.len(),
-        attach_event::Event::ExitCode(_) => 0,
-    }
-    .saturating_add(64)
-}
-
 impl Replay {
     pub(in crate::hub) fn new(id: String) -> Self {
         Self {
@@ -232,122 +378,57 @@ impl Replay {
         }
     }
 
+    /// Append `ev` to the log; waits for no client.
     pub(in crate::hub) async fn publish(&self, ev: attach_event::Event) {
-        let sz = event_size(&ev);
         if matches!(ev, attach_event::Event::Dispatched(_)) {
             self.told_waiting.store(0, Ordering::Relaxed);
         }
-        let streaming = match ev {
-            attach_event::Event::Output(_) => Some(true),
-            attach_event::Event::OutputRestart(_) => Some(false),
-            _ => None,
-        };
-        let ending = matches!(
-            ev,
-            attach_event::Event::ExitCode(_) | attach_event::Event::Error(_)
-        );
         let ev = AttachEvent { event: Some(ev) };
         let mut inner = self.inner.lock().await;
-        if let Some(streaming) = streaming {
-            inner.streaming = streaming;
-        }
-        if ending {
-            inner.ending.push(ev.clone());
-        }
-        if !inner.streaming && !inner.behind.is_empty() {
-            let preamble = missed(inner.outputs.as_deref());
-            for tx in mem::take(&mut inner.behind) {
-                // Room for the preamble and this event, or it stays.
-                if tx.capacity() > preamble.len() {
-                    for ev in &preamble {
-                        let _ = tx.try_send(Ok(ev.clone()));
+        let (i, mut nth) = (inner.base + inner.events.len(), 0);
+        match &ev.event {
+            Some(attach_event::Event::Output(o)) if !o.eof => {
+                let out = inner.paths.entry(o.store_path.clone()).or_default();
+                (nth, out.chunks) = (out.chunks, out.chunks + 1);
+            }
+            Some(attach_event::Event::OutputRestart(path)) => {
+                let restart = Output {
+                    restart: i,
+                    ..Output::default()
+                };
+                inner.paths.insert(path.clone(), restart);
+                // The chunks it supersedes need not be read back.
+                let mut freed = 0;
+                inner.went.retain(|h| match h.event.event.as_ref() {
+                    Some(attach_event::Event::Output(o)) if o.store_path == *path => {
+                        freed += cost(&h.event);
+                        false
                     }
-                    inner.rejoined.push(tx);
-                } else if !tx.is_closed() {
-                    inner.behind.push(tx);
-                }
+                    _ => true,
+                });
+                inner.bytes -= freed;
             }
+            _ => {}
         }
-        for tx in mem::take(&mut inner.subs) {
-            match tokio::time::timeout(SUB_STALL, tx.send(Ok(ev.clone()))).await {
-                Ok(Ok(())) => inner.subs.push(tx),
-                Ok(Err(_)) => {}
-                Err(_) => {
-                    // Slow, not gone: it still counts as attached.
-                    tracing::warn!(
-                        id = self.id,
-                        "attach subscriber stalled; it catches up later"
-                    );
-                    inner.behind.push(tx);
-                }
-            }
-        }
-        for tx in mem::take(&mut inner.rejoined) {
-            match tx.try_send(Ok(ev.clone())) {
-                Ok(()) => inner.rejoined.push(tx),
-                Err(TrySendError::Full(_)) => inner.behind.push(tx),
-                Err(TrySendError::Closed(_)) => {}
-            }
-        }
-        if inner.overflowed {
-            return;
-        }
-        if inner.bytes + sz > MAX_REPLAY_BYTES {
-            tracing::warn!(
-                id = self.id,
-                "replay buffer cap reached; late subscribers miss the log so far"
-            );
-            inner.overflowed = true;
-            inner.events.clear();
-            inner.bytes = 0;
-            return;
-        }
-        inner.bytes += sz;
-        inner.events.push(ev);
+        inner.bytes += cost(&ev);
+        inner.events.push_back(Held {
+            seq: i,
+            event: ev,
+            nth,
+        });
+        inner.trim(&self.id);
+        drop(inner);
+        self.grew.notify_waiters();
     }
 
-    pub(in crate::hub) async fn subscribe(&self) -> mpsc::Receiver<Result<AttachEvent, Status>> {
+    pub(in crate::hub) async fn subscribe(
+        self: &Arc<Self>,
+    ) -> mpsc::Receiver<Result<AttachEvent, Status>> {
         self.hold.lock().unwrap().clientless = None;
-        let mut inner = self.inner.lock().await;
-        if inner.overflowed {
-            // The backlog is gone. Follow live from here; joining in
-            // the middle of an output, wait behind like a stalled one.
-            let (tx, rx) = mpsc::channel(SUB_CHANNEL_SLACK);
-            if let Some(ended) = inner.ended {
-                let (outputs, ending) = (inner.outputs.clone(), inner.ending.clone());
-                tokio::spawn(catch_up(tx, self.id.clone(), outputs, ending, ended));
-            } else if inner.streaming {
-                inner.behind.push(tx);
-            } else {
-                let _ = tx.try_send(Ok(event(attach_event::Event::Log(TRUNCATED.into()))));
-                inner.subs.push(tx);
-            }
-            return rx;
-        }
-        // Enough capacity for the whole backlog plus live slack (and
-        // one error slot), so the snapshot below cannot drop events.
-        let (tx, rx) = mpsc::channel(inner.events.len() + SUB_CHANNEL_SLACK);
-        for ev in &inner.events {
-            let _ = tx.try_send(Ok(ev.clone()));
-        }
-        if inner.ended.is_some() {
-            // Finished without a verdict in the backlog (e.g. the job
-            // was dropped as abandoned between the dedupe lookup and
-            // this subscribe): an error beats a silently empty stream.
-            let concluded = inner.events.iter().any(|e| {
-                matches!(
-                    e.event,
-                    Some(attach_event::Event::ExitCode(_) | attach_event::Event::Error(_))
-                )
-            });
-            if !concluded {
-                let _ = tx.try_send(Err(Status::unavailable(
-                    "build is no longer in flight; resubmit",
-                )));
-            }
-        } else {
-            inner.subs.push(tx);
-        }
+        let (tx, rx) = mpsc::channel(SUB_CHANNEL_SLACK);
+        // Before the reader, which takes it out when it ends.
+        self.inner.lock().await.subs.push(tx.clone());
+        tokio::spawn(read(self.clone(), tx));
         rx
     }
 
@@ -396,43 +477,30 @@ impl Replay {
         self.inner.lock().await.outputs = Some(Arc::new(outputs));
     }
 
-    /// A requeue restarted the latest delivery's outputs, and the next
-    /// attempt delivers its own: leave their chunks to the cache.
-    /// `missed` needs only their paths.
+    /// A requeue restarted the latest delivery's outputs (every chunk sent
+    /// so far is superseded), and the next attempt delivers its own: leave
+    /// their chunks to the cache.
     pub(in crate::hub) async fn unpin_outputs(&self) {
-        if let Some(kept) = &self.inner.lock().await.outputs {
-            kept.unpin();
-        }
+        self.inner.lock().await.outputs = None;
     }
 
-    /// Close all subscriber streams; those behind catch up first.
+    /// The build ended: a client still reading gets the rest, then the
+    /// verdict, or its stream ends without one.
     pub(in crate::hub) async fn finish(&self) {
         let mut inner = self.inner.lock().await;
-        let ended = Instant::now();
-        inner.ended = Some(ended);
-        inner.subs.clear();
-        inner.rejoined.clear();
-        for tx in mem::take(&mut inner.behind) {
-            if !tx.is_closed() {
-                let (outputs, ending) = (inner.outputs.clone(), inner.ending.clone());
-                tokio::spawn(catch_up(tx, self.id.clone(), outputs, ending, ended));
-            }
-        }
+        inner.ended = Some(Instant::now());
         if let Some(kept) = &inner.outputs {
             tokio::spawn(unpin_after(Arc::downgrade(kept)));
         }
+        drop(inner);
+        self.grew.notify_waiters();
     }
 
     /// Any attach client still listening? Subscribers whose stream was
-    /// dropped count as gone even before publish() prunes them.
+    /// dropped count as gone even before their readers prune them.
     pub(in crate::hub) async fn has_subscribers(&self) -> bool {
         let inner = self.inner.lock().await;
-        inner
-            .subs
-            .iter()
-            .chain(&inner.rejoined)
-            .chain(&inner.behind)
-            .any(|tx| !tx.is_closed())
+        inner.subs.iter().any(|tx| !tx.is_closed())
     }
 }
 

@@ -169,7 +169,7 @@ async fn a_run_of_failures_comes_to_its_verdict() {
                 break;
             }
         }
-        let told = told(&mut client).0.len();
+        let told = told(&mut client).await.0.len();
         match (verdict, failed) {
             (Some((at, says)), Some((a, e))) => {
                 assert!(a == at && e.contains(says), "row {n}: failed at {a}: {e}");

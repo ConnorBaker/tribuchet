@@ -60,6 +60,12 @@ impl Captured {
         log.lines().any(|l| needles.iter().all(|n| l.contains(n)))
     }
 
+    /// How many captured lines contain `needle`.
+    pub(super) fn count(&self, needle: &str) -> usize {
+        let log = SINK.with(|s| String::from_utf8(s.borrow().clone()).unwrap());
+        log.lines().filter(|l| l.contains(needle)).count()
+    }
+
     /// The first captured line containing `needle`.
     pub(super) fn line(&self, needle: &str) -> String {
         let log = SINK.with(|s| String::from_utf8(s.borrow().clone()).unwrap());
