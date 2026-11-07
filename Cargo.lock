@@ -1501,7 +1501,7 @@ checksum = "439ee305def115ba05938db6eb1644ff94165c5ab5e9420d1c1bcedbba909391"
 [[package]]
 name = "presto-pasta"
 version = "0.0.8"
-source = "git+https://github.com/ConnorBaker/presto-pasta?rev=eb64bdcced52217923c6f7f425e543c38f2a62b5#eb64bdcced52217923c6f7f425e543c38f2a62b5"
+source = "git+https://github.com/ConnorBaker/presto-pasta?rev=182057288da497abd8df029467224122c557741d#182057288da497abd8df029467224122c557741d"
 dependencies = [
  "foldhash 0.2.0",
  "io-uring",

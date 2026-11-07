@@ -53,9 +53,10 @@ harmonia-store-path-info = { git = "https://github.com/nix-community/harmonia", 
 rusqlite = "0.40"
 harmonia-store-db = { git = "https://github.com/nix-community/harmonia", rev = "10a2228f94956fb568dfc799a1c918484bf33653" }
 harmonia-store-remote = { git = "https://github.com/nix-community/harmonia", rev = "10a2228f94956fb568dfc799a1c918484bf33653" }
-# presto-pasta 0.0.8 with fixes the FOD sandboxes need that are in no
-# release yet: a guest connect the host cannot make is answered at once,
-# and the caller can leave the guest without IPv6 where the host has no
-# IPv6 default route its connects can use. They are commits on its
-# v0.0.8 tag, written for an upstream pull request.
-presto-pasta = { git = "https://github.com/ConnorBaker/presto-pasta", rev = "eb64bdcced52217923c6f7f425e543c38f2a62b5" }
+# presto-pasta's main branch with fixes the FOD sandboxes need that are
+# in no release yet: a guest connect the host cannot make, or a flow the
+# policy refuses, is answered at once, and the caller can leave the guest
+# without IPv6 where the host has no IPv6 default route its connects can
+# use. They are commits on upstream main: the answers are written for
+# upstream pull requests, and the IPv6 switch is kept only here.
+presto-pasta = { git = "https://github.com/ConnorBaker/presto-pasta", rev = "182057288da497abd8df029467224122c557741d" }
