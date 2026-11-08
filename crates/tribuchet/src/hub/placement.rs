@@ -1,42 +1,31 @@
 //! What placement knows of each worker session: its admission, which the
 //! clientless decider reads, its size, and what the builds handed to it
 //! are expected to use; what builds used, learned from their runs
-//! (history.rs) and kept across restarts in a file; and the dispatch log
-//! line. A queued build goes to the worker that asks for it unless
+//! (history.rs), the fold of the build record (record.rs); and the
+//! dispatch's log line and record row. A queued build goes to the worker that asks for it unless
 //! another with an idle agent would be less full with it (rank.rs).
 
 use std::collections::HashMap;
-use std::fs::{self, File, TryLockError};
-use std::io;
-use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+
+use rusqlite::types::Value;
 
 use super::Admission;
 use super::naming::drv_name;
-use super::state::{HubState, Job, write_newest};
+use super::record::{Recorder, Rest, Row, int, now_ms, result_row, val};
+use super::state::{HubState, Job};
 use crate::proto::{BuildUsage, Register};
 
 #[path = "placement/history.rs"]
 mod history;
 #[path = "placement/rank.rs"]
 mod rank;
-#[path = "placement/seed.rs"]
-mod seed;
-#[cfg(test)]
-#[path = "placement/tests.rs"]
-mod tests;
 #[cfg(test)]
 pub(super) use history::Level;
 pub(super) use history::{Build, Demand, Expected, History};
 #[cfg(test)]
 pub(super) use rank::GRACE;
 pub(super) use rank::{Room, Rooms, Size};
-pub use seed::seed_history;
-
-/// How often a changed history is written. It is a cache: a crash
-/// loses at most this much learning.
-pub(super) const SAVE_EVERY: Duration = Duration::from_mins(5);
 
 /// What history knows `job` by.
 pub(super) fn build_of(job: &Job) -> Build<'_> {
@@ -88,8 +77,10 @@ impl Session {
 pub(super) struct Placement {
     /// Each worker session, by session id.
     pub(super) sessions: HashMap<u64, Session>,
-    /// What builds used, by key.
+    /// What builds used, by key: the record's fold.
     pub(super) history: History,
+    /// Where the record's rows go; None where the hub holds no record.
+    pub(super) record: Option<Recorder>,
 }
 
 impl Placement {
@@ -111,9 +102,20 @@ impl Placement {
         self.history.expect(&build_of(job))
     }
 
-    /// Learn from a finished run of `job`.
-    pub(super) fn learn(&mut self, job: &Job, exit_code: i32, u: &BuildUsage) {
-        self.history.record(&build_of(job), exit_code, u);
+    /// Learn from a finished run of `job`, and append it to the record,
+    /// in one step: the history stays the record's fold. The send never
+    /// waits.
+    pub(super) fn learn(&mut self, job: &Job, exit_code: i32, u: &BuildUsage, rest: Rest) {
+        let build = build_of(job);
+        self.history.record(&build, exit_code, u);
+        self.append(result_row(&build, exit_code, u, rest));
+    }
+
+    /// Hand `row` to the record's writer, if there is one.
+    pub(super) fn append(&self, row: Row) {
+        if let Some(record) = &self.record {
+            record.send(row);
+        }
     }
 
     /// `job` went to `session`: its expected demand counts there until
@@ -154,12 +156,11 @@ fn room(id: u64, s: &Session) -> Room {
 }
 
 /// Count `job`'s expected demand against worker session `to` (id and
-/// name), and log the dispatch with the declaration that admitted it,
-/// the features it declares, how many other workers that serve it have
-/// an idle agent, what it is expected to use, and the worker's size and
-/// expected load with it. Where that load is more memory than the worker
-/// has, say so: nothing holds a build back for memory (DESIGN.md,
-/// Placement).
+/// name); log the dispatch, and append its record row, with the
+/// declaration that admitted it, its features, how many other workers
+/// that serve it have an idle agent, what it is expected to use, and the
+/// worker's size and expected load with it. Over-memory is only logged:
+/// nothing holds a build back for memory (DESIGN.md, Placement).
 pub(super) fn dispatch(
     state: &HubState,
     to: (u64, &str),
@@ -172,7 +173,7 @@ pub(super) fn dispatch(
         (a.capacity, a.assignments, a.free, a.sent)
     };
     let e = job.expected;
-    let (idle_elsewhere, room) = {
+    let (idle_elsewhere, room, record) = {
         let workers = state.worker_caps.lock().unwrap();
         let mut placement = state.placement.lock().unwrap();
         let room = placement.dispatched(to.0, job);
@@ -181,10 +182,39 @@ pub(super) fn dispatch(
         };
         let rooms = placement.rooms();
         let idle = rooms.iter().filter(|r| r.id != to.0 && r.idle > 0);
-        (idle.filter(serves).count(), room)
+        (idle.filter(serves).count(), room, placement.record.clone())
     };
     let load = room.as_ref().map(|r| r.load);
     let memory = room.as_ref().and_then(|r| r.size.memory);
+    if let Some(record) = record {
+        let values = vec![
+            Value::Integer(now_ms()),
+            job.id.clone().into(),
+            job.key.clone().into(),
+            to.1.to_owned().into(),
+            val(drv_name(&job.req).map(str::to_owned)),
+            resumed.into(),
+            capacity.into(),
+            assignments.map_or(Value::Null, int),
+            free.into(),
+            int(sent),
+            job.features.join(",").into(),
+            int(u64::try_from(idle_elsewhere).unwrap_or(u64::MAX)),
+            e.level.name().to_owned().into(),
+            int(bytes(e.demand.memory)),
+            e.demand.cores.into(),
+            val(e.secs),
+            e.oom.into(),
+            load.map_or(Value::Null, |l| int(bytes(l.memory))),
+            val(load.map(|l| l.cores)),
+            memory.map_or(Value::Null, |m| int(bytes(m))),
+            val(room.as_ref().map(|r| r.size.cores)),
+        ];
+        record.send(Row {
+            table: "dispatch",
+            values,
+        });
+    }
     tracing::info!(
         id = job.id,
         worker = to.1,
@@ -228,132 +258,4 @@ pub(super) fn bytes(memory: f64) -> u64 {
 /// `x` to three decimals, for a log line.
 pub(super) fn round3(x: f64) -> f64 {
     (x * 1000.0).round() / 1000.0
-}
-
-/// The history's file, and the number of the newest copy written
-/// (write_newest): the saves every SAVE_EVERY and at SIGTERM may
-/// overlap, and leave the newest.
-pub(super) struct HistoryFile {
-    pub(super) path: PathBuf,
-    written: Arc<Mutex<u64>>,
-    /// The file's lock, held while the hub runs: seed-history refuses to
-    /// seed beside it. None where it could not be taken or the file could
-    /// not be loaded, and then the history is never saved.
-    lock: Option<File>,
-}
-
-impl HistoryFile {
-    /// Write copy number `generation`, if the hub holds the lock.
-    fn write(&self, generation: u64, history: &History) {
-        if self.lock.is_none() {
-            return;
-        }
-        let json = match serde_json::to_string(history) {
-            Ok(json) => json,
-            Err(e) => return tracing::warn!("failed to serialise placement history: {e}"),
-        };
-        write_newest(
-            &self.written,
-            generation,
-            &self.path,
-            &json,
-            "placement history",
-        );
-    }
-}
-
-/// The lock on the history file at `path`, `path` and ".lock", creating
-/// its directory: None while another holds it, a hub or seed-history. The
-/// file is opened only to read where it exists: a lock left by a run as
-/// another user locks too.
-pub(super) fn lock_history(path: &Path) -> io::Result<Option<File>> {
-    if let Some(dir) = path.parent() {
-        fs::create_dir_all(dir)?;
-    }
-    let mut name = path.as_os_str().to_owned();
-    name.push(".lock");
-    let file = match File::open(&name) {
-        Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            File::create_new(&name).or_else(|_| File::open(&name))?
-        }
-        file => file?,
-    };
-    match file.try_lock() {
-        Ok(()) => Ok(Some(file)),
-        Err(TryLockError::WouldBlock) => Ok(None),
-        Err(TryLockError::Error(e)) => Err(e),
-    }
-}
-
-/// Save the history if it changed: a copy taken, and numbered, under the
-/// placement lock (History::changed), serialised and written on a
-/// blocking thread, outside it: no file I/O on the runtime or under a
-/// lock. A save that fails is warned of, and not tried again until the
-/// history changes.
-pub(super) async fn save_history(state: &HubState, file: &Arc<HistoryFile>) {
-    let copy = state.placement.lock().unwrap().history.changed();
-    let Some((generation, history)) = copy else {
-        return;
-    };
-    let file = file.clone();
-    let _ = tokio::task::spawn_blocking(move || file.write(generation, &history)).await;
-}
-
-/// Whether `path` is named as a history file's own temporary file or
-/// lock is (it ends .tmp or .lock): seeding beside such a history would
-/// remove or lock it, so neither a hub nor seed-history takes one.
-pub(super) fn reserved_name(path: &Path) -> bool {
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    name.ends_with(".tmp") || name.ends_with(".lock")
-}
-
-/// Lock the history file at `path` and load it into `state`, on a
-/// blocking thread, before the hub serves anything. A hub that cannot take
-/// the lock, which another hub or seed-history holds, loads the file but
-/// never saves it; one that cannot read or parse it (an old format, its
-/// permissions) starts empty and never saves over it, the only copy; and
-/// one at a reserved_name neither loads nor saves.
-pub(super) async fn open_history(state: &HubState, path: PathBuf) -> Arc<HistoryFile> {
-    let owned = path.clone();
-    let opened = tokio::task::spawn_blocking(move || {
-        if reserved_name(&owned) {
-            let e = io::Error::other("its name ends .tmp or .lock, a history file's own");
-            return (Err(e), Ok(History::default()));
-        }
-        let lock = lock_history(&owned).and_then(|l| l.ok_or(io::ErrorKind::WouldBlock.into()));
-        (lock, History::load(&owned))
-    });
-    let (lock, loaded) = opened
-        .await
-        .unwrap_or_else(|e| (Err(io::Error::other(e)), Ok(History::default())));
-    let (lock, history) = match loaded {
-        Ok(history) => {
-            if let Err(e) = &lock {
-                tracing::warn!(path = %path.display(), "placement history not locked, so never saved: {e}");
-            }
-            (lock.ok(), history)
-        }
-        Err(e) => {
-            tracing::warn!(path = %path.display(), "placement history unreadable, so never saved over: {e}");
-            (None, History::default())
-        }
-    };
-    let (keys, entries) = history.len();
-    tracing::info!(path = %path.display(), keys, entries, "placement history loaded");
-    state.placement.lock().unwrap().history = history;
-    Arc::new(HistoryFile {
-        path,
-        written: Arc::default(),
-        lock,
-    })
-}
-
-/// Save the history every SAVE_EVERY while it changes.
-pub(super) async fn keep_history(state: Arc<HubState>, file: Arc<HistoryFile>) {
-    let mut tick = tokio::time::interval(SAVE_EVERY);
-    tick.tick().await;
-    loop {
-        tick.tick().await;
-        save_history(&state, &file).await;
-    }
 }

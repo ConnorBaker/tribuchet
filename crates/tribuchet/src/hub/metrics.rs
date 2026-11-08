@@ -11,6 +11,7 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+use super::record::Tally;
 use super::state::HubState;
 use crate::errors::{Result, err_ctx};
 use crate::proto::BuildUsage;
@@ -185,7 +186,7 @@ fn render_histograms(out: &mut String, m: &Metrics) {
 }
 
 /// Render the current metrics in Prometheus text exposition format.
-async fn render(state: &HubState) -> String {
+pub(super) async fn render(state: &HubState) -> String {
     let m = &state.metrics;
     let mut out = String::new();
     let counters = [
@@ -253,6 +254,36 @@ async fn render(state: &HubState) -> String {
         }
     }
     render_histograms(&mut out, m);
+    let tally = (state.placement.lock().unwrap().record.as_ref()).map(|r| r.tally.clone());
+    let load = |t: &Tally| {
+        (
+            t.uncommitted.load(Ordering::Relaxed),
+            t.failed.load(Ordering::Relaxed),
+        )
+    };
+    let (uncommitted, failed) = tally.as_deref().map_or((0, 0), load);
+    for (name, kind, help, value) in [
+        (
+            "tribuchet_hub_record_writing",
+            "gauge",
+            "1 while the hub writes its build record; 0 where it could not take it.",
+            u64::from(tally.is_some()),
+        ),
+        (
+            "tribuchet_hub_record_uncommitted_rows",
+            "gauge",
+            "Rows handed to the build record's writer and not yet committed.",
+            uncommitted,
+        ),
+        (
+            "tribuchet_hub_record_failed_commits_total",
+            "counter",
+            "Commits of the build record that failed; their rows are kept for the next.",
+            failed,
+        ),
+    ] {
+        metric(&mut out, name, kind, help, value);
+    }
 
     let mut queued: BTreeMap<String, u64> = BTreeMap::new();
     for j in state.queue.lock().await.iter() {
@@ -510,6 +541,9 @@ mod tests {
             has("tribuchet_system_slots{system=\"x86_64-linux\"} 12"),
             "{out}"
         );
+        assert!(has("tribuchet_hub_record_writing 0"), "{out}");
+        assert!(has("tribuchet_hub_record_uncommitted_rows 0"), "{out}");
+        assert!(has("tribuchet_hub_record_failed_commits_total 0"), "{out}");
     }
 
     #[test]

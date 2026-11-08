@@ -45,13 +45,15 @@ fn sandbox_defaults_off() {
     assert!(parse("sandbox = true").sandbox);
 }
 
-/// [placement] takes only the history's path: a hub.toml that still
-/// sets an arm or worker profiles fails to load.
+/// [placement] takes only the record's path: a hub.toml that still
+/// sets an arm, worker profiles or the retired history file fails to
+/// load.
 #[test]
-fn placement_takes_only_the_history_path() {
-    let cfg: HubConfig = toml::from_str("[placement]\nhistory = \"/x.json\"").unwrap();
-    assert_eq!(cfg.placement.history, Some(PathBuf::from("/x.json")));
+fn placement_takes_only_the_record_path() {
+    let cfg: HubConfig = toml::from_str("[placement]\nrecord = \"/x.sqlite\"").unwrap();
+    assert_eq!(cfg.placement.record, Some(PathBuf::from("/x.sqlite")));
     for gone in [
+        "history = \"/x.json\"",
         "arm = \"fcfs\"",
         "arm-file = \"/run/x\"",
         "admission = \"estimate\"",

@@ -111,10 +111,11 @@ pub struct HubConfig {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct PlacementConfig {
-    /// What builds used, kept across restarts. Defaults to
-    /// XDG_CACHE_HOME/tribuchet/placement-history.json.
+    /// The build record, whose fold is what placement learns (state,
+    /// not cache: the only copy). Defaults to
+    /// XDG_STATE_HOME/tribuchet/record.sqlite.
     #[serde(default)]
-    pub history: Option<PathBuf>,
+    pub record: Option<PathBuf>,
 }
 
 fn default_chunk_cache_bytes() -> u64 {
@@ -135,9 +136,14 @@ pub fn default_chunk_cache_dir() -> PathBuf {
     cache_dir().join("chunks")
 }
 
-/// XDG_CACHE_HOME/tribuchet/placement-history.json.
-pub fn default_placement_history() -> PathBuf {
-    cache_dir().join("placement-history.json")
+/// XDG_STATE_HOME/tribuchet/record.sqlite, with the usual
+/// ~/.local/state fallback.
+pub fn default_record() -> PathBuf {
+    env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+        .unwrap_or_else(|| PathBuf::from("/var/lib"))
+        .join("tribuchet/record.sqlite")
 }
 
 /// A hub-maintained nix.conf fragment. A local nix.conf `include`s the

@@ -15,7 +15,7 @@ const GIB: f64 = 1_073_741_824.0;
 
 /// Worker `name` serving x86_64-linux with two agents, `cores` cores and
 /// `gib` GiB for its builds.
-fn sized_worker(state: &Arc<HubState>, name: &str, cores: u32, gib: u64) -> Worker {
+pub(super) fn sized_worker(state: &Arc<HubState>, name: &str, cores: u32, gib: u64) -> Worker {
     let register = Register {
         worker_name: name.into(),
         caps: vec![SystemCaps {
@@ -39,7 +39,7 @@ fn sized_worker(state: &Arc<HubState>, name: &str, cores: u32, gib: u64) -> Work
 
 /// A declaration of `capacity`, `free_slots` of it free slots, having
 /// seen `seen` assignments.
-fn declare(capacity: u32, free_slots: u32, seen: u64) -> WorkerMessage {
+pub(super) fn declare(capacity: u32, free_slots: u32, seen: u64) -> WorkerMessage {
     WorkerMessage {
         msg: Some(worker_message::Msg::RequestJob(RequestJob {
             capacity,
