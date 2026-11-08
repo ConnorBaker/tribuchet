@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use super::tests::{info, test_job};
 use super::*;
 use crate::chunkstore::io_hook;
+use crate::hub::testlog::Captured;
 
 /// Recipe size of every test chunk.
 const CHUNK: u64 = 1 << 20;
@@ -38,9 +39,10 @@ fn staged<'a>(
     staging
 }
 
-/// Ask `staging` for every chunk of the one manifest it sent.
+/// Ask `staging` for every chunk of the last manifest it sent.
 async fn need_all(staging: &mut Staging<'_>, out_tx: &mpsc::Sender<Result<HubMessage, Status>>) {
-    let hashes = staging.sent[0].1.iter().flat_map(|(h, _)| *h).collect();
+    let (_, recipe) = &**staging.sent.last().unwrap();
+    let hashes = recipe.iter().flat_map(|(h, _)| *h).collect();
     let need = Need {
         build_id: staging.job.id.clone(),
         paths: vec![],
@@ -136,4 +138,42 @@ async fn a_small_need_does_not_wait_for_a_large_one() {
         position(&frames, &small_job.id, true) < position(&frames, &big_job.id, true),
         "the small build's chunks waited for the large transfer"
     );
+}
+
+/// A worker sends a Need per late manifest, so a Need per input path:
+/// one build staging 18316 inputs logged 12,119 lines in 90 s, and
+/// journald dropped the hub's other lines. A build's Needs log one line.
+#[tokio::test]
+async fn a_builds_needs_log_one_line_with_their_sums() {
+    let log = Captured::default();
+    let _guard = log.install();
+    let state = HubState::for_test(Duration::from_secs(1));
+    let (job, sess) = (test_job(), WorkerSession::new("w1".into()));
+    let mut staging = Staging::new(&state, &job, &sess);
+    let (out_tx, mut out_rx) = mpsc::channel(1);
+    for i in 0..3 {
+        // a chunk the recipe repeats: its plaintext counts once
+        let recipe = Arc::new(vec![([i; 32], CHUNK), ([i; 32], CHUNK)]);
+        let path = format!("/nix/store/{i}-x");
+        staging.sent.push(Arc::new((info(&path, &[]), recipe)));
+        io_hook::off_runtime(|| state.chunks.admit([i; 32], &[i]).unwrap());
+        need_all(&mut staging, &out_tx).await;
+    }
+    let mut eofs = 0;
+    while eofs < 3 {
+        tokio::select! {
+            r = staging.progress(&out_tx), if staging.busy() => r.unwrap(),
+            m = out_rx.recv() => if let Some(hub_message::Msg::Chunk(c)) = m.unwrap().unwrap().msg {
+                eofs += usize::from(c.eof);
+            }
+        }
+    }
+    drop(staging);
+    assert!(!log.has(&["INFO", "need served"]), "a Need's own INFO line");
+    assert_eq!(log.count("needs served"), 1);
+    let line = log.line("needs served");
+    // three chunks of CHUNK plaintext bytes, sent as one-byte frames
+    let sums = "needs: 3, cached: 3, repacked: 0, plain_bytes: 3145728, wire_bytes: 3,";
+    assert!(line.contains(sums), "{line}");
+    assert!(line.contains(r#"worker="w1""#), "{line}");
 }
