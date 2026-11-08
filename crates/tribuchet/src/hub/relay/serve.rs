@@ -1,8 +1,9 @@
 //! Serving the chunks of a Need: cached frames as stored, uncached
 //! chunks by re-serializing the path that holds them.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, LazyLock};
 use std::thread;
 use std::time::Instant;
@@ -23,6 +24,23 @@ use crate::hub::relay::staging::{Info, WorkerSession};
 use crate::hub::state::Job;
 use crate::proto::{ChunkFrame, HubMessage, hub_message};
 
+/// What the hub served a build, summed over its Needs as they are
+/// served; chunks = cached + repacked. serve_ms includes the frames of
+/// the session's other Needs sent meanwhile. A Need cut off (the staging
+/// dropped mid-Need): plain_bytes and repacked count the chunks planned
+/// for the manifests it reached, cached only those of a finished cache
+/// pass, wire_bytes each frame handed to a send; needs and serve_ms
+/// leave it out.
+#[derive(Debug, Default)]
+pub(super) struct Served {
+    needs: AtomicU64,
+    cached: AtomicU64,
+    repacked: AtomicU64,
+    plain_bytes: AtomicU64,
+    wire_bytes: AtomicU64,
+    serve_ms: AtomicU64,
+}
+
 /// Each needed chunk ships once, from the first manifest holding it,
 /// each frame when this Need has the session's send permit.
 pub(super) async fn serve_need(
@@ -32,54 +50,40 @@ pub(super) async fn serve_need(
     needed: HashSet<Hash>,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
     sess: &WorkerSession,
+    total: &Served,
 ) -> Result<()> {
     let t0 = Instant::now();
-    let mut sizes: HashMap<Hash, u64> = HashMap::new();
-    for e in sent {
-        for (h, size) in e.1.iter().filter(|(h, _)| needed.contains(h)) {
-            sizes.entry(*h).or_insert(*size);
-        }
-    }
-    let plain_bytes: u64 = sizes.values().sum();
     let mut served: HashSet<Hash> = HashSet::new();
-    let (mut cached, mut repacked, mut wire_bytes) = (0usize, 0usize, 0u64);
     for e in sent {
         let (info, recipe) = &**e;
-        let todo: HashSet<Hash> = recipe
-            .iter()
-            .map(|(h, _)| *h)
-            .filter(|h| needed.contains(h) && !served.contains(h))
-            .collect();
+        let mut todo = HashSet::new();
+        for (h, size) in recipe.iter().filter(|(h, _)| needed.contains(h)) {
+            if served.insert(*h) {
+                todo.insert(*h);
+                total.plain_bytes.fetch_add(*size, Relaxed);
+            }
+        }
         if todo.is_empty() {
             continue;
         }
-        served.extend(&todo);
         let n = todo.len();
-        let rest = serve_cached(cache, &job.id, todo, out_tx, sess, &mut wire_bytes).await?;
-        cached += n - rest.len();
+        let rest = serve_cached(cache, &job.id, todo, out_tx, sess, &total.wire_bytes).await?;
+        total.cached.fetch_add((n - rest.len()) as u64, Relaxed);
         if rest.is_empty() {
             continue;
         }
-        repacked += rest.len();
+        total.repacked.fetch_add(rest.len() as u64, Relaxed);
         let path = &info.store_path;
-        stream_path_chunks(cache, job, path, rest, out_tx, sess, &mut wire_bytes).await?;
+        stream_path_chunks(cache, job, path, rest, out_tx, sess, &total.wire_bytes).await?;
     }
     if served.len() != needed.len() {
         return Err(err_msg("worker needs chunks outside every manifest"));
     }
-    // Per Need: what the hub sent each worker, and how fast. elapsed
-    // includes the frames of the session's other Needs sent meanwhile.
-    tracing::info!(
-        id = job.id,
-        worker = sess.worker,
-        chunks = served.len(),
-        cached,
-        repacked,
-        plain_bytes,
-        wire_bytes,
-        elapsed_ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX),
-        "need served"
-    );
+    let ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
+    total.serve_ms.fetch_add(ms, Relaxed);
+    total.needs.fetch_add(1, Relaxed);
+    // The build's sums so far: a Need's own are the step from the last.
+    tracing::debug!(id = job.id, worker = sess.worker, ?total, "need served");
     Ok(())
 }
 
@@ -152,7 +156,7 @@ async fn serve_cached(
     todo: HashSet<Hash>,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
     sess: &WorkerSession,
-    wire: &mut u64,
+    wire: &AtomicU64,
 ) -> Result<HashSet<Hash>> {
     let Some(frames) = cache.locate_all(&todo) else {
         return Ok(todo);
@@ -171,7 +175,7 @@ async fn serve_cached(
     });
     let mut rest = todo;
     while let Some((hash, frame)) = rx.recv().await {
-        *wire += frame.len() as u64;
+        wire.fetch_add(frame.len() as u64, Relaxed);
         send_frame(out_tx, sess, build_id, &hash, frame).await?;
         rest.remove(&hash);
     }
@@ -189,7 +193,7 @@ async fn stream_path_chunks(
     todo: HashSet<Hash>,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
     sess: &WorkerSession,
-    wire: &mut u64,
+    wire: &AtomicU64,
 ) -> Result<()> {
     let (tx, rx) = mpsc::channel::<Chunk>(cores());
     let path = store_path.to_string();
@@ -209,7 +213,7 @@ async fn stream_path_chunks(
         .buffered(cores());
     while let Some(frame) = frames.next().await {
         let (hash, frame) = frame.map_err(err_ctx("compress task panicked"))??;
-        *wire += frame.len() as u64;
+        wire.fetch_add(frame.len() as u64, Relaxed);
         send_frame(out_tx, sess, &job.id, &hash, frame).await?;
     }
     packer.await.map_err(err_ctx("pack task panicked"))?
@@ -240,52 +244,6 @@ fn frame_for(cache: &ChunkCache, chunk: &Chunk) -> Result<Vec<u8>> {
 mod tests {
     use super::*;
     use crate::chunkstore::io_hook;
-    use crate::hub::state::Replay;
-    use crate::hub::testlog::Captured;
-    use crate::hub::tests::job;
-    use crate::proto::PathInfoMsg;
-
-    /// Every chunk of the Need is cached: the line counts them as
-    /// cached and carries the recipe's plaintext and the frames' bytes.
-    #[tokio::test]
-    async fn the_need_line_carries_worker_chunks_and_bytes() {
-        let log = Captured::default();
-        let _guard = log.install();
-        let dir = tempfile::tempdir().unwrap();
-        let cache = Arc::new(ChunkCache::open(dir.path().to_path_buf(), 1 << 20).unwrap());
-        let (a, b): (Hash, Hash) = ([1; 32], [2; 32]);
-        let (fa, fb) = (
-            compress(b"hello", 3).unwrap(),
-            compress(b"world!!", 3).unwrap(),
-        );
-        let wire = fa.len() + fb.len();
-        io_hook::off_runtime(|| {
-            cache.admit(a, &fa).unwrap();
-            cache.admit(b, &fb).unwrap();
-        });
-        let job = job(1, Arc::new(Replay::default()));
-        let info = Info {
-            store_path: "/nix/store/x".into(),
-            msg: PathInfoMsg::default(),
-        };
-        let sent = [Arc::new((info, Arc::new(vec![(a, 5), (b, 7), (a, 5)])))];
-        let (tx, _rx) = mpsc::channel(8);
-        let sess = WorkerSession::new("w1".into());
-        serve_need(&cache, &job, &sent, [a, b].into(), &tx, &sess)
-            .await
-            .unwrap();
-        let line = log.line("need served");
-        for field in [
-            r#"worker="w1""#.to_owned(),
-            "chunks=2".to_owned(),
-            "cached=2".to_owned(),
-            "repacked=0".to_owned(),
-            "plain_bytes=12".to_owned(),
-            format!("wire_bytes={wire}"),
-        ] {
-            assert!(line.contains(&field), "{field} missing from {line}");
-        }
-    }
 
     #[tokio::test]
     async fn serve_cached_skips_repack_and_reports_leftovers() {
@@ -299,13 +257,13 @@ mod tests {
         let sess = WorkerSession::new("w".into());
 
         let todo: HashSet<Hash> = [a, b].into();
-        let mut wire = 0;
-        let rest = serve_cached(&cache, "b1", todo.clone(), &tx, &sess, &mut wire)
+        let wire = AtomicU64::default();
+        let rest = serve_cached(&cache, "b1", todo.clone(), &tx, &sess, &wire)
             .await
             .unwrap();
         assert_eq!(rest, todo);
 
-        let rest = serve_cached(&cache, "b1", [a].into(), &tx, &sess, &mut wire)
+        let rest = serve_cached(&cache, "b1", [a].into(), &tx, &sess, &wire)
             .await
             .unwrap();
         assert!(rest.is_empty());

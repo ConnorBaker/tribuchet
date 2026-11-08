@@ -17,7 +17,7 @@ use tonic::Status;
 
 use super::daemon::DaemonWait;
 use super::send;
-use super::serve::{compute_recipe, serve_need};
+use super::serve::{Served, compute_recipe, serve_need};
 use crate::chunker::parse_hashes;
 use crate::chunkio;
 use crate::chunkstore::Hash;
@@ -90,7 +90,20 @@ pub(super) struct Staging<'a> {
     /// reading the worker, so neither side blocks on a full peer.
     queued: VecDeque<HashSet<Hash>>,
     serving: Option<Serving<'a>>,
+    /// What its Needs were served (serve::Served), logged once as the
+    /// staging ends, however it ends: a line per Need (per late manifest)
+    /// flooded journald. On success the line comes after the outputs are
+    /// delivered. A hub killed outright (SIGKILL, the watchdog's SIGABRT,
+    /// the OOM killer) loses the line of every staging in flight.
+    served: Arc<Served>,
     first_need: bool,
+}
+
+impl Drop for Staging<'_> {
+    fn drop(&mut self) {
+        let (id, worker) = (&self.job.id, &self.sess.worker);
+        tracing::info!(id, worker, served = ?self.served, "needs served");
+    }
 }
 
 impl<'a> Staging<'a> {
@@ -106,6 +119,7 @@ impl<'a> Staging<'a> {
             tasks: FuturesUnordered::new(),
             queued: VecDeque::new(),
             serving: None,
+            served: Arc::default(),
             first_need: true,
         }
     }
@@ -196,8 +210,9 @@ impl<'a> Staging<'a> {
         // sent before it.
         let sent = self.sent.clone();
         let out_tx = out_tx.clone();
+        let served = self.served.clone();
         self.serving = Some(Box::pin(async move {
-            serve_need(cache, job, &sent, needed, &out_tx, sess).await?;
+            serve_need(cache, job, &sent, needed, &out_tx, sess, &served).await?;
             send(
                 &out_tx,
                 hub_message::Msg::Chunk(ChunkFrame {
