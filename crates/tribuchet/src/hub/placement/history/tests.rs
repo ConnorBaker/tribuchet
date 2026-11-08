@@ -82,19 +82,6 @@ fn a_key_expects_its_largest_recent_peak_and_median_timing() {
     assert_eq!(gib(h.expect(&v1)), 2.0, "after the window");
 }
 
-/// A window loaded longer than WINDOW, written with another, is cut to
-/// it by the next run.
-#[test]
-fn an_oversized_window_is_trimmed() {
-    let run = Run(1 << 30, 1000, 1000, true);
-    let mut runs = Runs {
-        runs: iter::repeat_n(run, 10).collect(),
-        oom: 0,
-    };
-    runs.push(run, false, WINDOW);
-    assert_eq!(runs.runs.len(), WINDOW);
-}
-
 /// A key whose runs were all OOM-killed takes its class's cores, where
 /// a run of the class succeeded, and no seconds.
 #[test]
@@ -267,40 +254,4 @@ fn an_even_count_takes_the_midpoint() {
     }
     let e = h.expect(&b);
     assert_eq!((e.demand.cores, e.secs), (3.0, Some(20.0)));
-}
-
-/// Each copy is numbered after the last, so that of two saves the newer
-/// is kept (write_newest).
-#[test]
-fn copies_are_numbered_in_the_order_taken() {
-    let mut h = History::default();
-    let b = build("foo-1.0", true);
-    let mut number = || {
-        h.record(&b, 0, &usage(3, 5, 7));
-        h.changed().expect("changed").0
-    };
-    assert_eq!([number(), number()], [1, 2]);
-}
-
-#[test]
-fn history_survives_a_save_and_a_load() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("h.json");
-    let mut h = History::default();
-    let b = build("foo-1.0", true);
-    h.record(&b, 0, &usage(3, 5, 7));
-    let (_, copy) = h.changed().expect("changed");
-    assert!(h.changed().is_none(), "unchanged since");
-    fs::write(&path, serde_json::to_string(&copy).unwrap()).unwrap();
-    let loaded = History::load(&path).unwrap();
-    assert_eq!(loaded.expect(&b), h.expect(&b));
-    // One key, one prefix (itself), one class.
-    assert_eq!(loaded.len(), (1, 3));
-    fs::write(&path, "{").unwrap();
-    assert!(History::load(&path).is_err(), "unreadable");
-    fs::write(&path, b"\xff").unwrap();
-    assert!(History::load(&path).is_err(), "not UTF-8");
-    assert!(History::load(dir.path()).is_err(), "a directory");
-    let missing = History::load(&dir.path().join("none")).unwrap();
-    assert_eq!(missing.len().0, 0, "missing");
 }

@@ -50,7 +50,7 @@ harmonia-store-path = { git = "https://github.com/nix-community/harmonia", rev =
 harmonia-store-content-address = { git = "https://github.com/nix-community/harmonia", rev = "10a2228f94956fb568dfc799a1c918484bf33653" }
 harmonia-utils-hash = { git = "https://github.com/nix-community/harmonia", rev = "10a2228f94956fb568dfc799a1c918484bf33653" }
 harmonia-store-path-info = { git = "https://github.com/nix-community/harmonia", rev = "10a2228f94956fb568dfc799a1c918484bf33653" }
-rusqlite = "0.40"
+rusqlite = { version = "0.40", features = ["bundled"] }
 harmonia-store-db = { git = "https://github.com/nix-community/harmonia", rev = "10a2228f94956fb568dfc799a1c918484bf33653" }
 harmonia-store-remote = { git = "https://github.com/nix-community/harmonia", rev = "10a2228f94956fb568dfc799a1c918484bf33653" }
 # presto-pasta's main branch with fixes the FOD sandboxes need that are

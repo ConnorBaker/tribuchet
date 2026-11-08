@@ -1,8 +1,7 @@
 # The history phase's additions to nix/test.nix's nodes
 # (crates/tribuchet/tests/e2e/history.rs): a second worker, on the hub
 # VM, started by the test; three agents on two cores on either worker;
-# the tribuchet command on the hub, for seed-history;
-# and on the hub, builds that declare no system feature, each running
+# a build record of its own on the hub; and on the hub, builds that declare no system feature, each running
 # `secs` seconds: /etc/tt/hot.nix keeps both cores busy, /etc/tt/nap.nix
 # sleeps on none.
 {
@@ -23,10 +22,8 @@ in
   worker.services.tribuchet-worker = worker;
   hub = {
     virtualisation.cores = 2;
-    # seed-history, which the test runs beside the hub
-    environment.systemPackages = [ tribuchet ];
-    # a history file of its own, so that the test sees the setting used
-    services.tribuchet-hub.settings.placement.history = "/var/lib/tt-history/placement-history.json";
+    # a record of its own, so that the test sees the setting used
+    services.tribuchet-hub.settings.placement.record = "/var/lib/tt-history/record.sqlite";
     environment.etc."tt/hot.nix".text = ''
       { name, secs }:
       derivation {
@@ -64,6 +61,7 @@ in
     systemd.services.tribuchet-hub.serviceConfig.Environment = lib.mkForce [
       "RUST_LOG=info,tribuchet::hub=debug"
       "XDG_CACHE_HOME=/var/cache"
+      "XDG_STATE_HOME=/var/lib"
     ];
   };
 }

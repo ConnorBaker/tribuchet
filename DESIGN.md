@@ -200,8 +200,8 @@ runtime's own timer fires (`sd.rs`), and tokio's eager driver hand-off
 keeps one blocked worker from stopping that timer (`rt.rs`).
 
 Hub restarts cancel nothing, without any state handoff: on SIGTERM the
-hub saves the placement history and exits, and the replacement
-reconstructs its state from the edges and that file. Workers re-register
+hub commits what is queued to its build record and exits, and the
+replacement reconstructs its state from the edges and that record. Workers re-register
 and announce the dedupe keys of builds they still hold (running, or
 finished but undelivered); attach clients reconnect and resubmit the
 identical request, whose deterministic dedupe key routes it back to the
@@ -289,10 +289,7 @@ least: one that registered none, as it may with no agents yet, can have
 idle agents later, and as no cores it would be infinitely full, or NaN
 (which sorts first on x86). Both are as registered, for the session: one
 that registered no cores and `max_jobs` 0 counts as one core until it
-registers again. A hand-edited history with a peak of 0 on a worker
-reporting 0 bytes for its builds makes its memory ratio 0/0, a NaN,
-which `f64::max` discards for the cores' ratio: History::load does not
-check runs, as Run::of does. Memory has no such floor: a worker that
+registers again. Memory has no such floor: a worker that
 reports 0 bytes for its builds is infinitely full by memory, and is not
 chosen where memory is compared. A build counts against its worker from
 its dispatch, just after the worker takes it from the queue, until it
@@ -319,90 +316,82 @@ and unused. A run with no running time (a worker can report none)
 teaches no timing. Keys are never dropped. A build's expectation is
 taken once, as it is first queued; a requeued build keeps it.
 
-The history is kept in `placement-history.json` ([placement] `history`;
-a path ending .tmp or .lock, a history file's own temporary file's or
-lock's name, the hub warns of and neither loads nor saves, its "loaded …
-keys=0" then reading as if the file were empty). As the hub starts it
-takes the file's lock (`placement-history.json.lock`) and loads the
-file; a hub that finds the lock held, or cannot open it, warns, loads
-the file as it is, and never saves for its lifetime. It does not take
-the lock again at a later save: whatever holds the lock (another hub,
-the swap, seed-history writing a new file) can write the file meanwhile,
-so its copy may be stale, which it would save over the newer file if it
-took the lock later. It saves every 5 minutes when the history changed
-and at SIGTERM, off the runtime. Runs learned after the SIGTERM save are
-lost, and a hub that ends otherwise (its servers failing, the watchdog's
-abort) loses up to 5 minutes of them; a save that fails is not tried
-again until the history changes. A file that cannot be read or parsed,
-for any reason but its absence (the previous format, permissions, I/O
-errors), is warned of, and the hub starts empty and never saves over it:
-the file is the only record older than the journal's retention. Neither
-the permissions case nor the warning's text is covered by a test. A file
-that is a symlink becomes a regular file at the first save, its target
-left as it was; a dangling one counts as absent.
+The history is the fold of the hub's build record (`hub/record.rs`), a
+SQLite database at [placement] `record`, by default
+`$XDG_STATE_HOME/tribuchet/record.sqlite` (`/var/lib/tribuchet` under
+the NixOS module, its StateDirectory): state, not cache, as it is the
+only copy. It has two tables, appended to and never changed: `result`,
+a row per worker result that carries usage (the "build usage" line's
+fields, and whether the build declares `big-parallel`), and `dispatch`,
+a row per dispatch (the "dispatching build" line's values, unrounded).
+Other processes may query it while the hub runs (`sqlite3 -readonly`):
+it is in WAL mode, where readers and the one writer do not wait for each
+other. As the hub starts, before it serves, it folds every `result`
+row, in rowid order, into an empty history ("build record folded", with
+the rows read and the keys and entries learned); after, each result is
+learned and handed to the record in one step under the placement lock,
+so the history is the fold of the record's rows and those queued to it.
+A result row with no system (an imported build queued before its
+journal began) teaches nothing.
 
-To seed it from the hub's journal, while the hub runs: run `tribuchet
-seed-history --history SIDE` from the hub's package (the NixOS module
-puts no tribuchet on PATH) on `journalctl -u tribuchet-hub -o cat`, SIDE
-a new file beside the hub's, LIVE (it refuses one that exists, and a
-name ending .tmp or .lock, as a hub's temporary file and lock are, at
-which a hub takes no history either); it takes SIDE's lock, and the hub
-serves on. Then, from a root shell (`sudo -s`), swap SIDE in, as one
-command:
+One thread writes the record, all the rows waiting in one transaction;
+handing a row to it never waits, so no runtime thread does the record's
+file I/O. Each commit is durable (`synchronous=FULL`): a crash loses the
+rows handed over and not yet committed, never a committed row nor part
+of one. A commit that fails (a full disk, an I/O error) is logged as an
+error and its rows kept, to be committed with the next rows; at SIGTERM,
+or when its servers fail, the hub stops handing rows over and exits once
+the writer has committed what it holds, or logged as lost what it could
+not. The metrics show `tribuchet_hub_record_writing` (0 where the hub
+records nothing), `tribuchet_hub_record_uncommitted_rows` and
+`tribuchet_hub_record_failed_commits_total`. The retry has no bound:
+while commits fail, the rows held, and each attempt's work, grow with
+every row learned, so alert on `tribuchet_hub_record_uncommitted_rows`. One hub writes a record: it
+holds `record.sqlite.lock` while it runs, and a second hub, finding it
+held, folds what it reads and records nothing, logged as an error. A
+record that is not a SQLite database, or not one of a schema the hub
+knows (`user_version` 1 and the two tables), leaves the hub with an
+empty history, recording nothing, logged as an error; the file is left
+byte for byte as it is. A missing record, and its directory, are
+created. The hub serves either way: placement then falls back on its
+priors, and builds are not held for the record. The fold's cost at
+start is measured, not bounded: 338,559 rows, 116 MB, took 249 ms of
+CPU (release build, one run, 2026-11-08).
 
-```sh
-systemctl stop tribuchet-hub.socket tribuchet-hub.service; \
-flock -n LIVE.lock sh -ec 'test -f SIDE; if [ -e LIVE ]; then ln -T LIVE LIVE.$(date +%s); fi; mv -T SIDE LIVE' || echo 'NOT SWAPPED' >&2; \
-systemctl start tribuchet-hub.socket
-```
+The record replaces `placement-history.json` ([placement] `history`),
+which nothing reads now: a hub.toml that still sets `history` fails to
+load (an unknown field), and a hub that finds the file at its old
+default path logs once that it is no longer read. The file's runs are
+not carried over. `tribuchet import-journal --record PATH`, a one-time
+migration removed after the farm's, imports the hub's journal
+(`journalctl -u tribuchet-hub -o cat` on stdin) instead: each "build
+usage" line becomes the `result` row and each "dispatching build" line
+the `dispatch` row the record would hold had it existed then, at the
+line's own time; a result's system from its line, else its build's
+"queueing build" line (else none), its declaration from its dispatch
+line's features. A field a line predates is NULL, a usage figure 0;
+fields the record has no column for are dropped. Every line of the
+three messages is counted; where one does not parse, the import names
+the first ten by line number, imports nothing and exits non-zero. It
+takes the record's lock, so it refuses while a hub writes it. Its rows
+go before the record's, which must all be later than its last line, so
+a second import of the same journal is refused. On the farm's journal
+of 2026-10-29..11-08 it gave every key, prefix and class also in the
+farm's history file the same runs, where the journal holds them; the
+file's other 408 keys and 822 prefixes, and the older runs of 121 keys,
+are only in the file (keep a copy).
 
-One command, because `tribuchet attach` retries a build's connects 30
-times 2 s apart in all, not per outage. systemd stops the hub before its
-socket, which the NixOS module's hub unit requires (After= is systemd's
-own for a socket's service; without Requires=, the socket goes inactive
-while the hub is still saving, and whether connects are then refused is
-not settled: on systemd 255 user units they still succeeded, the hub
-holding the listening socket it inherited; the farm's is untested): the
-socket listens through the hub's SIGTERM save, connections queued then
-are closed unanswered as it stops (attach retries them), and connects
-are refused from then through the renames to the start. As the hub
-requires its socket, restarting the socket restarts the hub too. How
-long that save adds is not measured, and a wedged hub takes systemd's
-stop timeout, 90 s by default, longer than attach's budget. Where a hub
-holds the lock, SIDE is not a file (missing, a directory or a dangling
-symlink), or a backup of LIVE of the same second exists, the swap prints
-NOT SWAPPED and leaves LIVE as it was. The command exits 0 either way,
-its last step being the start, so read its output. Where it swaps, the
-old LIVE stays as LIVE.<seconds>. A directory or a symlink to one at
-that name, or a directory at LIVE, refuses the swap (`ln -T`, `mv -T`;
-plain mv would move SIDE into it and exit 0); a symlink at LIVE to a
-file or a directory is replaced and kept as LIVE.<seconds>, a dangling
-one replaced and not kept. Where SIDE is a symlink to LIVE or a hard
-link of it, the swap refuses at mv, after ln has left a stray
-LIVE.<seconds>, which refuses a retry in that second. A SIDE that is a
-symlink to a file is moved in as LIVE, the symlink itself (a relative
-one not beside LIVE then dangles, or names another file), and an empty
-or garbage SIDE is moved in too: the hub warns, runs empty and never
-saves over it. Only a hand-made SIDE gets there; seed-history writes a
-regular file. LIVE and SIDE go into the command unquoted (no spaces or
-quotes); SIDE beside LIVE is not enforced, and across filesystems mv
-copies, so that swap is not atomic. The command, the journal's unit and
-the cache directory are the NixOS module's names; the flakelet's hub is
-named by its `name`. The socket starts again either way; where that
-fails (its port taken), systemctl says so and exits 1, the swap made or
-not, and the hub stays down until the socket is started again (after
-`systemctl reset-failed tribuchet-hub.socket` if the start refuses).
-SIDE.lock, seed-history's, stays behind: leave it, and LIVE.lock, in
-place, as a lock file deleted while held lets the next taker lock a new
-file, and two writers write. What the hub learned since the journal was
-read is lost. The swap replaces the history and does not merge into it:
-SIDE holds only what the journal holds, so keys and runs older than the
-journal's retention are kept only in LIVE.<seconds>. Seed and swap only
-for a first deploy, or where the hub cannot read LIVE ("placement
-history unreadable"), not over a readable LIVE. Stopping the service but
-not the socket lets a queued connection start a hub during the swap: it
-finds the lock held, loads LIVE as it then is, and never saves, and the
-file stays intact.
+The farm imports with the hub stopped and before any hub that keeps a
+record has run, into an empty record, the journal read with a cursor so
+that no line is read twice or missed: build the new system; while the
+old hub runs, `journalctl -u tribuchet-hub -o cat
+--cursor-file=CURSOR > J1`; stop `tribuchet-hub.socket` and
+`tribuchet-hub.service`; copy `placement-history.json` aside;
+`journalctl --sync`; the same `journalctl` command again into J2 (from
+the cursor); `cat J1 J2 | NEW/bin/tribuchet import-journal --record
+/var/lib/tribuchet/record.sqlite`, NEW the new system's tribuchet; then
+switch to the new system and start the socket. The new hub's "build
+record folded" line counts the imported usage lines as its rows.
 
 The worker that asks takes the first queued build it can, unless
 another connected worker that serves it has an idle agent (a free slot,

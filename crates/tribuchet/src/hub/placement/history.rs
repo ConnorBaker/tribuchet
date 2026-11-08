@@ -29,12 +29,9 @@
 //! shown a ranking that weighs them doing better.
 
 use std::collections::{HashMap, VecDeque};
-use std::fs;
-use std::io;
 use std::iter;
-use std::mem;
-use std::path::Path;
 
+#[cfg(test)]
 use serde::{Deserialize, Serialize};
 
 use crate::proto::BuildUsage;
@@ -113,7 +110,8 @@ impl Expected {
 
 /// One run as the worker measured it: peak bytes, CPU and running
 /// milliseconds, and whether it succeeded.
-#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq)]
+#[cfg_attr(test, derive(Serialize, Deserialize))]
 struct Run(u64, u64, u64, bool);
 
 impl Run {
@@ -140,11 +138,12 @@ impl Run {
 }
 
 /// The runs of a key, prefix or class, newest last.
-#[derive(Clone, Default, Serialize, Deserialize)]
+#[derive(Clone, Default)]
+#[cfg_attr(test, derive(Serialize, Deserialize))]
 struct Runs {
     runs: VecDeque<Run>,
     /// OOM-killed runs ever.
-    #[serde(default)]
+    #[cfg_attr(test, serde(default))]
     oom: u32,
 }
 
@@ -162,10 +161,9 @@ fn median(mut xs: Vec<f64>) -> Option<f64> {
 }
 
 impl Runs {
-    /// Add `run`, keeping the last `keep`: fewer than a loaded window
-    /// held, if it was written with another `keep`.
+    /// Add `run`, keeping the last `keep`.
     fn push(&mut self, run: Run, oom: bool, keep: usize) {
-        while self.runs.len() >= keep {
+        if self.runs.len() >= keep {
             self.runs.pop_front();
         }
         self.runs.push_back(run);
@@ -253,14 +251,12 @@ pub(in crate::hub) struct Build<'a> {
     pub(in crate::hub) declared: bool,
 }
 
-/// Entries are never dropped (the previous format's file on the farm's
-/// hub held 15,293 keys): seeded from the journal above, 5,082 keys and
-/// 14,865 entries (prefixes and classes too), 1,901,745 bytes of JSON.
-/// Its one class is x86_64-linux/false: none of the journal's dispatch
-/// lines named features, so no build was seen to declare big-parallel.
-/// Re-measure the file and its save once "placement history loaded"
-/// counts ten times as many entries.
-#[derive(Clone, Default, Serialize, Deserialize)]
+/// Entries are never dropped: the fold of the build record (record.rs).
+/// The farm's placement-history.json, the file this was
+/// kept in before the record, held 7,677 keys on 2026-11-08 (serialised
+/// in tests only, to compare the record's fold with it).
+#[derive(Clone, Default)]
+#[cfg_attr(test, derive(Serialize, Deserialize))]
 pub(in crate::hub) struct History {
     /// "system/pname" to its runs.
     keys: HashMap<String, Runs>,
@@ -269,11 +265,6 @@ pub(in crate::hub) struct History {
     prefixes: HashMap<String, Runs>,
     /// "system/declared" (true or false) to the class's runs.
     classes: HashMap<String, Runs>,
-    #[serde(skip)]
-    dirty: bool,
-    /// How many copies `changed` has taken.
-    #[serde(skip)]
-    copies: u64,
 }
 
 impl History {
@@ -323,35 +314,36 @@ impl History {
                     .push(run, oom, WINDOW);
             }
         }
-        self.dirty = true;
-    }
-
-    /// The history at `path`, empty where there is no file; an error
-    /// where it cannot be read or parsed.
-    pub(in crate::hub) fn load(path: &Path) -> io::Result<Self> {
-        let parsed = fs::read_to_string(path)
-            .and_then(|text| serde_json::from_str(&text).map_err(io::Error::other));
-        match parsed {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(Self::default()),
-            parsed => parsed,
-        }
-    }
-
-    /// A copy to save, if it changed since the last, numbered after the
-    /// last: a later copy has the higher number, and write_newest keeps
-    /// it. Numbered with the copy, under whatever lock guards the history
-    /// (the placement lock), and not by a counter of its own beside it.
-    pub(in crate::hub) fn changed(&mut self) -> Option<(u64, Self)> {
-        mem::take(&mut self.dirty).then(|| {
-            self.copies += 1;
-            (self.copies, self.clone())
-        })
     }
 
     /// Its keys, and its entries: keys, prefixes and classes.
     pub(in crate::hub) fn len(&self) -> (usize, usize) {
         let entries = self.keys.len() + self.prefixes.len() + self.classes.len();
         (self.keys.len(), entries)
+    }
+
+    /// Every entry's runs, oldest first, as (peak, CPU ms, running ms,
+    /// succeeded), and its OOM kills, by "keys/", "prefixes/" or
+    /// "classes/" and its name: what a comparison of two histories reads.
+    #[cfg(test)]
+    pub(in crate::hub) fn entries(&self) -> HashMap<String, (Vec<(u64, u64, u64, bool)>, u32)> {
+        let tables = [
+            ("keys", &self.keys),
+            ("prefixes", &self.prefixes),
+            ("classes", &self.classes),
+        ];
+        let runs = |r: &Runs| {
+            r.runs
+                .iter()
+                .map(|&Run(p, c, t, ok)| (p, c, t, ok))
+                .collect()
+        };
+        (tables.into_iter())
+            .flat_map(|(t, m)| {
+                m.iter()
+                    .map(move |(k, r)| (format!("{t}/{k}"), (runs(r), r.oom)))
+            })
+            .collect()
     }
 }
 

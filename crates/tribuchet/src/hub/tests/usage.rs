@@ -1,9 +1,13 @@
 //! The hub's usage line for a build.
 
-use std::fs::{File, TryLockError};
-use std::os::unix::fs::PermissionsExt;
+use std::collections::HashMap;
+use std::path::Path;
 use std::thread;
+use std::time::{SystemTime, UNIX_EPOCH};
 
+use rusqlite::types::Value;
+
+use super::rank::{declare, sized_worker};
 use super::*;
 use crate::proto::{BuildResult, BuildUsage};
 
@@ -114,98 +118,174 @@ fn expected(state: &HubState, j: &Job) -> (&'static str, u64) {
     (e.level.name(), placement::bytes(e.demand.memory))
 }
 
-/// What a hub learned it saves, in a directory it creates, and the next
-/// hub loads, once the first has let go of the file's lock.
-#[tokio::test]
-async fn learning_survives_the_hubs_save_and_load() {
+/// A build of `name`, from a worker's run of it that used `gib` GiB.
+fn run_of(name: &str, gib: u64) -> (Job, BuildUsage) {
+    let (mut j, mut usage) = learned_build();
+    let out = format!("/nix/store/{H}-{name}");
+    j.req.outputs.insert("out".to_owned(), out);
+    usage.peak_memory_bytes = gib << 30;
+    (j, usage)
+}
+
+/// The record at `path` opened into `state`, as the hub opens it.
+fn open_record(state: &HubState, path: &Path) -> Option<thread::JoinHandle<()>> {
+    record::open(path).install(state)
+}
+
+/// Learn `j`'s run as the relay does, from worker w1.
+fn learn(state: &HubState, j: &Job, exit_code: i32, usage: &BuildUsage) {
+    let rest = record::Rest::of(j, "w1");
+    state
+        .placement
+        .lock()
+        .unwrap()
+        .learn(j, exit_code, usage, rest);
+}
+
+/// What a hub learned, the next hub folds from the record, at a
+/// path whose directories the first created.
+#[test]
+fn learning_survives_a_restart() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("cache/tribuchet/placement-history.json");
+    let path = dir.path().join("state/tribuchet/record.sqlite");
     let state = HubState::for_test(Duration::from_secs(30));
-    let file = placement::open_history(&state, path.clone()).await;
+    let writer = open_record(&state, &path);
     let (j, usage) = learned_build();
-    state.placement.lock().unwrap().learn(&j, 0, &usage);
-    placement::save_history(&state, &file).await;
-    let first = fs::read(&path).unwrap();
-    state.placement.lock().unwrap().learn(&j, 0, &usage);
-    placement::save_history(&state, &file).await;
-    assert_ne!(fs::read(&path).unwrap(), first, "a later save not written");
-    drop(file);
+    learn(&state, &j, 0, &usage);
+    record::close(&state, writer);
     let restarted = HubState::for_test(Duration::from_secs(30));
-    let _file = placement::open_history(&restarted, path).await;
-    assert_eq!(
-        expected(&restarted, &j),
-        ("key", 5 << 30),
-        "after a restart"
-    );
+    let _writer = open_record(&restarted, &path);
+    let after = expected(&restarted, &j);
+    assert_eq!(after, ("key", 5 << 30), "after a restart");
 }
 
-/// A hub that finds the lock held, by seed-history or another hub, loads
-/// the file as it is and never saves.
-#[tokio::test]
-async fn a_hub_without_the_lock_loads_but_never_saves() {
+/// The history a hub learned is the fold of the record it wrote, in the
+/// order learned, over runs that teach (successes, an OOM kill), one
+/// that does not (a failure), pnames sharing a prefix, and more runs of
+/// a key than its window.
+#[test]
+fn the_history_is_the_fold_of_the_record() {
     let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("placement-history.json");
-    let (first, (j, usage)) = (HubState::for_test(Duration::from_secs(30)), learned_build());
-    let holder = placement::open_history(&first, path.clone()).await;
-    first.placement.lock().unwrap().learn(&j, 0, &usage);
-    placement::save_history(&first, &holder).await;
-    let saved = fs::read(&path).unwrap();
+    let path = dir.path().join("record.sqlite");
     let state = HubState::for_test(Duration::from_secs(30));
-    let file = placement::open_history(&state, path.clone()).await;
-    assert_eq!(
-        expected(&state, &j),
-        ("key", 5 << 30),
-        "the file not loaded"
-    );
-    state.placement.lock().unwrap().learn(&j, 0, &usage);
-    placement::save_history(&state, &file).await;
-    assert_eq!(fs::read(&path).unwrap(), saved, "saved without the lock");
-}
-
-/// A history file that does not load, here the previous format's, is the
-/// only copy of what it holds: the hub starts empty and, at a periodic
-/// save as at SIGTERM's (both save_history), never saves over it.
-#[tokio::test]
-async fn an_unreadable_history_is_never_saved_over() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("placement-history.json");
-    let old = r#"{"keys":{"x86_64-linux/foo":{"cores":1.0,"memory":2.0}}}"#;
-    fs::write(&path, old).unwrap();
-    let state = HubState::for_test(Duration::from_secs(30));
-    let file = placement::open_history(&state, path.clone()).await;
-    let (j, usage) = learned_build();
-    for _ in 0..2 {
-        state.placement.lock().unwrap().learn(&j, 0, &usage);
-        placement::save_history(&state, &file).await;
+    let writer = open_record(&state, &path);
+    for n in 0..30u64 {
+        let name = ["tt-a", "tt-b-c", "tt-b-d"][usize::try_from(n % 3).unwrap()];
+        let (j, mut usage) = run_of(&format!("{name}-{n}.0"), n + 1);
+        usage.oom_killed = n == 4;
+        // Received in an order its times do not follow: the fold's is
+        // the rows' (rowid), the order learned.
+        let mut rest = record::Rest::of(&j, "w1");
+        rest.at_ms = 1_000_000 - i64::try_from(n).unwrap();
+        let exit_code = i32::from(n == 4 || n == 5);
+        state
+            .placement
+            .lock()
+            .unwrap()
+            .learn(&j, exit_code, &usage, rest);
     }
-    assert_eq!(fs::read_to_string(&path).unwrap(), old, "saved over it");
+    let learned = state.placement.lock().unwrap().history.entries();
+    record::close(&state, writer);
+    let restarted = HubState::for_test(Duration::from_secs(30));
+    let _writer = open_record(&restarted, &path);
+    let folded = restarted.placement.lock().unwrap().history.entries();
+    assert_eq!(folded, learned);
 }
 
-/// A history path ending .tmp or .lock, a history file's own temporary
-/// file's or lock's name, is not used: a history there is neither loaded
-/// nor saved over.
+/// A build run through the hub appends one dispatch row and one result
+/// row, the result row with its log line's values.
 #[tokio::test]
-async fn a_history_named_as_a_temporary_file_or_lock_is_not_used() {
+async fn a_build_appends_a_dispatch_and_a_result_row() {
+    const OUT: &str = "/nix/store/00000000000000000000000000000000-tt-rows-1.0";
     let dir = tempfile::tempdir().unwrap();
-    let (saved, (j, usage)) = (dir.path().join("h.json"), learned_build());
-    let first = HubState::for_test(Duration::from_secs(30));
-    let file = placement::open_history(&first, saved.clone()).await;
-    first.placement.lock().unwrap().learn(&j, 0, &usage);
-    placement::save_history(&first, &file).await;
-    for name in ["r.json.tmp", "r.json.lock"] {
-        let path = dir.path().join(name);
-        fs::copy(&saved, &path).unwrap();
-        let state = HubState::for_test(Duration::from_secs(30));
-        let file = placement::open_history(&state, path.clone()).await;
-        assert_eq!(expected(&state, &j).0, "prior", "loaded from {name}");
-        state.placement.lock().unwrap().learn(&j, 0, &usage);
-        placement::save_history(&state, &file).await;
-        assert_eq!(
-            fs::read(&path).unwrap(),
-            fs::read(&saved).unwrap(),
-            "saved at {name}"
+    let path = dir.path().join("record.sqlite");
+    let state = Arc::new(HubState::for_test(Duration::from_secs(30)));
+    let writer = open_record(&state, &path);
+    let before = unix_ms();
+    let replay = Arc::new(Replay::default());
+    let mut client = replay.subscribe().await;
+    let mut j = job(0, replay);
+    j.req.outputs.insert("out".to_owned(), OUT.to_owned());
+    j.features = vec!["big-parallel".to_owned()];
+    state.queue.lock().await.push_back(j);
+    // A worker that serves big-parallel (connect's serves no feature).
+    let mut w = sized_worker(&state, "w1", 4, 8);
+    w.to_hub.send(request_job(1, Some(0))).await.unwrap();
+    let build_id = w.assignment().await.expect("not assigned").build_id;
+    let usage = BuildUsage {
+        wall_ms: 2000,
+        cpu_usec: 3_000_000,
+        peak_memory_bytes: 7,
+        oom_killed: true,
+        frozen_ms: 500,
+    };
+    let result = BuildResult {
+        build_id: build_id.clone(),
+        exit_code: 137,
+        usage: Some(usage),
+        ..Default::default()
+    };
+    w.send(worker_message::Msg::Result(result)).await;
+    while client.recv().await.is_some() {}
+    let after = unix_ms();
+    let held = state.clone();
+    let closed = tokio::task::spawn_blocking(move || record::close(&held, writer));
+    closed.await.unwrap();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let text = |sql: &str| -> Vec<String> {
+        let row = db.query_row(sql, [], |r| {
+            (0..r.as_ref().column_count())
+                .map(|i| r.get::<_, Value>(i).map(|v| format!("{v:?}")))
+                .collect::<rusqlite::Result<Vec<_>>>()
+        });
+        row.unwrap()
+    };
+    let result = text(
+        "SELECT id, key, system, drv, declared, out_path, worker, exit_code, wall_ms, \
+         cpu_usec, peak_memory_bytes, oom_killed, frozen_ms FROM result",
+    );
+    let want = [
+        format!("Text({build_id:?})"),
+        r#"Text("k0")"#.to_owned(),
+        r#"Text("x86_64-linux")"#.to_owned(),
+        r#"Text("tt-rows-1.0")"#.to_owned(),
+        "Integer(1)".to_owned(),
+        format!("Text({OUT:?})"),
+        r#"Text("w1")"#.to_owned(),
+        "Integer(137)".to_owned(),
+        "Integer(2000)".to_owned(),
+        "Integer(3000000)".to_owned(),
+        "Integer(7)".to_owned(),
+        "Integer(1)".to_owned(),
+        "Integer(500)".to_owned(),
+    ];
+    assert_eq!(result, want);
+    // The other columns are the line's (the_dispatch_row_holds_the_dispatch_lines_values).
+    let dispatch = text("SELECT id, key FROM dispatch");
+    assert_eq!(
+        dispatch,
+        [format!("Text({build_id:?})"), r#"Text("k0")"#.to_owned()]
+    );
+    let rows = text("SELECT (SELECT count(*) FROM result), (SELECT count(*) FROM dispatch)");
+    assert_eq!(rows, ["Integer(1)", "Integer(1)"], "one row each");
+    for table in ["result", "dispatch"] {
+        let at = text(&format!("SELECT at_ms FROM {table}"));
+        let at: i64 = at[0]
+            .trim_start_matches("Integer(")
+            .trim_end_matches(')')
+            .parse()
+            .unwrap();
+        assert!(
+            (before..=after).contains(&at),
+            "{table} at {at}, not {before}..={after}"
         );
     }
+}
+
+/// Now in unix milliseconds, by the test's own reading of the clock.
+fn unix_ms() -> i64 {
+    let since = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    i64::try_from(since.as_millis()).unwrap()
 }
 
 /// A requeued build keeps the expectation it was first queued with, not
@@ -221,17 +301,6 @@ async fn a_requeued_build_keeps_its_expectation() {
     assert_eq!(kept, Some(placement::Expected::prior(true)));
 }
 
-/// The lock is the file's path and ".lock", the file the documented swap
-/// takes with `flock -n LIVE.lock`.
-#[test]
-fn the_lock_is_the_files_path_and_lock() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("placement-history.json");
-    let _hub = placement::lock_history(&path).unwrap().expect("free");
-    let swap = File::open(dir.path().join("placement-history.json.lock")).unwrap();
-    assert!(matches!(swap.try_lock(), Err(TryLockError::WouldBlock)));
-}
-
 /// A build that declares big-parallel, its key unseen, takes the prior
 /// of the builds that do.
 #[test]
@@ -243,35 +312,71 @@ fn a_declaring_build_takes_their_prior() {
     assert_eq!(e, placement::Expected::prior(true));
 }
 
-/// A lock file the hub may not write, as one a seeding left as another
-/// user, still locks: it is opened to read.
-#[test]
-fn a_read_only_lock_file_locks() {
+/// The dispatch row holds the dispatch line's values: every column but
+/// the hub's time and the build's key, which the line does not carry.
+/// Of the other workers that serve the build, two have an idle agent and
+/// one has none.
+#[tokio::test]
+async fn the_dispatch_row_holds_the_dispatch_lines_values() {
+    let log = Captured;
+    let _guard = log.install();
     let dir = tempfile::tempdir().unwrap();
-    let lock = dir.path().join("placement-history.json.lock");
-    fs::write(&lock, "").unwrap();
-    fs::set_permissions(&lock, fs::Permissions::from_mode(0o444)).unwrap();
-    let got = placement::lock_history(&dir.path().join("placement-history.json"));
-    assert!(matches!(got, Ok(Some(_))), "{got:?}");
-}
-
-/// What the hub learns it saves every SAVE_EVERY, not only as it stops.
-#[tokio::test(start_paused = true)]
-async fn the_history_is_saved_every_few_minutes() {
-    let dir = tempfile::tempdir().unwrap();
-    let path = dir.path().join("placement-history.json");
+    let path = dir.path().join("record.sqlite");
     let state = Arc::new(HubState::for_test(Duration::from_secs(30)));
-    let file = placement::open_history(&state, path.clone()).await;
-    tokio::spawn(placement::keep_history(state.clone(), file));
-    let (j, usage) = learned_build();
-    state.placement.lock().unwrap().learn(&j, 0, &usage);
-    tokio::time::sleep(placement::SAVE_EVERY).await;
+    let writer = open_record(&state, &path);
+    let mut workers = Vec::new();
+    for (name, capacity, free) in [("w1", 3, 2), ("w2", 1, 0), ("w3", 1, 1), ("w4", 2, 2)] {
+        let w = sized_worker(&state, name, 4, 8);
+        w.to_hub.send(declare(capacity, free, 0)).await.unwrap();
+        workers.push(w);
+    }
+    tokio::time::sleep(QUIET).await;
+    let mut j = job(0, Arc::new(Replay::default()));
+    let out = format!("/nix/store/{H}-tt-row-1.0");
+    j.req.outputs = [("out".to_owned(), out)].into();
+    let _client = j.replay.subscribe().await;
+    state.queue.lock().await.push_back(j);
+    state.notify.notify_waiters();
     for _ in 0..500 {
-        if path.exists() {
+        if log.has(&["dispatching build"]) {
             break;
         }
-        tokio::task::yield_now().await;
-        thread::sleep(Duration::from_millis(10));
+        tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    assert!(path.exists(), "not saved after SAVE_EVERY");
+    let line = log.line("dispatching build");
+    assert!(line.contains("idle_elsewhere=2"), "{line}");
+    let held = state.clone();
+    let closed = tokio::task::spawn_blocking(move || record::close(&held, writer));
+    closed.await.unwrap();
+    let (_, logged) = line.split_once("dispatching build ").unwrap();
+    let logged: HashMap<&str, &str> = (logged.split(' '))
+        .filter_map(|w| w.split_once('='))
+        .map(|(k, v)| (k, v.trim_matches('"')))
+        .collect();
+    let db = rusqlite::Connection::open(&path).unwrap();
+    let mut stmt = db.prepare("SELECT * FROM dispatch").unwrap();
+    let names: Vec<String> = stmt.column_names().into_iter().map(str::to_owned).collect();
+    let values: Vec<Value> = stmt
+        .query_row([], |r| (0..names.len()).map(|i| r.get(i)).collect())
+        .unwrap();
+    let mut compared = 0;
+    for (name, value) in names.iter().zip(&values) {
+        if name == "at_ms" || name == "key" {
+            continue;
+        }
+        let line = logged.get(name.as_str()).copied();
+        let same = match (value, line) {
+            (Value::Null, None) => true,
+            (Value::Integer(i), Some("true")) => *i == 1,
+            (Value::Integer(i), Some("false")) => *i == 0,
+            (Value::Integer(i), Some(l)) => l == i.to_string(),
+            (Value::Real(x), Some(l)) => l.parse::<f64>().ok() == Some(placement::round3(*x)),
+            (Value::Text(t), Some(l)) => l == t,
+            _ => false,
+        };
+        assert!(same, "{name}: row {value:?}, line {line:?}");
+        compared += 1;
+    }
+    assert_eq!(compared, 19, "columns compared");
+    drop(workers);
 }

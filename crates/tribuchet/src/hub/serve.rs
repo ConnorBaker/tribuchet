@@ -19,11 +19,11 @@ use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 
 use super::chunkcache::ChunkCache;
 use super::metrics;
-use super::placement;
+use super::record;
 use super::state::HubState;
 use super::submit::AttachSvc;
 use super::{PeerAuth, WorkerSvc};
-use crate::config::{Auth, HubConfig, default_chunk_cache_dir, default_placement_history};
+use crate::config::{Auth, HubConfig, default_chunk_cache_dir, default_record};
 use crate::errors::{Result, chain, err_ctx, err_msg};
 use crate::fsutil::io_ctx;
 use crate::proto::worker_hub_server::WorkerHubServer;
@@ -146,13 +146,18 @@ async fn run_async(cfg: HubConfig) -> Result<()> {
         chunks,
     ));
 
-    let history = cfg
-        .placement
-        .history
-        .clone()
-        .unwrap_or_else(default_placement_history);
-    let history = placement::open_history(&state, history).await;
-    tokio::spawn(placement::keep_history(state.clone(), history.clone()));
+    // The record is folded into the history before the hub serves.
+    let path = cfg.placement.record.clone().unwrap_or_else(default_record);
+    // The file the history was kept in before the record: named once, as
+    // nothing reads it now (the journal import migrates the journal).
+    let retired = default_chunk_cache_dir().with_file_name("placement-history.json");
+    if retired.exists() {
+        tracing::warn!(path = %retired.display(), "placement history file no longer read: the build record replaces it");
+    }
+    let opened = tokio::task::spawn_blocking(move || record::open(&path))
+        .await
+        .map_err(err_ctx("opening the build record"))?;
+    let writer = opened.install(&state);
 
     let (tls, peer_auth) = configure_auth(&cfg, config_dir)?;
 
@@ -242,15 +247,18 @@ async fn run_async(cfg: HubConfig) -> Result<()> {
     // No drain on SIGTERM: hub state is reconstructed by the
     // replacement instance from worker re-registration (resumable
     // build keys), attach resubmission (deterministic dedupe keys) and
-    // the placement history, saved here, so exiting cancels nothing.
-    tokio::select! {
+    // the build record, whose queued rows are committed here, so
+    // exiting cancels nothing.
+    let res = tokio::select! {
         res = servers => res.map(|_| ()),
         () = sd::stop_requested() => {
-            placement::save_history(&state, &history).await;
             tracing::info!("SIGTERM: exiting, builds resume against the replacement instance");
             Ok(())
         }
-    }
+    };
+    let held = state.clone();
+    let _ = tokio::task::spawn_blocking(move || record::close(&held, writer)).await;
+    res
 }
 
 fn open_chunk_cache(cfg: &HubConfig) -> Result<Arc<ChunkCache>> {

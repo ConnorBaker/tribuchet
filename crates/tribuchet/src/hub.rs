@@ -37,13 +37,14 @@ mod metrics;
 mod model;
 mod naming;
 mod placement;
+mod record;
 mod relay;
 mod serve;
 mod state;
 mod submit;
 #[cfg(test)]
 mod testlog;
-pub use placement::seed_history;
+pub use record::import_journal;
 pub use serve::run;
 
 use crate::errors::{Error, Result, chain};

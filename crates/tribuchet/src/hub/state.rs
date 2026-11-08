@@ -212,8 +212,7 @@ fn render_nix_config(caps: &HashMap<u64, WorkerCaps>, cfg: &NixConfig) -> String
 /// Write `content` to `path` through a temporary file, `path` and ".tmp",
 /// made anew (one left there is removed: a symlink is never followed),
 /// renamed into place, and removed where the write failed. A path's
-/// writers are serialised: the hub's by write_newest, the hub and
-/// seed-history by the path's lock.
+/// writers are serialised by write_newest.
 pub(super) fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
     let tmp = path.with_added_extension("tmp");
     let _ = fs::remove_file(&tmp);
