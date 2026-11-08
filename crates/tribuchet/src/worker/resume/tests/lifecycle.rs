@@ -14,6 +14,7 @@ use crate::worker::session::handle_cancel;
 use crate::worker::unix_now;
 
 mod cancel;
+mod slots;
 mod teardown;
 
 /// A worker starting up waits on no agent that never answers, as a
@@ -55,7 +56,7 @@ fn startup_waits_on_no_agent_that_does_not_answer() -> Result<()> {
     );
     assert!(build.exists(), "the held build's state is gone");
     assert_eq!(held(&ctx, "k"), Some((true, false)));
-    assert_eq!(ctx.free_slots(), 0, "the held build has no slot");
+    assert_eq!(ctx.free_slots(), 0, "the held build left its slot free");
     Ok(())
 }
 

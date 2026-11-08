@@ -498,7 +498,8 @@ mod tests {
     /// The slot an agent back from down frees goes to the orphan cleanup
     /// that reserves the agent, not to a build asking meanwhile. Were
     /// the agent reserved first and a slot asked for after, a build
-    /// asking between would take it, and the cleanup run without one.
+    /// asking between would take it, and more slots be held than jobs():
+    /// a build launched with a slot and no agent to lease.
     #[test]
     fn a_reserved_agents_slot_goes_to_the_reservation() -> Result<()> {
         let dir = tempfile::tempdir()?;
@@ -509,7 +510,7 @@ mod tests {
         for _ in 0..rounds {
             ctx.agents.mark_down(&socket);
             let (asking, done) = (AtomicBool::new(false), AtomicBool::new(false));
-            let (reserved, taken) = thread::scope(|s| {
+            let (_reserved, taken) = thread::scope(|s| {
                 let taker = s.spawn(|| {
                     loop {
                         asking.store(true, SeqCst);
@@ -526,11 +527,12 @@ mod tests {
                 done.store(true, SeqCst);
                 (reserved, taker.join().unwrap())
             });
-            lost += usize::from(reserved.is_none() || taken.is_some());
+            let reserved = ctx.jobs() == 1 && ctx.agents.idle_sockets().is_empty();
+            lost += usize::from(taken.is_some() || !reserved);
         }
         assert_eq!(
             lost, 0,
-            "a build took the reserved slot in {lost} of {rounds} rounds"
+            "the agent was not reserved, or a build took its slot, in {lost} of {rounds} rounds"
         );
         Ok(())
     }

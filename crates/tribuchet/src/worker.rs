@@ -79,7 +79,8 @@ struct WorkerCtx {
     secret_paths: Vec<PathBuf>,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     sandbox: bool,
-    /// Slots taken (Slot), at most `jobs()` as read when each was.
+    /// Slots taken (Slot): one per running build, past `jobs()` only by
+    /// builds that ran already (`reserve`).
     held: Mutex<usize>,
     /// The max-jobs setting.
     max_jobs: usize,
@@ -358,25 +359,21 @@ impl WorkerCtx {
     /// A free slot, checked and taken under `held`'s lock: two callers
     /// never take the same one.
     fn try_slot(self: &Arc<Self>) -> Option<Slot> {
-        self.slot_after(|| {})
+        let mut held = self.held.lock().unwrap();
+        (*held < self.jobs()).then(|| {
+            *held += 1;
+            Slot { ctx: self.clone() }
+        })
     }
 
     /// Take agent `socket`, which runs a build already, out of the pool
-    /// with a slot, in one step: no caller takes the slot an agent back
-    /// from down frees before this one does.
-    fn reserve(self: &Arc<Self>, socket: &Path) -> Option<Slot> {
-        self.slot_after(|| self.agents.reserve(socket))
-    }
-
-    /// `first`, then a free slot, under `held`'s lock.
-    fn slot_after(self: &Arc<Self>, first: impl FnOnce()) -> Option<Slot> {
+    /// with a slot, in one step (no caller takes the slot an agent back
+    /// from down frees first), free or not: the build runs either way.
+    fn reserve(self: &Arc<Self>, socket: &Path) -> Slot {
         let mut held = self.held.lock().unwrap();
-        first();
-        if *held >= self.jobs() {
-            return None;
-        }
+        self.agents.reserve(socket);
         *held += 1;
-        Some(Slot { ctx: self.clone() })
+        Slot { ctx: self.clone() }
     }
 }
 

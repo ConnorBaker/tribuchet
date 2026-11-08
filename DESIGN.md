@@ -214,9 +214,12 @@ worker collects them, and resume state is persisted in the build
 dir of each run (`builds/<id>.<ns>`, one per run of a build, which no
 other run removes). The replacement worker re-adopts running builds
 from their agents, supervises them to completion and redelivers finished
-results. A worker runs min(`max-jobs`, reachable agents) builds; a
-running build whose agent does not answer keeps its key, its slot and
-its agent until the agent answers, and its clients are told it waits.
+results. A worker starts a build only while fewer than min(`max-jobs`,
+reachable agents) run; a build that runs already when it starts
+(adopted, held, killed as unconfined, an orphan's cleanup) holds a slot
+past that, until it ends. A running build whose agent does not answer
+keeps its key, its slot and its agent until the agent answers, and its
+clients are told it waits.
 An agent answers Adopt and Status at once whatever Kill or Finish it runs
 (each on a thread of its own; Kill, Finish and Cleanup take turns, so no
 kill sweep kills another's helper), and once a Start has registered its
