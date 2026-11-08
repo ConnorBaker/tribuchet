@@ -148,12 +148,6 @@ async fn run_async(cfg: HubConfig) -> Result<()> {
 
     // The record is folded into the history before the hub serves.
     let path = cfg.placement.record.clone().unwrap_or_else(default_record);
-    // The file the history was kept in before the record: named once, as
-    // nothing reads it now (the journal import migrates the journal).
-    let retired = default_chunk_cache_dir().with_file_name("placement-history.json");
-    if retired.exists() {
-        tracing::warn!(path = %retired.display(), "placement history file no longer read: the build record replaces it");
-    }
     let opened = tokio::task::spawn_blocking(move || record::open(&path))
         .await
         .map_err(err_ctx("opening the build record"))?;

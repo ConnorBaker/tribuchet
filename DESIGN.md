@@ -360,38 +360,11 @@ CPU (release build, one run, 2026-11-08).
 
 The record replaces `placement-history.json` ([placement] `history`),
 which nothing reads now: a hub.toml that still sets `history` fails to
-load (an unknown field), and a hub that finds the file at its old
-default path logs once that it is no longer read. The file's runs are
-not carried over. `tribuchet import-journal --record PATH`, a one-time
-migration removed after the farm's, imports the hub's journal
-(`journalctl -u tribuchet-hub -o cat` on stdin) instead: each "build
-usage" line becomes the `result` row and each "dispatching build" line
-the `dispatch` row the record would hold had it existed then, at the
-line's own time; a result's system from its line, else its build's
-"queueing build" line (else none), its declaration from its dispatch
-line's features. A field a line predates is NULL, a usage figure 0;
-fields the record has no column for are dropped. Every line of the
-three messages is counted; where one does not parse, the import names
-the first ten by line number, imports nothing and exits non-zero. It
-takes the record's lock, so it refuses while a hub writes it. Its rows
-go before the record's, which must all be later than its last line, so
-a second import of the same journal is refused. On the farm's journal
-of 2026-10-29..11-08 it gave every key, prefix and class also in the
-farm's history file the same runs, where the journal holds them; the
-file's other 408 keys and 822 prefixes, and the older runs of 121 keys,
-are only in the file (keep a copy).
-
-The farm imports with the hub stopped and before any hub that keeps a
-record has run, into an empty record, the journal read with a cursor so
-that no line is read twice or missed: build the new system; while the
-old hub runs, `journalctl -u tribuchet-hub -o cat
---cursor-file=CURSOR > J1`; stop `tribuchet-hub.socket` and
-`tribuchet-hub.service`; copy `placement-history.json` aside;
-`journalctl --sync`; the same `journalctl` command again into J2 (from
-the cursor); `cat J1 J2 | NEW/bin/tribuchet import-journal --record
-/var/lib/tribuchet/record.sqlite`, NEW the new system's tribuchet; then
-switch to the new system and start the socket. The new hub's "build
-record folded" line counts the imported usage lines as its rows.
+load (an unknown field). The file's runs were
+not carried over: the farm's journal of 2026-10-29..11-08 was imported
+into the record once instead, by a command removed since, before the
+first hub that keeps a record started. Its rows are the record's first;
+those of builds queued before that journal began have no system.
 
 The worker that asks takes the first queued build it can, unless
 another connected worker that serves it has an idle agent (a free slot,

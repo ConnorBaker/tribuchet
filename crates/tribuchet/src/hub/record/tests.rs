@@ -13,29 +13,19 @@ use crate::hub::testlog::Captured;
 
 /// A reader of the record at `path`, as another process would open it,
 /// that never waits for a lock.
-pub(super) fn reader(path: &Path) -> Connection {
+fn reader(path: &Path) -> Connection {
     let db = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
     db.busy_timeout(Duration::ZERO).unwrap();
     db
 }
 
-/// `sql`'s one row, each value as its Debug.
-pub(super) fn row(path: &Path, sql: &str) -> Vec<String> {
-    let row = reader(path).query_row(sql, [], |r| {
-        (0..r.as_ref().column_count())
-            .map(|i| r.get::<_, Value>(i).map(|v| format!("{v:?}")))
-            .collect::<rusqlite::Result<Vec<_>>>()
-    });
-    row.unwrap()
-}
-
-pub(super) fn rows(path: &Path, table: &str) -> i64 {
+fn rows(path: &Path, table: &str) -> i64 {
     let sql = format!("SELECT count(*) FROM {table}");
     reader(path).query_row(&sql, [], |r| r.get(0)).unwrap()
 }
 
 /// Close an opened record as the hub does at SIGTERM.
-pub(super) fn shut(opened: Opened) {
+fn shut(opened: Opened) {
     let state = HubState::for_test(Duration::from_secs(30));
     let writer = opened.install(&state);
     close(&state, writer);
