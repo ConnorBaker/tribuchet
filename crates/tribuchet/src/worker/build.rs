@@ -19,8 +19,9 @@ use claims::{ClaimState, Claimed, Wait};
 pub(super) use claims::{Claims, Wake};
 use import_pool::{ImportHandle, ImportPool};
 
+use super::lease::Lease;
 use super::pins;
-use super::{DaemonConn, Slot, WorkerCtx, unix_now};
+use super::{DaemonConn, WorkerCtx, unix_now};
 use crate::chunkio::ChannelReader;
 use crate::errors::chain;
 use crate::errors::{Result, err_ctx, err_msg};
@@ -42,7 +43,7 @@ pub(super) struct ActiveBuild {
     pub(super) dir: PathBuf, // state_dir/builds/<id>.<ns>, the run's own
     pub(super) ctx: Arc<WorkerCtx>,
     /// None while staged as lookahead beyond the free slots.
-    pub(super) slot: Option<Slot>,
+    pub(super) lease: Option<Lease>,
     /// Input store paths valid in /nix/store (bind-mount sources).
     inputs: HashSet<String>,
     /// Paths this build claimed and imports, removed at dispatch.
@@ -103,7 +104,7 @@ impl ActiveBuild {
             assignment,
             dir,
             ctx,
-            slot: None,
+            lease: None,
             inputs: HashSet::new(),
             pending: HashSet::new(),
             infos: HashMap::new(),
@@ -486,9 +487,10 @@ mod tests {
         // Cancelled, so that a build not refused does not wait for its
         // agent, which is down: it fails as cancelled instead.
         ctx.cancelled.lock().unwrap().insert("test-key".into());
-        let refused = build.execute(&out_tx, Duration::from_secs(60)).err();
+        let mut lease = ctx.agents.lease().expect("a free slot");
+        let refused = build.execute(&mut lease, &out_tx, Duration::from_secs(60));
         assert_eq!(
-            refused.map(|e| chain(&e)).as_deref(),
+            refused.err().map(|e| chain(&e)).as_deref(),
             Some("refusing a build with network: this worker cannot give it a network of its own")
         );
         Ok(())

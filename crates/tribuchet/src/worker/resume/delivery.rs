@@ -18,6 +18,7 @@ use crate::errors::{Result, chain, err_msg};
 use crate::fsutil::io_ctx;
 use crate::proto::{BuildResult, BuildUsage, ChunkFrame, Manifest, WorkerMessage, worker_message};
 use crate::worker::build::ActiveBuild;
+use crate::worker::lease::Lease;
 use crate::worker::logtail::LogTail;
 use crate::worker::{WorkerCtx, msg, remove_build_dir};
 
@@ -275,10 +276,12 @@ pub(in crate::worker) fn persist_finished(key: &str, build_id: &str, fin: &Finis
 /// entry unfinished and the client waiting forever.
 pub(in crate::worker) fn execute_to_finished(
     build: &ActiveBuild,
+    lease: &mut Lease,
     out_tx: &mpsc::Sender<WorkerMessage>,
     timeout: Duration,
 ) -> FinishedBuild {
-    panic::catch_unwind(panic::AssertUnwindSafe(|| build.execute(out_tx, timeout)))
+    let run = || build.execute(lease, out_tx, timeout);
+    panic::catch_unwind(panic::AssertUnwindSafe(run))
         .unwrap_or_else(|_| Err(err_msg("build execution panicked")))
         .unwrap_or_else(|e| {
             let e = chain(&e);

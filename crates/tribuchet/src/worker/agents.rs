@@ -7,13 +7,11 @@
 
 use std::fs;
 use std::io;
-use std::thread;
 use std::time::Duration;
 
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 #[cfg(target_os = "macos")]
 use std::fmt::Write as _;
@@ -26,7 +24,6 @@ use sandbox_proto::agent::{
 };
 use sandbox_proto::framing;
 
-use super::resume::CANCELLED;
 use crate::errors::{Error, Result, chain, err_ctx, err_msg};
 use crate::sockpath;
 
@@ -114,120 +111,6 @@ pub(super) fn seatbelt_profile(
 ",
     );
     Ok(profile)
-}
-
-/// The agent sockets. One build per agent, so the reachable ones bound
-/// the worker's concurrency.
-pub(super) struct AgentPool(Mutex<Pool>);
-
-struct Pool {
-    all: Vec<PathBuf>,
-    free: Vec<PathBuf>,
-    /// Agents nothing answered on, out of `free` until a probe reaches
-    /// them again.
-    down: Vec<PathBuf>,
-}
-
-impl AgentPool {
-    pub(super) fn new(sockets: Vec<PathBuf>) -> Self {
-        Self(Mutex::new(Pool {
-            all: sockets.clone(),
-            free: sockets,
-            down: Vec::new(),
-        }))
-    }
-
-    /// Lease a free agent and start the build on it. An agent nothing
-    /// answers on is marked down and the next one tried. With none
-    /// free the build waits, calling `waiting` once, until `cancelled`.
-    pub(super) fn start(
-        &self,
-        req: &StartRequest,
-        tmp_pack: &fs::File,
-        log: &fs::File,
-        cancelled: impl Fn() -> bool,
-        waiting: impl FnOnce(),
-    ) -> Result<(PathBuf, AgentBuild)> {
-        let mut waiting = Some(waiting);
-        loop {
-            let Some(socket) = self.0.lock().unwrap().free.pop() else {
-                if cancelled() {
-                    return Err(err_msg(CANCELLED));
-                }
-                if let Some(waiting) = waiting.take() {
-                    waiting();
-                }
-                thread::sleep(Duration::from_secs(1));
-                continue;
-            };
-            match AgentBuild::start(&socket, req, tmp_pack, log) {
-                Ok(build) => return Ok((socket, build)),
-                Err(e) if unreachable(&e) => {
-                    tracing::warn!(id = req.build_id, "{}; trying another agent", chain(&e));
-                    self.mark_down(&socket);
-                }
-                Err(e) => {
-                    self.release(socket);
-                    return Err(e);
-                }
-            }
-        }
-    }
-
-    /// Return an agent to the free list, also one that was down.
-    pub(super) fn release(&self, socket: PathBuf) {
-        let mut pool = self.0.lock().unwrap();
-        if pool.all.contains(&socket) && !pool.free.contains(&socket) {
-            pool.down.retain(|s| *s != socket);
-            pool.free.push(socket);
-        }
-    }
-
-    /// Take a specific agent out of the pool: an adopted build already
-    /// occupies it, so new builds must not be placed there.
-    pub(super) fn reserve(&self, socket: &Path) {
-        let mut pool = self.0.lock().unwrap();
-        pool.free.retain(|s| s != socket);
-        pool.down.retain(|s| s != socket);
-    }
-
-    /// Set an agent aside until a probe reaches it again. False if it
-    /// already was.
-    pub(super) fn mark_down(&self, socket: &Path) -> bool {
-        let mut pool = self.0.lock().unwrap();
-        pool.free.retain(|s| s != socket);
-        if pool.down.iter().any(|s| s == socket) {
-            return false;
-        }
-        pool.down.push(socket.to_path_buf());
-        true
-    }
-
-    /// Add sockets not seen before, down until a probe reaches them.
-    pub(super) fn discover(&self, sockets: Vec<PathBuf>) {
-        let mut pool = self.0.lock().unwrap();
-        for socket in sockets {
-            if !pool.all.contains(&socket) {
-                pool.all.push(socket.clone());
-                pool.down.push(socket);
-            }
-        }
-    }
-
-    /// Sockets not occupied by an adopted build.
-    pub(super) fn idle_sockets(&self) -> Vec<PathBuf> {
-        self.0.lock().unwrap().free.clone()
-    }
-
-    pub(super) fn down_sockets(&self) -> Vec<PathBuf> {
-        self.0.lock().unwrap().down.clone()
-    }
-
-    /// Agents that can run a build, leased or not.
-    pub(super) fn usable(&self) -> usize {
-        let pool = self.0.lock().unwrap();
-        pool.all.len() - pool.down.len()
-    }
 }
 
 /// Nothing listens on the agent socket, or the file is gone: a stopped

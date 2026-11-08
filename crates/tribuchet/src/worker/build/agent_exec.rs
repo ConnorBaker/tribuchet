@@ -23,6 +23,7 @@ use crate::tmpdir::pack_zstd_dir;
 use crate::worker::caps::requires_uid_range;
 #[cfg(target_os = "macos")]
 use crate::worker::caps::requires_uid_range;
+use crate::worker::lease::Lease;
 use crate::worker::logtail::tail_log;
 use crate::worker::resume::{FinishedBuild, ResumeState, Usage, persist_finished};
 use crate::worker::{WorkerCtx, agents, sandbox};
@@ -35,6 +36,7 @@ impl ActiveBuild {
     /// them readable.
     pub(in crate::worker) fn execute(
         &self,
+        lease: &mut Lease,
         out_tx: &mpsc::Sender<WorkerMessage>,
         timeout: Duration,
     ) -> Result<FinishedBuild> {
@@ -56,7 +58,7 @@ impl ActiveBuild {
         if self.reuse_outputs {
             return Ok(self.finish_reused());
         }
-        self.execute_on_agent(out_tx, timeout)
+        self.execute_on_agent(lease, out_tx, timeout)
     }
 
     /// Pack existing outputs without running a builder. Agent cleanup
@@ -84,6 +86,7 @@ impl ActiveBuild {
 
     fn execute_on_agent(
         &self,
+        lease: &mut Lease,
         out_tx: &mpsc::Sender<WorkerMessage>,
         timeout: Duration,
     ) -> Result<FinishedBuild> {
@@ -134,7 +137,7 @@ impl ActiveBuild {
             .create(true)
             .append(true)
             .open(self.dir.join("build.log"))?;
-        let started = self.ctx.agents.start(
+        let started = lease.start(
             &req,
             &fs::File::open(self.dir.join("top.tmpdir.zst"))
                 .map_err(io_ctx("opening", &self.dir.join("top.tmpdir.zst")))?,
@@ -192,7 +195,6 @@ impl ActiveBuild {
         let fin = supervise_agent(&self.ctx, &resume, self.dir.clone(), &socket, build);
         log_done.store(true, Ordering::Relaxed);
         let _ = tailer.join();
-        self.ctx.agents.release(socket);
         Ok(fin)
     }
 

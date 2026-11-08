@@ -56,7 +56,11 @@ fn startup_waits_on_no_agent_that_does_not_answer() -> Result<()> {
     );
     assert!(build.exists(), "the held build's state is gone");
     assert_eq!(held(&ctx, "k"), Some((true, false)));
-    assert_eq!(ctx.free_slots(), 0, "the held build left its slot free");
+    assert_eq!(
+        ctx.agents.room().free,
+        0,
+        "the held build left its slot free"
+    );
     Ok(())
 }
 
@@ -298,7 +302,7 @@ fn run(row: &str) -> Result<()> {
             "done" => state(Some((false, true))),
             "gone" => state(None),
             "idle" => until(row, || {
-                !ctx.agents.idle_sockets().is_empty() && ctx.free_slots() > 0
+                !ctx.agents.idle_sockets().is_empty() && ctx.agents.room().free > 0
             }),
             "killed" => until(&format!("killed while the replay waits: {row}"), || {
                 (h.calls.answered.lock().unwrap().iter()).any(|c| c.starts_with("kill"))
@@ -373,14 +377,15 @@ fn unreachable_agents_do_not_count_until_they_answer() -> Result<()> {
     drop(sockpath::bind(&stale)?);
     let ctx = WorkerCtx::for_test(dir.path(), 4, vec![live, stale.clone()])?;
     sweep_orphaned_agent_builds(&ctx, ctx.agents.idle_sockets());
-    assert_eq!(ctx.jobs(), 1);
-    let _slot = ctx.try_slot().unwrap();
-    assert!(ctx.try_slot().is_none());
+    assert_eq!(ctx.agents.room().capacity, 1);
+    let _lease = ctx.agents.lease().unwrap();
+    assert!(ctx.agents.lease().is_none());
 
     fs::remove_file(&stale)?;
     spawn_agent(&stale, dir.path().join("a2"))?;
     rescan_agents(&ctx, None);
-    assert_eq!((ctx.jobs(), ctx.free_slots()), (2, 1));
+    let room = ctx.agents.room();
+    assert_eq!((room.capacity, room.free), (2, 1));
     Ok(())
 }
 
@@ -413,7 +418,7 @@ fn a_silent_agent_does_not_stop_the_rescan() -> Result<()> {
         "the rescan still waits on the silent agent after 30 s"
     );
     assert_eq!(ctx.agents.down_sockets(), vec![silent]);
-    assert_eq!(ctx.jobs(), 1);
+    assert_eq!(ctx.agents.room().capacity, 1);
     Ok(())
 }
 
@@ -434,7 +439,7 @@ fn an_agent_silent_on_shutdown_does_not_stop_the_rescan() -> Result<()> {
         "the rescan still waits on Shutdown after 30 s"
     );
     assert_eq!(calls.asked.load(SeqCst), 2, "Status and Shutdown");
-    assert_eq!(ctx.jobs(), 1);
+    assert_eq!(ctx.agents.room().capacity, 1);
     Ok(())
 }
 
@@ -447,7 +452,7 @@ fn rescan_adds_new_agent_sockets() -> Result<()> {
     fs::create_dir(&agents)?;
     spawn_agent(&agents.join("1.sock"), dir.path().join("a1"))?;
     let ctx = WorkerCtx::for_test(dir.path(), 2, agent_sockets_in(&agents)?)?;
-    assert_eq!(ctx.jobs(), 1);
+    assert_eq!(ctx.agents.room().capacity, 1);
     for i in 2..=3 {
         spawn_agent(
             &agents.join(format!("{i}.sock")),
@@ -455,8 +460,8 @@ fn rescan_adds_new_agent_sockets() -> Result<()> {
         )?;
     }
     rescan_agents(&ctx, Some(&agents));
-    assert_eq!(ctx.agents.usable(), 3);
-    assert_eq!(ctx.jobs(), 2);
+    assert_eq!(ctx.agents.idle_sockets().len(), 3);
+    assert_eq!(ctx.agents.room().capacity, 2);
     Ok(())
 }
 

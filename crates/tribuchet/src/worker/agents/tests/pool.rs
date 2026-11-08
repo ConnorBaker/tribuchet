@@ -4,7 +4,9 @@
 use super::*;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
+
+use crate::worker::lease::{Lease, Pool};
 
 use sandbox_proto::agent::{AdoptReply, ERROR_UNKNOWN_BUILD, Empty, StatusReply};
 
@@ -28,66 +30,77 @@ fn an_adopted_running_build_ends_at_its_agents_kill() -> Result<()> {
     cleanup(&socket, build_id)
 }
 
-/// A stopped socket unit's file, a missing socket and one that
-/// drops the call unanswered (a failing agent service) sit on top
-/// of the free list. The build skips them and lands on the live
-/// agent. An error the agent replies with leaves it in the pool.
+/// A lease started on a thread of its own, with the agent at `dir`'s pack
+/// and log: it and its start arrive on the receiver.
+fn start(mut lease: Lease, req: &StartRequest, dir: &Path, cancelled: bool) -> Started {
+    let (tx, rx) = mpsc::channel();
+    let (req, dir) = (req.clone(), dir.to_path_buf());
+    thread::spawn(move || {
+        let pack = fs::File::open(dir.join("top.tmpdir.zst")).unwrap();
+        let log = fs::File::create(dir.join("build.log")).unwrap();
+        let started = lease.start(&req, &pack, &log, || cancelled, || {});
+        let _ = tx.send((lease, started));
+    });
+    rx
+}
+
+type Started = mpsc::Receiver<(Lease, Result<(PathBuf, AgentBuild)>)>;
+
+/// What `started` gives within 30 s: a start that waits for good fails the
+/// test instead of hanging it.
+fn within(started: &Started) -> (PathBuf, AgentBuild) {
+    let started = started.recv_timeout(Duration::from_secs(30));
+    started
+        .expect("a start still runs after 30 s: no wake reached its lease")
+        .1
+        .unwrap()
+}
+
+/// A stopped socket unit's file, a missing socket and one that drops the
+/// call unanswered (a failing agent service) are leased first. The build
+/// skips them, setting each down, and starts on the live agent. Then it is
+/// the only agent up: a lease whose start the agent refuses (Busy) keeps
+/// it, and one whose agent does not answer is cancelled, still counted,
+/// or waits until a probe brings an agent back, and starts there.
 #[test]
-fn start_skips_unreachable_agents() -> Result<()> {
+fn a_lease_skips_unreachable_agents_and_waits_for_one() -> Result<()> {
     let dir = tempfile::tempdir()?;
-    let (live, pack_path) = spawn_test_agent(dir.path())?;
+    let (live, _) = spawn_test_agent(dir.path())?;
     let stale = dir.path().join("stale.sock");
     drop(sockpath::bind(&stale)?);
     let missing = dir.path().join("missing.sock");
     let dead = dir.path().join("dead.sock");
     let listener = sockpath::bind(&dead)?;
     thread::spawn(move || drop(listener.accept()));
-    let mut sockets = vec![live.clone(), missing.clone(), stale.clone()];
-    sockets.push(dead.clone());
-    let pool = AgentPool::new(sockets);
+    let sockets = vec![live.clone(), missing.clone(), stale.clone(), dead.clone()];
+    let pool = Pool::new(sockets, 4);
     let build_id = "00000000000000000000000000000002";
     let req = start_request(build_id, "true".into(), vec![]);
-    let pack = fs::File::open(&pack_path)?;
-    let log = fs::File::create(dir.path().join("build.log"))?;
-    let (socket, build) = pool.start(&req, &pack, &log, || false, || {})?;
-    assert_eq!(socket, live);
-    assert_eq!(build.wait_exit()?.exit_code, 0);
-    assert_eq!(pool.down_sockets(), vec![dead, stale, missing]);
-    assert_eq!(pool.usable(), 1);
-    pool.release(live.clone());
-    let busy = pool.start(&req, &pack, &log, || false, || {});
-    assert!(busy.is_err());
-    assert_eq!(pool.usable(), 1);
-    cleanup(&live, build_id)
-}
+    let (socket, build) = within(&start(pool.lease().unwrap(), &req, dir.path(), false));
+    assert_eq!((socket, build.wait_exit()?.exit_code), (live.clone(), 0));
+    assert_eq!(pool.down_sockets(), vec![dead, stale, missing.clone()]);
+    let busy = start(pool.lease().unwrap(), &req, dir.path(), false);
+    let (busy, refused) = busy.recv_timeout(Duration::from_secs(30)).unwrap();
+    assert!(refused.is_err());
+    // It keeps the agent: none free, one up.
+    assert_eq!((pool.idle_sockets().len(), pool.room().capacity), (0, 1));
+    drop(busy);
+    cleanup(&live, build_id)?;
 
-/// With no agent reachable a build waits instead of failing, until
-/// it is cancelled or an agent is back.
-#[test]
-fn start_waits_for_an_agent() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let (_, pack_path) = spawn_test_agent(dir.path())?;
-    let socket = dir.path().join("down.sock");
-    let pool = AgentPool::new(vec![socket.clone()]);
-    let build_id = "00000000000000000000000000000003";
-    let req = start_request(build_id, "true".into(), vec![]);
-    let pack = fs::File::open(&pack_path)?;
-    let log = fs::File::create(dir.path().join("build.log"))?;
-    let Err(e) = pool.start(&req, &pack, &log, || true, || {}) else {
-        panic!("started on an unreachable agent");
-    };
-    assert_eq!(chain(&e), "build cancelled");
-    thread::scope(|s| {
-        let started = s.spawn(|| pool.start(&req, &pack, &log, || false, || {}));
-        thread::sleep(Duration::from_millis(1500));
-        assert!(!started.is_finished(), "the build did not wait");
-        spawn_agent(&socket, dir.path().join("down"))?;
-        pool.release(socket.clone());
-        let (leased, build) = started.join().unwrap()?;
-        assert_eq!(leased, socket);
-        assert_eq!(build.wait_exit()?.exit_code, 0);
-        cleanup(&socket, build_id)
-    })
+    fs::remove_file(&live)?;
+    let cancelled = start(pool.lease().unwrap(), &req, dir.path(), true);
+    let (lease, cancelled) = cancelled.recv_timeout(Duration::from_secs(30)).unwrap();
+    let cancelled = cancelled.err().map(|e| chain(&e));
+    assert_eq!(cancelled.as_deref(), Some("build cancelled"));
+    assert_eq!((pool.room().capacity, pool.room().leases), (0, 1));
+    let started = start(lease, &req, dir.path(), false);
+    let early = started.recv_timeout(Duration::from_millis(500));
+    assert!(early.is_err(), "the build did not wait");
+    spawn_agent(&missing, dir.path().join("back"))?;
+    pool.probe_up(&missing);
+    let (socket, build) = within(&started);
+    assert_eq!((socket, build.wait_exit()?.exit_code), (missing.clone(), 0));
+    cleanup(&missing, build_id)
 }
 
 /// What a stand-in agent was asked: how many calls reached it, and each
