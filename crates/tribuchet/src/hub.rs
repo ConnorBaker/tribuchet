@@ -42,7 +42,6 @@ mod state;
 mod submit;
 #[cfg(test)]
 mod testlog;
-pub use record::import_journal;
 pub use serve::run;
 
 use crate::errors::{Error, Result, chain};

@@ -65,18 +65,6 @@ enum Command {
         #[arg(long, default_value = "/etc/tribuchet/worker.toml")]
         config: PathBuf,
     },
-    /// Import the hub's journal on stdin (`journalctl -u tribuchet-hub
-    /// -o cat`) into its build record, once, with the hub stopped and
-    /// before the record's first row: a migration, removed after the
-    /// farm's import. Nothing is imported where a line does not parse or
-    /// the record holds a row from before the journal's last line.
-    ImportJournal {
-        /// The hub's record: hub.toml's [placement] record, else
-        /// record.sqlite in the hub's $XDG_STATE_HOME/tribuchet
-        /// (/var/lib/tribuchet under the NixOS module).
-        #[arg(long)]
-        record: PathBuf,
-    },
     /// Certificate authority management (init CA, issue worker certs).
     Ca {
         #[command(subcommand)]
@@ -167,9 +155,6 @@ fn run() -> Result<(), Error> {
             cfg.apply_env_overrides();
             tracing::info!(?cfg, "worker configuration");
             worker::run(cfg)
-        }
-        Command::ImportJournal { record } => {
-            hub::import_journal(&record, io::stdin().lock()).map(|_| ())
         }
         Command::Ca { action } => Ok(ca::run(action)?),
         Command::Agent {

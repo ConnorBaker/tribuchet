@@ -30,13 +30,6 @@ use crate::proto::BuildUsage;
 #[path = "record/tests.rs"]
 mod tests;
 
-#[path = "record/import.rs"]
-mod import;
-pub use import::import_journal;
-#[cfg(test)]
-#[path = "record/import_tests.rs"]
-mod import_tests;
-
 /// The schema `user_version` 1 names. A column takes NULL where its value
 /// is not known: a field a journal line predates, or a result's system
 /// where its build was queued before the imported journal begins.

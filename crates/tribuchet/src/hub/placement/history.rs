@@ -31,9 +31,6 @@
 use std::collections::{HashMap, VecDeque};
 use std::iter;
 
-#[cfg(test)]
-use serde::{Deserialize, Serialize};
-
 use crate::proto::BuildUsage;
 
 /// Runs kept per key and prefix (a class keeps CLASS_WINDOW).
@@ -111,7 +108,6 @@ impl Expected {
 /// One run as the worker measured it: peak bytes, CPU and running
 /// milliseconds, and whether it succeeded.
 #[derive(Clone, Copy, Debug, PartialEq)]
-#[cfg_attr(test, derive(Serialize, Deserialize))]
 struct Run(u64, u64, u64, bool);
 
 impl Run {
@@ -139,11 +135,9 @@ impl Run {
 
 /// The runs of a key, prefix or class, newest last.
 #[derive(Clone, Default)]
-#[cfg_attr(test, derive(Serialize, Deserialize))]
 struct Runs {
     runs: VecDeque<Run>,
     /// OOM-killed runs ever.
-    #[cfg_attr(test, serde(default))]
     oom: u32,
 }
 
@@ -252,11 +246,7 @@ pub(in crate::hub) struct Build<'a> {
 }
 
 /// Entries are never dropped: the fold of the build record (record.rs).
-/// The farm's placement-history.json, the file this was
-/// kept in before the record, held 7,677 keys on 2026-11-08 (serialised
-/// in tests only, to compare the record's fold with it).
 #[derive(Clone, Default)]
-#[cfg_attr(test, derive(Serialize, Deserialize))]
 pub(in crate::hub) struct History {
     /// "system/pname" to its runs.
     keys: HashMap<String, Runs>,
