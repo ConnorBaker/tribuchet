@@ -84,10 +84,7 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>) {
     let asked: Vec<_> = thread::scope(|s| {
         let calls: Vec<_> = running
             .iter()
-            .map(|(_, st)| {
-                ctx.agents.reserve(&st.agent_socket);
-                s.spawn(|| agents::AgentBuild::adopt(&st.agent_socket, &st.build_id))
-            })
+            .map(|(_, st)| s.spawn(|| agents::AgentBuild::adopt(&st.agent_socket, &st.build_id)))
             .collect();
         calls
             .into_iter()
@@ -109,7 +106,10 @@ async fn settle(
     answer: Result<(agents::AgentBuild, Option<i32>)>,
 ) {
     match answer {
-        Ok((build, _)) => adopt(ctx, st, dir, build, ctx.try_slot()).await,
+        Ok((build, _)) => {
+            let slot = ctx.reserve(&st.agent_socket);
+            adopt(ctx, st, dir, build, slot).await;
+        }
         Err(e) if agents::unreachable(&e) => {
             tracing::warn!(
                 id = st.build_id,
@@ -158,7 +158,7 @@ fn kill_held(
     dir: &Path,
     build: Option<agents::AgentBuild>,
     tail: Option<LogTail>,
-    slot: Option<Slot>,
+    slot: Slot,
 ) {
     if let Some(build) = build {
         unrecord(dir);
@@ -188,7 +188,7 @@ async fn adopt(
     st: ResumeState,
     dir: PathBuf,
     build: agents::AgentBuild,
-    slot: Option<Slot>,
+    slot: Slot,
 ) {
     tracing::info!(id = st.build_id, pid = st.pid, "adopted running build");
     let socket = st.agent_socket.clone();
@@ -233,7 +233,7 @@ fn wait_for_agent(ctx: &Arc<WorkerCtx>, st: ResumeState, dir: PathBuf) {
         e.adopting = true;
     }
     ctx.wait_for_agent(&key, true);
-    let slot = ctx.try_slot();
+    let slot = ctx.reserve(&st.agent_socket);
     let ctx = ctx.clone();
     let rt = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
