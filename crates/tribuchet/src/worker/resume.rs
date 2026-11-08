@@ -14,10 +14,9 @@ use harmonia_store_path::StoreDir;
 use harmonia_store_remote::{DaemonClient, DaemonStore};
 
 use super::build::supervise_agent;
+use super::lease::Lease;
 use super::logtail::LogTail;
-use super::{
-    DaemonConn, Slot, WorkerCtx, agent_sockets_in, agents, msg, remove_build_dir, sandbox,
-};
+use super::{DaemonConn, WorkerCtx, agent_sockets_in, agents, msg, remove_build_dir, sandbox};
 use crate::errors::{Result, chain};
 use crate::fsutil::io_ctx;
 use crate::proto::{BuildResult, worker_message};
@@ -107,8 +106,8 @@ async fn settle(
 ) {
     match answer {
         Ok((build, _)) => {
-            let slot = ctx.reserve(&st.agent_socket);
-            adopt(ctx, st, dir, build, slot).await;
+            let lease = ctx.agents.lease_this(&st.agent_socket);
+            adopt(ctx, st, dir, build, lease).await;
         }
         Err(e) if agents::unreachable(&e) => {
             tracing::warn!(
@@ -125,7 +124,7 @@ async fn settle(
                 "re-adopting build from its agent: {}",
                 chain(&e)
             );
-            ctx.agents.release(st.agent_socket.clone());
+            ctx.agents.probe_up(&st.agent_socket);
             remove_build_dir(&dir);
         }
     }
@@ -139,33 +138,30 @@ async fn settle(
 /// next sweep kills (sweep_orphaned_agent_builds).
 fn kill_unconfined(ctx: &Arc<WorkerCtx>, st: ResumeState, dir: PathBuf, why: &'static str) {
     tracing::warn!(id = st.build_id, "killing a build its agent runs {why}");
-    let slot = ctx.reserve(&st.agent_socket);
-    let ctx = ctx.clone();
+    let lease = ctx.agents.lease_this(&st.agent_socket);
     tokio::task::spawn_blocking(move || {
         let build = answered(&st, || {}).ok().map(|(build, _)| build);
-        kill_held(&ctx, st, &dir, build, None, slot);
+        kill_held(st, &dir, build, None, lease);
     });
 }
 
 /// Kill the held build `st` if its agent answered with it (`build`): its
 /// state.json goes before the kill, so a worker stopped meanwhile has
-/// nothing to adopt; its agent and `slot`, no longer used, are handed back
-/// after it; its log tailer `tail`, which drains up to the end of the log
-/// the run still writes, stops then, and its dir with it.
+/// nothing to adopt; its `lease`, no longer used, is handed back after it;
+/// its log tailer `tail`, which drains up to the end of the log the run
+/// still writes, stops then, and its dir with it.
 fn kill_held(
-    ctx: &WorkerCtx,
     st: ResumeState,
     dir: &Path,
     build: Option<agents::AgentBuild>,
     tail: Option<LogTail>,
-    slot: Slot,
+    lease: Lease,
 ) {
     if let Some(build) = build {
         unrecord(dir);
         kill(&st, build);
     }
-    ctx.agents.release(st.agent_socket);
-    drop(slot);
+    drop(lease);
     remove_state(tail, dir);
 }
 
@@ -182,13 +178,13 @@ fn answered(st: &ResumeState, meanwhile: impl Fn()) -> Result<(agents::AgentBuil
     }
 }
 
-/// Supervise an adopted build to its end in `slot`, then record it.
+/// Supervise an adopted build to its end in `lease`, then record it.
 async fn adopt(
     ctx: &Arc<WorkerCtx>,
     st: ResumeState,
     dir: PathBuf,
     build: agents::AgentBuild,
-    slot: Slot,
+    lease: Lease,
 ) {
     tracing::info!(id = st.build_id, pid = st.pid, "adopted running build");
     let socket = st.agent_socket.clone();
@@ -211,10 +207,8 @@ async fn adopt(
         let ctx = task_ctx;
         let key = st.dedupe_key.clone();
         let fin = supervise_agent(&ctx, &st, dir, &socket, build);
-        ctx.agents.release(socket);
         // Roots live until the outputs are packed.
-        drop(gc_roots);
-        drop(slot);
+        drop((gc_roots, lease));
         record_finished(&ctx, &key, fin);
     });
 }
@@ -233,7 +227,7 @@ fn wait_for_agent(ctx: &Arc<WorkerCtx>, st: ResumeState, dir: PathBuf) {
         e.adopting = true;
     }
     ctx.wait_for_agent(&key, true);
-    let slot = ctx.reserve(&st.agent_socket);
+    let lease = ctx.agents.lease_this(&st.agent_socket);
     let ctx = ctx.clone();
     let rt = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
@@ -257,16 +251,15 @@ fn wait_for_agent(ctx: &Arc<WorkerCtx>, st: ResumeState, dir: PathBuf) {
             }
         };
         match answer {
-            Ok((build, _)) if cancelled => kill_held(&ctx, st, &dir, Some(build), tail, slot),
-            Ok((build, _)) => rt.block_on(adopt(&ctx, st, dir, build, slot)),
+            Ok((build, _)) if cancelled => kill_held(st, &dir, Some(build), tail, lease),
+            Ok((build, _)) => rt.block_on(adopt(&ctx, st, dir, build, lease)),
             Err(e) => {
                 tracing::warn!(
                     id = st.build_id,
                     "its agent answered at last, without the build: {}",
                     chain(&e)
                 );
-                ctx.agents.release(st.agent_socket);
-                drop(slot);
+                drop(lease);
                 if cancelled {
                     remove_state(tail, &dir);
                 } else {
@@ -375,7 +368,7 @@ pub(super) fn sweep_orphaned_agent_builds(ctx: &Arc<WorkerCtx>, sockets: Vec<Pat
                 if let Err(e) = agents::shutdown(&socket) {
                     tracing::warn!("agent shutdown {}: {}", socket.display(), chain(&e));
                 }
-                ctx.agents.release(socket);
+                ctx.agents.probe_up(&socket);
                 continue;
             }
             Err(e) if agents::unreachable(&e) => {
@@ -392,13 +385,11 @@ pub(super) fn sweep_orphaned_agent_builds(ctx: &Arc<WorkerCtx>, sockets: Vec<Pat
         tracing::warn!(id, "cleaning up an orphaned agent build");
         // Cleanup is slow. Run it in the background, with the agent
         // reserved, so the hub connection is not delayed.
-        let slot = ctx.reserve(&socket);
-        let ctx = ctx.clone();
+        let lease = ctx.agents.lease_this(&socket);
         tokio::task::spawn_blocking(move || {
-            let _slot = slot;
             let _ = agents::kill(&socket, &id);
             agents::retire(&socket, &id, "orphaned build cleanup");
-            ctx.agents.release(socket);
+            drop(lease);
         });
     }
 }
@@ -426,14 +417,7 @@ fn rescan_agents(ctx: &Arc<WorkerCtx>, dir: Option<&Path>) {
             Err(e) => tracing::warn!("agent-sockets-dir {}: {e}", dir.display()),
         }
     }
-    let before = ctx.agents.usable();
     sweep_orphaned_agent_builds(ctx, ctx.agents.down_sockets());
-    let usable = ctx.agents.usable();
-    if usable > before {
-        tracing::info!(usable, "build agents joined");
-        // The session hands out the new slots and re-declares capacity.
-        ctx.slot_freed.notify_one();
-    }
 }
 
 /// Take fresh temp roots for an adopted build's inputs on a new daemon

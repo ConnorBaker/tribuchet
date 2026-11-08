@@ -7,11 +7,14 @@ use std::path::Path;
 use std::thread;
 use std::time::{Duration, Instant};
 
+use futures_util::FutureExt;
+
 use super::tests::base_assignment;
 use super::*;
-use crate::proto::{WorkerMessage, worker_message};
+use crate::proto::{CancelBuild, WorkerMessage, worker_message};
 use crate::worker::hostname;
 use crate::worker::resume::ResumableBuild;
+use crate::worker::session::handle_cancel;
 
 type Woken = mpsc::UnboundedReceiver<Wake>;
 
@@ -156,7 +159,8 @@ fn every_wait_is_told_as_the_table_says() -> Result<()> {
         let on_rt = rt.handle().clone();
         let running = thread::spawn(move || {
             let _rt = on_rt.enter();
-            build.execute(&old_tx, Duration::from_millis(1))
+            let mut lease = build.ctx.agents.lease().expect("a free slot");
+            build.execute(&mut lease, &old_tx, Duration::from_millis(1))
         });
         let waits = |m: &HashMap<String, ResumableBuild>| m["test-key"].waiting_for_agent;
         let end = Instant::now() + Duration::from_secs(10);
@@ -178,14 +182,25 @@ fn every_wait_is_told_as_the_table_says() -> Result<()> {
                 "row {row}: not held"
             );
         }
-        let cancel = || ctx.cancelled.lock().unwrap().insert("test-key".into());
-        if full {
-            cancel();
+        // As the hub's cancel comes: through the session, which wakes it.
+        let cancel = || {
+            let c = CancelBuild {
+                build_id: old_id.clone(),
+                dedupe_key: "test-key".into(),
+            };
+            let cancelled = handle_cancel(c, &mut HashMap::new(), &new_tx, &ctx).now_or_never();
+            assert!(matches!(cancelled, Some(Ok(()))));
             let end = Instant::now() + Duration::from_secs(5);
             while !running.is_finished() {
-                assert!(Instant::now() < end, "row {row}: stuck on the full session");
+                assert!(
+                    Instant::now() < end,
+                    "row {row}: the cancel did not end the wait"
+                );
                 thread::sleep(Duration::from_millis(10));
             }
+        };
+        if full {
+            cancel();
         }
         for _ in 0..queued {
             assert_eq!(

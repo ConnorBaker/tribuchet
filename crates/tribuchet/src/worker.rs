@@ -20,6 +20,7 @@ mod build;
 #[cfg(test)]
 pub(crate) use build::chunk_tests;
 mod caps;
+mod lease;
 mod logtail;
 mod pins;
 mod resume;
@@ -42,7 +43,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use harmonia_store_remote::DaemonClient;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::mpsc;
 
 use caps::host_system;
 use logtail::spawn_log_tail;
@@ -79,14 +80,6 @@ struct WorkerCtx {
     secret_paths: Vec<PathBuf>,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     sandbox: bool,
-    /// Slots taken (Slot): one per running build, past `jobs()` only by
-    /// builds that ran already (`reserve`).
-    held: Mutex<usize>,
-    /// The max-jobs setting.
-    max_jobs: usize,
-    /// A `Slot` dropped or an agent joined. The session loop
-    /// re-declares capacity.
-    slot_freed: Notify,
     /// dedupe_key -> build past staging; survives session loss so a
     /// replacement hub can resume instead of rebuilding.
     resumable: Mutex<HashMap<String, ResumableBuild>>,
@@ -103,8 +96,8 @@ struct WorkerCtx {
     max_log_size: u64,
     /// memory.max for each build's cgroup.
     build_memory_max_bytes: Option<u64>,
-    /// The per-uid build agents, one leased per build.
-    agents: agents::AgentPool,
+    /// The per-uid build agents, one leased per build with its slot.
+    agents: Arc<lease::Pool>,
     /// Freezes and thaws the running builds and counts their frozen time.
     arbiter: Arc<arbiter::Arbiter>,
     /// Dedupe keys of builds the hub cancelled; the supervising loops
@@ -328,55 +321,6 @@ fn msg(m: worker_message::Msg) -> WorkerMessage {
     WorkerMessage { msg: Some(m) }
 }
 
-/// A build slot. Dropping it frees the slot, then wakes the session
-/// loop to hand it to a staged build.
-pub(crate) struct Slot {
-    ctx: Arc<WorkerCtx>,
-}
-
-impl Drop for Slot {
-    fn drop(&mut self) {
-        // Free first: a loop woken before would find no free slot and
-        // wait for a wake that does not come.
-        *self.ctx.held.lock().unwrap() -= 1;
-        self.ctx.slot_freed.notify_one();
-    }
-}
-
-impl WorkerCtx {
-    /// Builds that can run at once: one per reachable agent, at most
-    /// max-jobs.
-    fn jobs(&self) -> usize {
-        self.max_jobs.min(self.agents.usable())
-    }
-
-    /// Slots a build can take now.
-    fn free_slots(&self) -> usize {
-        let held = *self.held.lock().unwrap();
-        self.jobs().saturating_sub(held)
-    }
-
-    /// A free slot, checked and taken under `held`'s lock: two callers
-    /// never take the same one.
-    fn try_slot(self: &Arc<Self>) -> Option<Slot> {
-        let mut held = self.held.lock().unwrap();
-        (*held < self.jobs()).then(|| {
-            *held += 1;
-            Slot { ctx: self.clone() }
-        })
-    }
-
-    /// Take agent `socket`, which runs a build already, out of the pool
-    /// with a slot, in one step (no caller takes the slot an agent back
-    /// from down frees first), free or not: the build runs either way.
-    fn reserve(self: &Arc<Self>, socket: &Path) -> Slot {
-        let mut held = self.held.lock().unwrap();
-        self.agents.reserve(socket);
-        *held += 1;
-        Slot { ctx: self.clone() }
-    }
-}
-
 pub fn run(opts: WorkerConfig) -> Result<()> {
     let rt = rt::runtime("trib-worker").map_err(err_ctx("creating the tokio runtime"))?;
     rt.block_on(run_async(opts))
@@ -455,7 +399,7 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         opts.agent_sockets.extend(found);
     }
     // Every build runs on one agent, so the reachable agents bound
-    // concurrency (WorkerCtx::jobs).
+    // concurrency (lease::Pool::capacity).
     if opts.agent_sockets.is_empty() {
         return Err(err_msg("agent-sockets must list at least one build agent"));
     }
@@ -473,9 +417,6 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         sandbox_bin_sh: opts.sandbox_bin_sh.clone(),
         secret_paths: vec![opts.key.clone()],
         sandbox: opts.sandbox,
-        held: Mutex::new(0),
-        max_jobs: opts.max_jobs.max(1) as usize,
-        slot_freed: Notify::new(),
         import_jobs: opts.import_jobs.max(1) as usize,
         chunks: open_chunk_store(&opts)?,
         cancelled: Mutex::new(HashSet::new()),
@@ -487,7 +428,7 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         max_silent_time: Duration::from_secs(opts.max_silent_time_secs),
         max_log_size: opts.max_log_size,
         build_memory_max_bytes: opts.build_memory_max_bytes,
-        agents: agents::AgentPool::new(opts.agent_sockets.clone()),
+        agents: lease::Pool::new(opts.agent_sockets.clone(), opts.max_jobs.max(1) as usize),
         arbiter: arbiter::Arbiter::new(),
     });
 
@@ -563,9 +504,6 @@ mod tests {
                 sandbox_bin_sh: None,
                 secret_paths: vec![],
                 sandbox: false,
-                held: Mutex::new(0),
-                max_jobs,
-                slot_freed: Notify::new(),
                 resumable: Mutex::new(HashMap::new()),
                 emulators: HashMap::new(),
                 fod_isolation: false,
@@ -573,7 +511,7 @@ mod tests {
                 max_silent_time: Duration::ZERO,
                 max_log_size: 0,
                 build_memory_max_bytes: None,
-                agents: agents::AgentPool::new(agents),
+                agents: lease::Pool::new(agents, max_jobs),
                 arbiter: arbiter::Arbiter::off(),
                 cancelled: Mutex::new(HashSet::new()),
                 claims: build::Claims::default(),

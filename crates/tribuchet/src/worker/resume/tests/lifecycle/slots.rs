@@ -4,7 +4,7 @@ use super::*;
 
 /// Max-jobs `max_jobs`, the agents `pool` (of 1.sock and 2.sock): B1
 /// adopted on 1.sock and running; `then` leaves a build that runs already
-/// on 2.sock; B1 killed. Once B1 is recorded, the slots free and jobs():
+/// on 2.sock; B1 killed. Once B1 is recorded, the slots free and the capacity:
 /// what is on 2.sock still holds its slot then. A failure fails the test
 /// (B1 not recorded within 60 s too), not hangs it: the runtime is shut
 /// down however the test ends (`Down`).
@@ -33,7 +33,8 @@ fn once_b1_ends(
     while !recorded() && Instant::now() < end {
         thread::sleep(Duration::from_millis(1));
     }
-    let slots = (ctx.free_slots(), ctx.jobs());
+    let room = ctx.agents.room();
+    let slots = (room.free, room.capacity);
     // B2, if adopted, ends, and its supervisor with it (a kill call to an
     // agent that does not answer would wait for good).
     let map = ctx.resumable.lock().unwrap();
