@@ -216,8 +216,8 @@ other run removes but the launch that displaces its result). The replacement wor
 from their agents, supervises them to completion and redelivers finished
 results. A build leases a slot and its agent together, only while fewer
 than min(`max-jobs`, reachable agents) leases are held; a build that runs
-already when it starts (adopted, held, killed as unconfined, an orphan's
-cleanup) leases its own agent past that, until it ends, and takes a slot
+already when it starts (adopted, held, an orphan's cleanup) leases its
+own agent past that, until it ends, and takes a slot
 from the pool even when that agent is outside it. A running build whose
 agent does not answer keeps its key and its lease until the agent
 answers, and its clients are told it waits. A build whose agent did not

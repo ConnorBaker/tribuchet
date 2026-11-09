@@ -72,7 +72,7 @@ pub(super) async fn session(opts: &WorkerConfig, ctx: &Arc<WorkerCtx>) -> Result
             build_memory: build_memory(
                 Path::new("/sys/fs/cgroup"),
                 Path::new("/proc/meminfo"),
-                &own_cgroup(),
+                &own_cgroup().unwrap_or_default(),
             ),
         })))
         .await?;
