@@ -169,7 +169,7 @@ impl Drop for Held {
     }
 }
 
-fn held_build(has: bool, exit: Option<i32>, network: bool) -> Result<Held> {
+fn held_build(has: bool, exit: Option<i32>) -> Result<Held> {
     let dir = tempfile::tempdir()?;
     let (build, socket) = (dir.path().join("builds/b1"), dir.path().join("agent.sock"));
     fs::create_dir_all(&build)?;
@@ -185,9 +185,7 @@ fn held_build(has: bool, exit: Option<i32>, network: bool) -> Result<Held> {
     };
     let id = if has { HELD } else { "" };
     let calls = fake_agent(&socket, id, exit, allow.clone(), seen)?;
-    let mut st = resume_state(HELD, socket.clone());
-    st.spec.network = network;
-    st.persist(&build)?;
+    resume_state(HELD, socket.clone()).persist(&build)?;
     let ctx = WorkerCtx::for_test(dir.path(), 4, vec![socket])?;
     let _ = cell.set(ctx.clone());
     let rt = tokio::runtime::Runtime::new()?;
@@ -245,9 +243,6 @@ const SCENARIOS: &[&str] = &[
     // replay is stopped before its dir goes, not left to write an offset
     // there meanwhile ("directory not empty").
     "lost cap1 | fill assign:old cancel:old cancelled:old log:1638400 replayed:8192 open gone idle unrecorded drain:old removed stopped:old | adopt running k",
-    // Left by an older worker with network in the host's network: killed,
-    // not adopted, its key never offered.
-    "has net | gone open idle removed gone | adopt running, kill none, cleanup none, other none",
 ];
 
 /// Each held build's scenario, all at once (each waits on its agent).
@@ -273,8 +268,8 @@ fn run(row: &str) -> Result<()> {
     };
     let flag = |f| flags.split(' ').any(|x| x == f);
     // The agent "has" the build or has "lost" it; it "exit"s 0 once adopted
-    // (or runs until killed); its spec had network in the host's ("net").
-    let h = held_build(flag("has"), flag("exit").then_some(0), flag("net"))?;
+    // (or runs until killed).
+    let h = held_build(flag("has"), flag("exit").then_some(0))?;
     let (ctx, build, log) = (&h.ctx, &h.build, h.build.join("build.log"));
     let mut sessions = HashMap::new();
     let mut results: HashMap<&str, Vec<(String, String)>> = HashMap::new();

@@ -85,9 +85,9 @@ pub struct SandboxSpec {
     /// Uids mapped in that namespace at in-ns 0 (1 or 65536).
     #[serde(default)]
     pub leased_uid_count: Option<u32>,
-    /// Its network is a namespace of its own; set with `network`
-    /// (prepare). A spec with network but without it, as older workers sent
-    /// on a host without /dev/net/tun, is unconfined.
+    /// Set with `network` (prepare) for an agent still running an older
+    /// Tribuchet, which reads it: without it, such an agent runs a build
+    /// with network in the host's network, or refuses it.
     #[serde(default)]
     pub net_isolation: bool,
     /// Flow policy applied to that network.
@@ -115,21 +115,13 @@ pub struct SandboxSpec {
 }
 
 impl SandboxSpec {
-    /// Why a build with this spec may not run, if it may not: with
-    /// network but in the host's network, or with the host's nix-daemon
-    /// socket bound in (recursive Nix, which workers no longer serve). No
-    /// spec this worker sends is either, but one an older
-    /// worker persisted can still describe a running build: agents
-    /// outlive an upgrade.
+    /// Why a build with this spec may not run, if it may not: with the
+    /// host's nix-daemon socket bound in (recursive Nix, which workers no
+    /// longer serve). No spec this worker sends has it.
     pub fn unconfined(&self) -> Option<&'static str> {
-        if self.network && !self.net_isolation {
-            Some("with network in the host's network")
-        } else if (self.binds_ro.iter()).any(|(_, to)| to.starts_with("/nix/var/nix/daemon-socket"))
-        {
-            Some("with the host's nix-daemon socket")
-        } else {
-            None
-        }
+        (self.binds_ro.iter())
+            .any(|(_, to)| to.starts_with("/nix/var/nix/daemon-socket"))
+            .then_some("with the host's nix-daemon socket")
     }
 }
 
@@ -354,40 +346,22 @@ mod tests {
         }
     }
 
-    /// What a spec may not run with, whoever wrote it.
-    #[test]
-    fn network_in_the_hosts_network_or_its_daemon_is_unconfined() {
-        let dir = tempfile::tempdir().unwrap();
-        let spec = |network, net_isolation, bind: &str| SandboxSpec {
-            network,
-            net_isolation,
-            binds_ro: vec![(PathBuf::from("/x"), PathBuf::from(bind))],
-            ..test_spec(dir.path())
-        };
-        let socket = "/nix/var/nix/daemon-socket/socket";
-        assert_eq!(spec(false, false, "/nix/store/x").unconfined(), None);
-        assert_eq!(spec(true, true, "/nix/store/x").unconfined(), None);
-        let host = Some("with network in the host's network");
-        assert_eq!(spec(true, false, "/nix/store/x").unconfined(), host);
-        let daemon = Some("with the host's nix-daemon socket");
-        assert_eq!(spec(false, false, socket).unconfined(), daemon);
-        assert_eq!(spec(true, true, socket).unconfined(), daemon);
-    }
-
-    /// The setup stage refuses an unconfined spec before it enters any
-    /// namespace: the build never runs in the host's network.
+    /// The setup stage refuses a spec with the host's nix-daemon socket
+    /// before it enters any namespace; a store path is no such bind.
     #[test]
     fn the_setup_stage_refuses_an_unconfined_spec() {
         let dir = tempfile::tempdir().unwrap();
-        let spec = SandboxSpec {
-            network: true,
+        let spec = |bind: &str| SandboxSpec {
+            binds_ro: vec![(PathBuf::from("/x"), PathBuf::from(bind))],
             ..test_spec(dir.path())
         };
+        assert_eq!(spec("/nix/store/x").unconfined(), None);
         let status = fs::File::create(dir.path().join("status")).unwrap();
-        let err = platform::stage::enter_and_exec(&spec, &status).unwrap_err();
+        let socket = spec("/nix/var/nix/daemon-socket/socket");
+        let err = platform::stage::enter_and_exec(&socket, &status).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "refusing a build with network in the host's network"
+            "refusing a build with the host's nix-daemon socket"
         );
     }
 

@@ -202,7 +202,7 @@ fn every_cancel_and_assignment_ends_as_the_table_says() -> Result<()> {
 /// behind, it would fail the key's next run here "build cancelled".
 #[test]
 fn a_cancel_taken_as_a_held_builds_kill_is_decided_leaves_no_flag() -> Result<()> {
-    let h = held_build(true, None, false)?;
+    let h = held_build(true, None)?;
     // Full once the session is told of the wait: the first cancel's
     // failure then waits, after the agent answered, until it is taken.
     let (tx, mut rx) = tokio::sync::mpsc::channel(1);

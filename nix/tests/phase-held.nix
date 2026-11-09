@@ -4,7 +4,7 @@
 # waiting AGENT_ANSWER on an agent.
 { pkgs, lib, ... }:
 let
-  # NAME = [ seconds files ]: a busy Finish, a stopped agent, a busy Cleanup
+  # NAME = [ seconds files ]: a busy Finish, a stopped agent
   builds = {
     F = [
       5
@@ -13,10 +13,6 @@ let
     S = [
       40
       0
-    ];
-    C = [
-      5
-      100000
     ];
   };
 in

@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::errors::{Result, err_msg};
 use crate::fsutil::stat_field;
+use crate::worker::caps::cgroup_path;
 
 /// The build cgroup holding `pid`, from `/proc/<pid>/cgroup` cut at
 /// `build-<build_id>` (the payload may have moved the pid into a
@@ -25,12 +26,6 @@ fn cgroup_dir(proc_cgroup: &str, build_id: &str) -> Option<PathBuf> {
     let dirs = cgroup_path(proc_cgroup)?;
     let first = dirs.ancestors().filter(|d| d.ends_with(&leaf)).last();
     first.map(Path::to_path_buf)
-}
-
-/// The cgroup v2 dir a `/proc/<pid>/cgroup` text names.
-pub(crate) fn cgroup_path(proc_cgroup: &str) -> Option<PathBuf> {
-    let path = proc_cgroup.lines().find_map(|l| l.strip_prefix("0::"))?;
-    Some(PathBuf::from(format!("/sys/fs/cgroup{}", path.trim())))
 }
 
 /// The cgroups directly below cgroup `dir`.

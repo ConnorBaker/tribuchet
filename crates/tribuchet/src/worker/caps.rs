@@ -90,18 +90,20 @@ pub(super) fn build_memory(cgroup: &Path, meminfo: &Path, own: &Path) -> Option<
         let text = fs::read_to_string(dir.join("memory.max")).ok()?;
         text.trim().parse::<u64>().ok()
     };
-    let own = cgroup.join(own.strip_prefix("/").unwrap_or(own));
     let above = own.ancestors().take_while(|d| d.starts_with(cgroup));
     let caps = above.filter_map(max).chain(max(&cgroup.join(AGENT_SLICE)));
     Some(caps.fold(total, u64::min))
 }
 
-/// The worker's cgroup, as /proc/self/cgroup names it (cgroup v2), else
-/// the root.
-pub(super) fn own_cgroup() -> PathBuf {
-    let text = fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
-    let path = text.lines().find_map(|l| l.strip_prefix("0::"));
-    PathBuf::from(path.unwrap_or("/"))
+/// The cgroup v2 dir a `/proc/<pid>/cgroup` text names.
+pub(crate) fn cgroup_path(proc_cgroup: &str) -> Option<PathBuf> {
+    let path = proc_cgroup.lines().find_map(|l| l.strip_prefix("0::"))?;
+    Some(PathBuf::from(format!("/sys/fs/cgroup{}", path.trim())))
+}
+
+/// This process's cgroup (cgroup_path).
+pub(crate) fn own_cgroup() -> Option<PathBuf> {
+    cgroup_path(&fs::read_to_string("/proc/self/cgroup").ok()?)
 }
 
 pub fn host_system() -> String {
@@ -142,10 +144,10 @@ mod tests {
         let none = dir.path().join("none");
         assert_eq!(build_memory(dir.path(), &none, Path::new("/")), None);
         // A container's limit two levels above the worker's cgroup.
-        let own = Path::new("/machine.slice/c1/payload");
-        fs::create_dir_all(dir.path().join("machine.slice/c1/payload")).unwrap();
+        let own = dir.path().join("machine.slice/c1/payload");
+        fs::create_dir_all(&own).unwrap();
         fs::write(dir.path().join("machine.slice/c1/memory.max"), "524288\n").unwrap();
-        let contained = build_memory(dir.path(), &meminfo, own);
+        let contained = build_memory(dir.path(), &meminfo, &own);
         assert_eq!(contained, Some(512 << 10), "a container's limit");
     }
 

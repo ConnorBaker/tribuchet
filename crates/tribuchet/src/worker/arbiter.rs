@@ -39,7 +39,7 @@ use crate::errors::chain;
 use crate::worker::resume::ResumeState;
 use policy::{Action, Policy};
 
-pub(crate) use sample::{cgroup_path, frozen_usec, subgroups};
+pub(crate) use sample::{frozen_usec, subgroups};
 
 const SAMPLE_EVERY: Duration = Duration::from_millis(200);
 /// Samples in the demand mean: one second.

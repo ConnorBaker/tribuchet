@@ -51,10 +51,7 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>) {
             continue; // already swept by sweep_state_dir
         };
         match serde_json::from_str::<BuildState>(&s) {
-            Ok(BuildState::Running(st)) => match st.spec.unconfined() {
-                Some(why) => kill_unconfined(ctx, *st, dir, why),
-                None => running.push((dir, st)),
-            },
+            Ok(BuildState::Running(st)) => running.push((dir, st)),
             Ok(BuildState::Finished {
                 dedupe_key,
                 build_id,
@@ -128,22 +125,6 @@ async fn settle(
             remove_build_dir(&dir);
         }
     }
-}
-
-/// A running build an older worker left whose spec this one does not run
-/// (SandboxSpec::unconfined): killed, never adopted, as a held build the
-/// hub cancelled is once its agent answers, its agent and a slot kept
-/// until then. Its key is not offered, so the hub runs the build again,
-/// confined. A worker stopped meanwhile leaves an orphan its agent's
-/// next sweep kills (sweep_orphaned_agent_builds).
-fn kill_unconfined(ctx: &Arc<WorkerCtx>, st: ResumeState, dir: PathBuf, why: &'static str) {
-    tracing::warn!(id = st.build_id, "killing a build its agent runs {why}");
-    let lease = ctx.agents.lease_this(&st.agent_socket);
-    let ctx = ctx.clone();
-    tokio::task::spawn_blocking(move || {
-        let build = answered(&st, || {}).ok().map(|(build, _)| build);
-        Ending(None, dir, Some(lease), None).end(&ctx, build.map(|b| (st, b)));
-    });
 }
 
 /// How a run (key?, dir, lease, log tailer) ends, in this order: its

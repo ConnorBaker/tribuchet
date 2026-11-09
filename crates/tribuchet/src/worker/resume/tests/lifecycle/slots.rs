@@ -130,20 +130,6 @@ fn a_build_held_for_its_agent_beyond_max_jobs_holds_a_slot() -> Result<()> {
     Ok(())
 }
 
-/// A build killed as unconfined (kill_unconfined) holds a slot until its
-/// agent, here never answering, has killed it, beyond max-jobs too.
-#[test]
-fn a_build_killed_as_unconfined_beyond_max_jobs_holds_a_slot() -> Result<()> {
-    let slots = once_b1_ends(1, BOTH, |ctx, rt, root| {
-        let (st, build) = running(root, "b2")?;
-        let _rt = rt.enter();
-        kill_unconfined(ctx, st, build, "in this test");
-        Ok(())
-    })?;
-    assert_eq!(slots, (0, 1));
-    Ok(())
-}
-
 /// An orphan's cleanup (sweep_orphaned_agent_builds) holds a slot while it
 /// runs, beyond max-jobs too: the orphan's agent answers the status call,
 /// not the kill.

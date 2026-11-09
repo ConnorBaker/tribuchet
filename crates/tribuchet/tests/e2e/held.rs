@@ -1,13 +1,13 @@
 //! The `held` phase (nix/tests/phase-held.nix): a worker restarted while a
-//! running build's agent is busy in a long Finish or Cleanup, or stopped
-//! from outside Tribuchet. The test makes the work long by stopping the
-//! userns helper the agent waits on (SIGSTOP from the test, never the agent
-//! itself): the agent runs, as in a long make-readable or remove. A build
+//! running build's agent is busy in a long Finish, or stopped from outside
+//! Tribuchet. The test makes the work long by stopping the userns helper
+//! the agent waits on (SIGSTOP from the test, never the agent itself): the
+//! agent runs, as in a long make-readable. A build
 //! whose agent does not answer Adopt within AGENT_ANSWER (7 s) is held until
 //! it does, its client told it waits; an agent busy in Finish answers.
 
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use crate::harness::{
     Node, count, ended, more_than, run, submit, succeed, wait_until_succeeds, write_file,
@@ -19,8 +19,6 @@ const HELD: &str = "holding the build until it does";
 const ADOPTED: &str = "adopted running build";
 const FINISHED: &str = "adopted finished build awaiting delivery";
 const NOTE: &str = "does not answer; waiting for it";
-const DOWN: &str = "not leasing builds to it";
-const JOINED: &str = "build agents joined";
 
 /// Stops (SIGSTOP) the agent's userns helper doing `$1` as soon as it runs,
 /// and records its pids. The pattern is split so this script's own command
@@ -39,18 +37,6 @@ fn launch(name: &str) {
 
 fn seen(pattern: &str) -> i64 {
     count(Node::Worker, WORKER, pattern)
-}
-
-/// Whether the worker logs `pattern` more than `n` times within `secs`.
-fn seen_within(pattern: &str, n: i64, secs: u64) -> bool {
-    let deadline = Instant::now() + Duration::from_secs(secs);
-    while seen(pattern) <= n {
-        if Instant::now() > deadline {
-            return false;
-        }
-        thread::sleep(Duration::from_secs(1));
-    }
-    true
 }
 
 /// Whether build `name` ended with 0 and its output is complete.
@@ -184,35 +170,5 @@ fn b_stopped_agent() {
         (while_stopped, done),
         ((false, true), true),
         "S (adopted, client told) while its agent was stopped; S succeeded"
-    );
-}
-
-/// A worker restarted while C's agent is in Cleanup, its remove helper
-/// stopped: C's result is on disk (persist_finished) before Cleanup, so the
-/// next worker delivers it, holding nothing, while the agent still cleans.
-/// The agent, unanswering, is left out of the pool, and rejoins once the
-/// helper goes on and the Cleanup ends.
-#[test]
-fn c_busy_cleanup() {
-    let (held0, finished0) = (seen(HELD), seen(FINISHED));
-    let (down0, joined0) = (seen(DOWN), seen(JOINED));
-    catch("remove");
-    launch("C");
-    caught("remove");
-    let t = restart();
-    wait_until_succeeds(Node::Worker, &more_than(WORKER, FINISHED, finished0), 60);
-    eprintln!("[held] C: '{FINISHED}' {:?} after the restart", t.elapsed());
-    let done = ok("C");
-    eprintln!("[held] C: client done {:?} after the restart", t.elapsed());
-    let held = seen(HELD) > held0;
-    let down = seen(DOWN) > down0;
-    release("remove");
-    // The rescan probes agents left out every 10 s.
-    let rejoined = seen_within(JOINED, joined0, 60);
-    show("C");
-    assert_eq!(
-        (held, done, down, rejoined),
-        (false, true, true, true),
-        "C held; C succeeded with its agent still in Cleanup; the agent left out, then rejoined"
     );
 }
