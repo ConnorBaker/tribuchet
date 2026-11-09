@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
-use super::{BuildState, unrecord};
+use super::{BuildState, Ending};
 use crate::chunker::parse_hashes;
 use crate::chunkstore::Hash;
 use crate::errors::{Result, chain, err_msg};
@@ -44,12 +44,8 @@ fn expired(e: &ResumableBuild, ttl: Duration) -> Option<&PathBuf> {
     (idle && fin.finished_at.elapsed() > ttl).then_some(&fin.dir)
 }
 
-/// Drop the results `expired` names, with no file I/O under the registry
-/// lock. Each one's state.json goes before its key: the hub, told by the
-/// next heartbeat without the key, may run the build again under the same
-/// build id, which a worker adopting from that state would take for this
-/// result. A result a session starts to deliver meanwhile keeps its key,
-/// as does one whose state.json stays.
+/// End the results `expired` names (Ending), off the registry lock; one a
+/// delivery starts to read meanwhile keeps its key, as does a stuck one.
 pub(super) fn reap(ctx: &WorkerCtx, ttl: Duration) {
     let candidates: Vec<(String, PathBuf)> = ctx
         .resumable
@@ -59,21 +55,11 @@ pub(super) fn reap(ctx: &WorkerCtx, ttl: Duration) {
         .filter_map(|(key, e)| Some((key.clone(), expired(e, ttl)?.clone())))
         .collect();
     for (key, dir) in candidates {
-        if !unrecord(&dir) {
-            tracing::warn!(key, "keeping an undelivered result whose state.json stays");
-            continue;
-        }
-        let mut map = ctx.resumable.lock().unwrap();
-        if map.get(&key).and_then(|e| expired(e, ttl)) != Some(&dir) {
-            continue;
-        }
-        map.remove(&key);
-        drop(map);
-        remove_build_dir(&dir);
         tracing::warn!(
             key,
             "dropping undelivered build result (no resume within TTL)"
         );
+        Ending(Some(key), dir, None, None).end(ctx, None);
     }
 }
 
@@ -124,6 +110,16 @@ pub(in crate::worker) struct ResumableBuild {
 }
 
 impl ResumableBuild {
+    /// Make `e` `key`'s run; a finished result it displaces (one cancelled
+    /// after the assignment) ends off this thread, unless the worker stops.
+    pub(in crate::worker) fn launch(ctx: &Arc<WorkerCtx>, key: String, e: Self) {
+        let old = ctx.resumable.lock().unwrap().insert(key, e);
+        if let Some(old) = old.filter(|o| o.finished.is_some()) {
+            let ctx = ctx.clone();
+            tokio::task::spawn_blocking(move || Ending(None, old.dir, None, None).end(&ctx, None));
+        }
+    }
+
     /// Register a build no session has assigned yet.
     pub(in crate::worker) fn insert(
         ctx: &Arc<WorkerCtx>,
@@ -406,15 +402,20 @@ pub(in crate::worker) fn serve_chunks(
 /// stable identity); the ack's build_id may predate a concurrent
 /// resume that rotated the entry's id.
 pub(in crate::worker) fn ack_delivery(ctx: &Arc<WorkerCtx>, key: &str, build_id: &str) {
+    let (ctx, key, build_id) = (ctx.clone(), key.to_owned(), build_id.to_owned());
+    tokio::task::spawn_blocking(move || acked(&ctx, &key, &build_id));
+}
+
+pub(super) fn acked(ctx: &WorkerCtx, key: &str, build_id: &str) {
     let removed = {
-        let mut map = ctx.resumable.lock().unwrap();
+        let map = ctx.resumable.lock().unwrap();
         match map.get(key) {
-            Some(e) if e.finished.is_some() => map.remove(key),
+            Some(e) if e.finished.is_some() => Some(e.dir.clone()),
             _ => None,
         }
     };
-    if let Some(e) = removed {
-        remove_build_dir(&e.dir);
+    if let Some(dir) = removed {
+        Ending(Some(key.into()), dir, None, None).end(ctx, None);
         tracing::info!(id = build_id, "build result acknowledged");
     }
 }

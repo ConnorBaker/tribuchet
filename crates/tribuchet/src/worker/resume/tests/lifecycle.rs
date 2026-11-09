@@ -1,6 +1,7 @@
 use super::*;
 use std::collections::HashMap;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::{OnceLock, mpsc};
 use std::thread;
@@ -215,9 +216,9 @@ const SCENARIOS: &[&str] = &[
     // runs on for the new assignment: the cancel does not survive it.
     "has exit | assign:old cancel:old assign:new open done ok:new | adopt running k, finish running k, cleanup finished k, other finished k",
     // Cancelled while held, it is failed to the hub at once and stays held;
-    // once its agent answers, its key goes as the kill is decided and its
-    // state before the kill, then its agent is handed back: the cancel
-    // does not wait unseen, nor the state outlive the kill.
+    // once its agent answers, its state goes, then its key, before the
+    // kill, then its agent is handed back: the cancel does not wait unseen,
+    // nor the state outlive its key.
     "has | assign:old cancel:old cancelled:old held open gone idle removed | adopt running k, kill none, cleanup none, other none",
     // ... also while its log replay waits on a session that takes nothing,
     // killed and its agent handed back before it drains, not the replay
@@ -225,15 +226,18 @@ const SCENARIOS: &[&str] = &[
     "has cap1 | assign:old cancel:old cancelled:old log:65536 replayed:8192 open gone killed replayed:8192 idle drain:old removed | adopt running k, kill none, cleanup none, other none",
     // Once adopted, a cancel kills it like any run.
     "has | assign:old open running cancel:old cancelled:old | adopt running k, kill running k, cleanup finished k, other finished k",
-    // Its agent no longer has it: its agent handed back, then dropped, its
-    // state, then its key: not after 7 s, nor its key first.
-    "lost | fill assign:old open gone nodir idle | adopt running k",
+    // Its agent no longer has it: dropped, its state, then its key, then
+    // its dir: not after 7 s, nor its key first; its agent handed back.
+    "lost | fill assign:old open gone idle removed | adopt running k",
     // ... its agent handed back while its log replay waits on a session
-    // that takes nothing; a cancel taken meanwhile leaves no flag, nor does
-    // the replay keep its state (which fails its removal: "directory not
+    // that takes nothing; a cancel then leaves no flag, nor does the
+    // replay keep its state (which fails its removal: "directory not
     // empty").
-    "lost cap1 | fill log:1638400 assign:old open running idle cancel:old flagged drain:old gone nodir noflag | adopt running k",
-    // Cancelled and its agent without it: its key goes as that is decided,
+    "lost cap1 | fill log:1638400 assign:old open gone idle cancel:old drain:old removed noflag | adopt running k",
+    // Its state.json staying: killed if its agent has it, its key kept, no takeover.
+    "has | assign:old cancel:old cancelled:old jam open killed idle running cancel:old refused:new noflag unjam | adopt running k, kill running k, cleanup running k, other running k",
+    "lost | assign:old jam open idle running cancel:old refused:new noflag unjam | adopt running k",
+    // Cancelled and its agent without it: its key goes after its state,
     // and its teardown leaves a new run of the key alone.
     "lost | fill assign:old cancel:old open gone dir anew idle removed running | adopt running k",
     // ... while its log replay waits on a session that takes nothing, its
@@ -291,6 +295,7 @@ fn run(row: &str) -> Result<()> {
                     assert!(h.assign(arg, &tx), "{row}");
                 }
             }
+            "refused" => assert!(!h.assign(arg, &tokio::sync::mpsc::channel(1).0), "{row}"),
             // Until the agent was asked n times, answered or not; it
             // answers; until "k" is held, running, done or gone, until its
             // agent and its slot are handed back, or its agent asked to kill
@@ -326,6 +331,8 @@ fn run(row: &str) -> Result<()> {
                 !build.join("state.json").exists()
             }),
             "fill" => fill(build, "top/build")?,
+            "jam" => fs::set_permissions(build, fs::Permissions::from_mode(0o500))?,
+            "unjam" => fs::set_permissions(build, fs::Permissions::from_mode(0o700))?,
             // The run logs n bytes; until n were replayed; session s takes
             // what it is sent, slowly; "k" runs anew in b2.
             "log" => {

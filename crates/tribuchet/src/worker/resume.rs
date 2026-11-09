@@ -139,30 +139,60 @@ async fn settle(
 fn kill_unconfined(ctx: &Arc<WorkerCtx>, st: ResumeState, dir: PathBuf, why: &'static str) {
     tracing::warn!(id = st.build_id, "killing a build its agent runs {why}");
     let lease = ctx.agents.lease_this(&st.agent_socket);
+    let ctx = ctx.clone();
     tokio::task::spawn_blocking(move || {
         let build = answered(&st, || {}).ok().map(|(build, _)| build);
-        kill_held(st, &dir, build, None, lease);
+        Ending(None, dir, Some(lease), None).end(&ctx, build.map(|b| (st, b)));
     });
 }
 
-/// Kill the held build `st` if its agent answered with it (`build`): its
-/// state.json goes before the kill, so a worker stopped meanwhile has
-/// nothing to adopt; its `lease`, no longer used, is handed back after it;
-/// its log tailer `tail`, which drains up to the end of the log the run
-/// still writes, stops then, and its dir with it.
-fn kill_held(
-    st: ResumeState,
-    dir: &Path,
-    build: Option<agents::AgentBuild>,
-    tail: Option<LogTail>,
-    lease: Lease,
-) {
-    if let Some(build) = build {
-        unrecord(dir);
-        kill(&st, build);
+/// How a run (key?, dir, lease, log tailer) ends, in this order: its
+/// state.json goes (if it stays, so do its key and dir); its key, if its
+/// entry is still in `dir` and nothing reads its result; the run is killed
+/// (`build`); its lease handed back; its tailer stopped; its dir removed.
+pub(super) struct Ending(Option<String>, PathBuf, Option<Lease>, Option<LogTail>);
+
+impl Ending {
+    /// Blocking.
+    pub(super) fn end(self, ctx: &WorkerCtx, build: Option<(ResumeState, agents::AgentBuild)>) {
+        let Self(key, dir, lease, tail) = self;
+        let mut gone = unrecord(&dir);
+        if !gone {
+            tracing::warn!("keeping {}: its state.json stays", dir.display());
+        }
+        if let Some(key) = key.filter(|_| gone) {
+            let mut map = ctx.resumable.lock().unwrap();
+            let ours = map.get(&key).filter(|e| e.dir == dir);
+            let fin = ours.and_then(|e| e.finished.as_ref());
+            let read =
+                ours.is_some_and(|e| e.delivering) || fin.is_some_and(|f| Arc::strong_count(f) > 1);
+            gone = !read;
+            if gone && ours.is_some() {
+                map.remove(&key);
+            }
+        }
+        if let Some((st, build)) = build {
+            let socket = &st.agent_socket;
+            if let Err(e) = agents::kill(socket, &st.build_id) {
+                tracing::warn!(id = st.build_id, "killing the build: {}", chain(&e));
+            }
+            if let Err(e) = build.wait_exit() {
+                tracing::warn!(
+                    id = st.build_id,
+                    "waiting for the killed build: {}",
+                    chain(&e)
+                );
+            }
+            agents::retire(socket, &st.build_id, "agent cleanup");
+        }
+        drop(lease);
+        if let Some(t) = tail {
+            t.stop();
+        }
+        if gone {
+            remove_build_dir(&dir);
+        }
     }
-    drop(lease);
-    remove_state(tail, dir);
 }
 
 /// Ask `st`'s agent to adopt its build every AGENT_RETRY until it
@@ -234,59 +264,34 @@ fn wait_for_agent(ctx: &Arc<WorkerCtx>, st: ResumeState, dir: PathBuf) {
         let answer = answered(&st, || fail_cancelled(&ctx, &key));
         fail_cancelled(&ctx, &key);
         ctx.wait_for_agent(&key, false);
-        // A cancelled build leaves the registry now, with its log tailer
-        // and any cancel taken since fail_cancelled, so no assignment
-        // takes the dying run over and no flag outlives it.
+        // Held no more. One that ends takes its log tailer and any cancel
+        // taken since fail_cancelled; no cancel or assignment takes it after.
         let (cancelled, tail) = {
             let mut map = ctx.resumable.lock().unwrap();
-            if map.get(&key).is_some_and(|e| e.cancelled) {
+            let e = map.get_mut(&key);
+            let ends = answer.is_err() || e.as_ref().is_some_and(|e| e.cancelled);
+            if ends {
                 ctx.cancelled.lock().unwrap().remove(&key);
-                (true, map.remove(&key).and_then(|e| e.log_tail))
-            } else {
-                if let Some(e) = map.get_mut(&key) {
-                    // No longer held: a cancel now kills it, as any run.
-                    e.adopting = false;
-                }
-                (false, None)
             }
+            let tail = e.and_then(|e| {
+                (e.adopting, e.cancelled) = (false, ends);
+                ends.then(|| e.log_tail.take()).flatten()
+            });
+            (ends, tail)
         };
         match answer {
-            Ok((build, _)) if cancelled => kill_held(st, &dir, Some(build), tail, lease),
-            Ok((build, _)) => rt.block_on(adopt(&ctx, st, dir, build, lease)),
-            Err(e) => {
-                tracing::warn!(
-                    id = st.build_id,
-                    "its agent answered at last, without the build: {}",
-                    chain(&e)
-                );
-                drop(lease);
-                if cancelled {
-                    remove_state(tail, &dir);
-                } else {
-                    drop_held(&ctx, &key, &dir);
+            Ok((build, _)) if !cancelled => rt.block_on(adopt(&ctx, st, dir, build, lease)),
+            answer => {
+                if let Err(e) = &answer {
+                    let e = chain(e);
+                    let why = "its agent answered at last, without the build";
+                    tracing::warn!(id = st.build_id, "{why}: {e}");
                 }
+                let build = answer.ok().map(|(build, _)| (st, build));
+                Ending(Some(key), dir, Some(lease), tail).end(&ctx, build);
             }
         }
     });
-}
-
-/// Drop the held build keyed `key` that its agent no longer has: its
-/// state goes before its key, since the hub, told by the next heartbeat
-/// without the key, runs the build again under the same build id, which
-/// a worker adopting from that state would take for this run. A cancel
-/// taken meanwhile goes with the key: it has no run left, and would kill
-/// the key's next run here.
-fn drop_held(ctx: &WorkerCtx, key: &str, dir: &Path) {
-    let tail = ctx
-        .resumable
-        .lock()
-        .unwrap()
-        .get_mut(key)
-        .and_then(|e| e.log_tail.take());
-    remove_state(tail, dir);
-    let mut map = ctx.resumable.lock().unwrap();
-    map.remove(key);
-    ctx.cancelled.lock().unwrap().remove(key);
 }
 
 /// Remove `dir`'s state.json, which a restarted worker adopts its build
@@ -295,17 +300,6 @@ pub(super) fn unrecord(dir: &Path) -> bool {
     // Whatever fails here fails the removal of the rest, which warns.
     let gone = fs::remove_file(dir.join("state.json"));
     gone.map_or_else(|e| e.kind() == io::ErrorKind::NotFound, |()| true)
-}
-
-/// Remove a build dir once `tail`, its log tailer, has stopped: the
-/// offset it writes there meanwhile would fail the removal. Its
-/// state.json goes first, not left to adopt while the tailer drains.
-fn remove_state(tail: Option<LogTail>, dir: &Path) {
-    unrecord(dir);
-    if let Some(t) = tail {
-        t.stop();
-    }
-    remove_build_dir(dir);
 }
 
 /// If the hub cancelled the held build keyed `key`, fail it to the hub
@@ -335,23 +329,6 @@ fn fail_cancelled(ctx: &WorkerCtx, key: &str) {
         // A session gone meanwhile needs no verdict.
         let _ = tx.blocking_send(msg(worker_message::Msg::Result(result)));
     }
-}
-
-/// Kill an adopted build `st` that the hub cancelled, and have its agent
-/// clean it up.
-fn kill(st: &ResumeState, build: agents::AgentBuild) {
-    let socket = &st.agent_socket;
-    if let Err(e) = agents::kill(socket, &st.build_id) {
-        tracing::warn!(id = st.build_id, "killing a cancelled build: {}", chain(&e));
-    }
-    if let Err(e) = build.wait_exit() {
-        tracing::warn!(
-            id = st.build_id,
-            "waiting for a cancelled build: {}",
-            chain(&e)
-        );
-    }
-    agents::retire(socket, &st.build_id, "agent cleanup");
 }
 
 /// Clean up agent builds without an on-disk record, left by a Start

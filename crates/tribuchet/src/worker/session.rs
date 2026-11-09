@@ -270,7 +270,8 @@ pub(super) async fn handle_cancel(
         // check and the insert. The entry remembers the cancel, which a
         // later assignment of its key voids (adopt_assignment).
         let mut map = ctx.resumable.lock().unwrap();
-        if let Some(e) = map.get_mut(&c.dedupe_key).filter(|e| e.finished.is_none()) {
+        let open = |e: &&mut ResumableBuild| e.finished.is_none() && !(e.cancelled && !e.adopting);
+        if let Some(e) = map.get_mut(&c.dedupe_key).filter(open) {
             e.cancelled = true;
             ctx.cancelled.lock().unwrap().insert(c.dedupe_key);
         }
@@ -366,7 +367,8 @@ fn launch_build(
     let ctx = ctx.clone();
     let out_tx = out_tx.clone();
     let key = build.assignment.dedupe_key.clone();
-    ctx.resumable.lock().unwrap().insert(
+    ResumableBuild::launch(
+        &ctx,
         key.clone(),
         // No log tail: execute() streams the log live itself.
         ResumableBuild {
