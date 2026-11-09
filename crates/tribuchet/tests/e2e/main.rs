@@ -27,6 +27,7 @@ mod fod_ipv6;
 mod harness;
 mod held;
 mod history;
+mod oom;
 mod pairs;
 mod spread;
 

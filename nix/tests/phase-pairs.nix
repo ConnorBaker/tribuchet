@@ -61,8 +61,22 @@ in
     # room for the page cache the cache row writes
     virtualisation.diskSize = lib.mkForce 6144;
     virtualisation.additionalPaths = deps;
+    # The agents' slice as a host's agent-memory policy left it on this
+    # VM with a 1536 MiB reserve: A and S (MemTotal 4,010,648 kB, from
+    # the worker's memory=2239651840 then), swapping through zswap with
+    # a 100 % pool and writeback off, so that pages zswap refuses (random
+    # bytes) stay in RAM, in the swap cache. Not kept: that policy's clamp
+    # guard and MemoryZSwapMax=0 for every other unit.
+    boot.kernelParams = [
+      "zswap.enabled=1"
+      "zswap.max_pool_percent=100"
+    ];
+    systemd.slices."system-tribuchet\\x2dagent".sliceConfig = {
+      MemoryMax = 2239651840;
+      MemorySwapMax = 4106223616;
+      MemoryZSwapWriteback = false;
+    };
     services.tribuchet-worker = {
-      agentMemoryReserve = lib.mkForce (1536 * 1024 * 1024);
       # what each row starts from (pairs.rs writes it, with the row's
       # timeouts, over /etc/tribuchet/worker.toml)
       settings = lib.mkForce {

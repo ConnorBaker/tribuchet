@@ -2,7 +2,7 @@
 # (an agent runs at -1000; a build must not keep or regain that).
 { bash }:
 derivation {
-  name = "tt-slice-adj";
+  name = "tt-oomscore";
   system = "x86_64-linux";
   builder = builtins.storePath bash + "/bin/bash";
   args = [

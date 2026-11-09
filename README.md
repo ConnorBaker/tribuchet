@@ -184,16 +184,10 @@ deploys. Upgrade workers before or with the hub: a hub sends a
 fixed-output build only to a worker advertising `tribuchet-network`,
 which older workers never do, even with `/dev/net/tun`, so until an
 upgraded worker with `/dev/net/tun` registers every fixed-output build
-waits. The build agents and their builds together may use the host's
-memory less `services.tribuchet-worker.agentMemoryReserve` (8 GiB by
-default) and less a per-page bound on what zswap holds for them outside
-their charge (zsmalloc's fragmentation after frees can pass it until
-global reclaim compacts the pool), and swap up to `agentSwapPercent`
-percent of MemTotal (100 by default) through zswap, which the module
-turns on for them alone. Past that the kernel OOM-kills inside their
-slice, never an agent, instead of taking the host down.
-Set the reserve to `null` to lift the cap and leave swap and zswap as
-the host has them.
+waits. The build agents and their builds run in
+`system-tribuchet\x2dagent.slice`, and no agent is ever an OOM victim:
+cap the slice (`systemd.slices."system-tribuchet\\x2dagent"`) to keep
+memory for the rest of the host.
 
 ### macOS (nix-darwin)
 

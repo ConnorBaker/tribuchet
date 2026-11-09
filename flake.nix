@@ -142,53 +142,6 @@
           spec-protocol = specCheck "protocol";
           spec-refute-hubBlock = specRefute "hubBlock";
           spec-refute-hubDrop = specRefute "hubDrop";
-          nixos-test-agent-memory = vmTest ./nix/agent-memory-test.nix { };
-          nixos-test-agent-memory-switch = vmTest ./nix/agent-memory-switch-test.nix { };
-          nixos-test-agent-memory-repeat = vmTest ./nix/agent-memory-repeat-test.nix { };
-          nixos-test-agent-memory-stop = vmTest ./nix/agent-memory-stop-test.nix { };
-
-          # tribuchet-agent-guard as the module builds it for a 1536 MiB
-          # reserve, against a stand-in systemd and cgroup: a clamp and
-          # the OOM kill; a clamp a TERM left, undone by the next guard; a
-          # clamp applied after its call failed; a restore that fails; a
-          # reload of the swap unit during a clamp, and as the clamp's
-          # call returns; a clamp no OOM kill follows, kept.
-          agent-memory-guard =
-            let
-              host = nixpkgs.lib.nixosSystem {
-                modules = [
-                  self.nixosModules.default
-                  {
-                    nixpkgs.hostPlatform = system;
-                    boot.isContainer = true;
-                    system.stateVersion = "25.11";
-                    services.tribuchet-worker = {
-                      enable = true;
-                      settings.hub = "https://hub.example.org:7437";
-                      agentMemoryReserve = 1536 * 1024 * 1024;
-                    };
-                  }
-                ];
-              };
-            in
-            pkgs.runCommand "agent-memory-guard-test"
-              {
-                nativeBuildInputs = with pkgs; [
-                  bash
-                  coreutils
-                  util-linux
-                  gnused
-                  gnugrep
-                ];
-              }
-              ''
-                bash ${./nix/agent-memory-guard-test.sh} ${host.config.systemd.services.tribuchet-agent-guard.serviceConfig.ExecStart} >log 2>&1 || {
-                  cat log
-                  exit 1
-                }
-                cp log $out
-              '';
-
           nixos-test-container = vmTest ./nix/container-test.nix {
             workerImage = self.packages.x86_64-linux.worker-image;
             seccompProfile = self.packages.x86_64-linux.seccomp-profile;

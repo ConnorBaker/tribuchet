@@ -46,11 +46,6 @@ let
   '';
 in
 {
-  imports = [
-    # the agents' memory cap, swap and OOM policy
-    ./agent-memory.nix
-  ];
-
   options.services.tribuchet-hub = {
     enable = lib.mkEnableOption "tribuchet build hub";
     package = lib.mkOption {

@@ -68,12 +68,12 @@ pub(super) fn system_caps(opts: &WorkerConfig, ctx: &WorkerCtx) -> Vec<SystemCap
 }
 
 /// The agents' slice under the cgroup root, where every agent and its
-/// builds run (nix/agent-memory.nix caps it).
+/// builds run (a host may cap it).
 const AGENT_SLICE: &str = "system.slice/system-tribuchet\\x2dagent.slice";
 
 /// The CPUs this worker's builds share, for the hub's placement: the
 /// worker's own, as its affinity and CPU quota allow. The agents' are
-/// taken to be the same; nix/agent-memory.nix limits only their memory.
+/// taken to be the same; a host's cap on the slice limits only memory.
 pub(super) fn cores() -> Option<u32> {
     let n = thread::available_parallelism().ok()?;
     u32::try_from(n.get()).ok()

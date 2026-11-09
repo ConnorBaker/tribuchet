@@ -17,8 +17,8 @@
 //!   that pressure outside the slice counts too.
 //!
 //! Swap is no room: a page zswap keeps stays charged to the build,
-//! compressed (mm/memcontrol.c, obj_cgroup_charge_zswap), and the
-//! module's slice keeps pages from the swap device (nix/agent-memory.nix).
+//! compressed (mm/memcontrol.c, obj_cgroup_charge_zswap), and a slice
+//! with zswap writeback off keeps pages from the swap device.
 //!
 //! The pins are summed (`Budget`): the builds frozen already, oldest
 //! first, then the freezes a sample asks for, likewise; one that does

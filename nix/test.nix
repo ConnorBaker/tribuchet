@@ -204,6 +204,9 @@ in
         environment.etc."tt/memhog.nix".text = ''
           import ${./tests/memhog.nix} { bash = "${pkgs.bash}"; }
         '';
+        environment.etc."tt/oomscore.nix".text = ''
+          import ${./tests/oomscore.nix} { bash = "${pkgs.bash}"; }
+        '';
         environment.etc."tt/drain.nix".text = ''
           import ${./tests/drain.nix} { bash = "${pkgs.bash}"; }
         '';
@@ -334,8 +337,6 @@ in
         services.tribuchet-worker = {
           enable = true;
           package = tribuchet;
-          # the VM has less than the default 8 GiB to keep back
-          agentMemoryReserve = 512 * 1024 * 1024;
           keyFile = "/etc/tribuchet/tls/worker.key";
           settings = {
             hub = "https://hub:7437";
