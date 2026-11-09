@@ -104,12 +104,12 @@ async fn heartbeat_updates_the_advertised_capacity() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("nix.conf");
     let mut state = HubState::for_test(Duration::ZERO);
-    state.nix_config = Some(NixConfig {
+    state.nix_config = Some(HubState::nix_config_writer(NixConfig {
         path: path.clone(),
         attach_program: "/attach".into(),
         oversubscribe_percent: 100,
         max_jobs_cap: 256,
-    });
+    }));
     let state = Arc::new(state);
     let caps = WorkerCaps {
         name: "w".into(),
@@ -117,7 +117,18 @@ async fn heartbeat_updates_the_advertised_capacity() {
         systems: HashMap::new(),
         max_jobs: 2,
     };
+    // Written on a blocking thread: the registration's rendering, then,
+    // once the heartbeat is routed, its own.
+    let conf = || fs::read_to_string(&path).unwrap_or_default();
+    let written = async |jobs: u32| {
+        let line = format!("max-jobs = {jobs}\n");
+        for _ in (0..1000).take_while(|_| !conf().contains(&line)) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        conf().contains(&line)
+    };
     let guard = CapsGuard::new(state.clone(), caps);
+    assert!(written(2).await, "{}", conf());
     let id = guard.id;
     let (tx, rx) = mpsc::channel(4);
     tx.send(heartbeat(Some(3))).await.unwrap();
@@ -127,12 +138,7 @@ async fn heartbeat_updates_the_advertised_capacity() {
     route_loop(rx, Router::default(), admission, state.clone(), id).await;
     let jobs = state.worker_caps.lock().unwrap()[&id].max_jobs;
     assert_eq!(jobs, 3);
-    // Written on a blocking thread, after the heartbeat is routed.
-    let conf = || fs::read_to_string(&path).unwrap_or_default();
-    for _ in (0..1000).take_while(|_| !conf().contains("max-jobs = 3\n")) {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(conf().contains("max-jobs = 3\n"), "{}", conf());
+    assert!(written(3).await, "{}", conf());
 }
 
 fn caps(name: &str) -> WorkerCaps {
