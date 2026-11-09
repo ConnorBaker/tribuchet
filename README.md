@@ -184,7 +184,10 @@ deploys. Upgrade workers before or with the hub: a hub sends a
 fixed-output build only to a worker advertising `tribuchet-network`,
 which older workers never do, even with `/dev/net/tun`, so until an
 upgraded worker with `/dev/net/tun` registers every fixed-output build
-waits.
+waits. The build agents and their builds run in
+`system-tribuchet\x2dagent.slice`, and no agent is ever an OOM victim:
+cap the slice (`systemd.slices."system-tribuchet\\x2dagent"`) to keep
+memory for the rest of the host.
 
 ### macOS (nix-darwin)
 
