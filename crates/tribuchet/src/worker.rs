@@ -161,13 +161,7 @@ impl WorkerCtx {
         let e = map.get_mut(&a.dedupe_key)?;
         let voided = self.cancelled.lock().unwrap().remove(&a.dedupe_key);
         match &e.finished {
-            Some(f) if f.error.ends_with(CANCELLED) => {
-                let dir = e.dir.clone();
-                map.remove(&a.dedupe_key);
-                drop(map);
-                remove_build_dir(&dir);
-                return None;
-            }
+            Some(f) if f.error.ends_with(CANCELLED) => return None,
             None if e.cancelled && !voided && !e.adopting => return None,
             _ => {}
         }

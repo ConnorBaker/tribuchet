@@ -40,11 +40,12 @@ type Then = (
 const ROWS: &[(Entry, &[Tell], Then)] = &[
     // A run being killed for a cancel is no result for a later assignment
     // (the new client is not sent "build cancelled"): it starts anew, and
-    // the killed run's failure goes to the session it was cancelled for.
+    // the killed run's failure goes to the session it was cancelled for,
+    // its result to its end as the key runs anew.
     (
         Entry::Running,
-        &[Cancel, Take, Assign("new", false), End(CANCELLED)],
-        (&[("old", CANCELLED)], &[], Some(("old", true)), true),
+        &[Cancel, Take, Assign("new", false), End(CANCELLED), Anew],
+        (&[("old", CANCELLED)], &[], Some(("new", false)), false),
     ),
     // ... and once it ends after its key ran anew, the new run is left be.
     (
@@ -52,11 +53,11 @@ const ROWS: &[(Entry, &[Tell], Then)] = &[
         &[Cancel, Take, Anew, End(CANCELLED)],
         (&[], &[], Some(("new", false)), false),
     ),
-    // Nor is a cancelled run's result: its state goes.
+    // Nor is a cancelled run's result: it stays until the key runs anew.
     (
         Entry::Finished(CANCELLED),
         &[Assign("new", false)],
-        (&[], &[], None, false),
+        (&[], &[], Some(("old", true)), true),
     ),
     // An assignment voids a cancel not taken yet, also of a held build
     // whose wait failed it to the hub: the run goes on for it.
@@ -152,8 +153,11 @@ fn every_cancel_and_assignment_ends_as_the_table_says() -> Result<()> {
                 }
                 Anew => {
                     fs::create_dir_all(&b2)?;
-                    ResumableBuild::insert(&ctx, "k".into(), "new".into(), b2.clone(), None);
-                    ctx.resumable.lock().unwrap().get_mut("k").unwrap().out_tx = Some(new.clone());
+                    let mut anew = ResumableBuild::default();
+                    (anew.build_id, anew.dir, anew.out_tx) =
+                        ("new".into(), b2.clone(), Some(new.clone()));
+                    let _rt = rt.enter();
+                    ResumableBuild::launch(&ctx, "k".into(), anew);
                 }
             }
         }
@@ -185,7 +189,7 @@ fn every_cancel_and_assignment_ends_as_the_table_says() -> Result<()> {
             then.map(|(id, f)| (id.to_owned(), f)),
             "row {row}: entry"
         );
-        assert_eq!(b1.exists(), b1_there, "row {row}: b1");
+        until(&format!("row {row}: b1"), || b1.exists() == b1_there);
         let next = ctx.abort_reason("k", &b1.join("build.log"), None, None);
         assert_eq!(next, None, "row {row}: the key's next run is aborted");
     }
@@ -194,7 +198,7 @@ fn every_cancel_and_assignment_ends_as_the_table_says() -> Result<()> {
 
 /// A cancel the hub sends as the kill of a held build it cancelled
 /// before is decided (the first cancel failed to the hub after its agent
-/// answered) leaves no flag: it goes with the key at that decision. Left
+/// answered) leaves no flag: it goes at that decision. Left
 /// behind, it would fail the key's next run here "build cancelled".
 #[test]
 fn a_cancel_taken_as_a_held_builds_kill_is_decided_leaves_no_flag() -> Result<()> {
