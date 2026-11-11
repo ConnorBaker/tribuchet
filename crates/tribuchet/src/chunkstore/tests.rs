@@ -1,5 +1,6 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::thread;
 
 use super::*;
@@ -218,4 +219,50 @@ fn a_chunk_pinned_before_the_decide_stays() {
         .expect("a chunk pinned before the decide was dropped");
     assert_eq!(kept.read_blocking().unwrap(), frame(0));
     drop(pin);
+}
+
+/// A stop between a retire's two unlinks leaves the pack's index alone.
+/// Ids restart above the highest pack left, so the next pack takes the
+/// orphan's id, and a restart before it seals must not load that index.
+#[test]
+fn an_index_left_by_a_stop_mid_retire_is_dropped() {
+    let dir = tempfile::tempdir().unwrap();
+    let ((ha, fa), (hc, fc)) = (frame(b"aaa"), frame(b"ccc"));
+    let s = store(dir.path(), 1 << 20);
+    s.set_limits(1, 1 << 20); // a's insert seals pack 0 and retires it
+    let stopped = thread::scope(|t| {
+        t.spawn(|| {
+            let unlinks = AtomicUsize::new(0);
+            io_hook::install(Arc::new(move |op| {
+                let second = op == Op::Unlink && unlinks.fetch_add(1, Ordering::Relaxed) == 1;
+                assert!(!second, "stopped between the unlinks");
+            }));
+            s.insert(ha, &fa)
+        })
+        .join()
+    });
+    assert!(stopped.is_err(), "the retire was not stopped");
+    drop(s);
+    let orphan = pack::index_path(dir.path(), 0);
+    assert!(!pack::pack_path(dir.path(), 0).exists() && orphan.exists());
+    let s = store(dir.path(), 1 << 20);
+    assert!(!orphan.exists(), "the orphan was kept");
+    s.insert(hc, &fc).unwrap(); // new pack 0, unsealed
+    drop(s);
+    let s = store(dir.path(), 1 << 20);
+    assert!(s.peek(&ha).is_none(), "a points into the new pack");
+    assert_eq!(get(&s, &hc), Some(fc));
+}
+
+/// Only the names pack_path and index_path write count: others are
+/// neither read nor removed.
+#[test]
+fn non_canonical_names_are_left_alone() {
+    for name in ["0.idx", "+0.idx", "00000000000000AB.idx", "0.pack"] {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join(name), b"").unwrap();
+        let opened = ChunkStore::open(dir.path().to_path_buf(), 1 << 20);
+        assert!(opened.is_ok(), "{name}: {:?}", opened.err());
+        assert!(dir.path().join(name).exists(), "{name} was removed");
+    }
 }
