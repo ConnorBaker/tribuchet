@@ -475,16 +475,29 @@ impl ChunkStore {
 
 /// Everything on disk loads into main with freq 0.
 fn load(dir: &Path, w: &mut Writer, index: &mut Index) -> io::Result<()> {
-    let mut ids: Vec<u64> = Vec::new();
+    let (mut ids, mut indexes) = (Vec::new(), Vec::new());
     for e in fs::read_dir(dir)? {
         let name = e?.file_name();
-        if let Some(hex) = name.to_str().and_then(|n| n.strip_suffix(".pack"))
+        // Only the names pack_path and index_path write count.
+        if let Some((hex, ext)) = name.to_str().and_then(|n| n.split_once('.'))
             && let Ok(id) = u64::from_str_radix(hex, 16)
+            && hex == format!("{id:016x}")
         {
-            ids.push(id);
+            match ext {
+                "pack" => ids.push(id),
+                "idx" => indexes.push(id),
+                _ => {}
+            }
         }
     }
     ids.sort_unstable();
+    // A stop between retire's unlinks leaves an index without its pack.
+    // Ids are reused, and a later pack would load it as its own.
+    for id in indexes {
+        if ids.binary_search(&id).is_err() {
+            fs::remove_file(pack::index_path(dir, id))?;
+        }
+    }
     for id in ids {
         let entries = match pack::load_index(dir, id) {
             Ok(entries) => entries,
