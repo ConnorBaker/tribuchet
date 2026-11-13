@@ -41,6 +41,8 @@ mod record;
 mod relay;
 #[cfg(test)]
 pub(crate) use relay::msg_name;
+#[cfg(test)]
+mod semantics;
 mod serve;
 mod state;
 mod submit;
