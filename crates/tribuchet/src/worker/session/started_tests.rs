@@ -84,9 +84,10 @@ async fn a_session_resuming_a_finished_result_says_so_and_releases_it() -> Resul
     // A hub assigning "test-key" anew, which ends the session once the
     // worker says it resumed it, and passes on all it read until then.
     let (read_tx, mut read) = mpsc::unbounded_channel();
-    let resumes = slowlink::hub(move |mut from_worker, to_worker| {
+    let resumes = slowlink::hub(move |(mut from_worker, to_worker), bulk| {
         let read = read_tx.clone();
         async move {
+            let _bulk = bulk;
             let a = BuildAssignment {
                 build_id: "new".into(),
                 dedupe_key: "test-key".into(),

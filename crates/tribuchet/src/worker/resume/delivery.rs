@@ -384,12 +384,13 @@ fn send_chunks(
 /// Serve a NeedChunks for a finished build on a blocking thread. A result
 /// it does not have, or cannot serve, is gone (ResultGone): one it cannot
 /// serve is dropped first, so that no later assignment adopts it again.
-/// One whose session closed meanwhile stays, for the next.
+/// One whose session closed meanwhile stays, for the next. The chunks go
+/// on the session's `bulk`, the rest on its control.
 pub(in crate::worker) fn serve_chunks(
     ctx: &Arc<WorkerCtx>,
     build_id: String,
     hashes: &[u8],
-    out_tx: mpsc::Sender<WorkerMessage>,
+    (out_tx, bulk): (mpsc::Sender<WorkerMessage>, mpsc::Sender<WorkerMessage>),
 ) {
     // holding the Arc keeps the reaper off the build dir
     let held = (ctx.resumable.lock().unwrap().iter())
@@ -406,7 +407,7 @@ pub(in crate::worker) fn serve_chunks(
             return;
         };
         let res = parse_hashes(&hashes)
-            .and_then(|needed| send_chunks(&fin, &build_id, needed.into_iter().collect(), &out_tx));
+            .and_then(|needed| send_chunks(&fin, &build_id, needed.into_iter().collect(), &bulk));
         match res {
             Ok(()) | Err(Error::Send(_)) => {}
             Err(e) => {

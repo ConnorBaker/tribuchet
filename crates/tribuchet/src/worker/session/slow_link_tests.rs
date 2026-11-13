@@ -1,71 +1,56 @@
 //! The session loop over a slow link (crate::slowlink).
 
 use super::*;
-use crate::{hub, slowlink};
+use crate::proto::worker_hub_server::WorkerHub;
+use crate::slowlink::{self, HubEnd};
 
-/// A hub sending inputs over a slow link to an otherwise quiet worker
-/// keeps its session. Its keepalive would PING behind the inputs and
-/// miss the timeout, but the worker's heartbeats give it something to
-/// read first.
-#[tokio::test(start_paused = true)]
-async fn a_hub_sending_inputs_over_a_slow_link_keeps_its_session() -> Result<()> {
-    let dir = tempfile::tempdir()?;
-    let ctx = WorkerCtx::for_test(dir.path(), 1, vec![])?;
-    // Chunk frames as fast as the link takes them.
-    let inputs = slowlink::hub(|mut from_worker, to_worker| async move {
-        slowlink::flood(to_worker, || {
-            let chunk = hub_message::Msg::Chunk(slowlink::bulk());
-            Ok(HubMessage { msg: Some(chunk) })
-        });
-        while let Ok(Some(_)) = from_worker.message().await {}
-    });
-    let register = msg(worker_message::Msg::Register(Register::default()));
-    let (to_hub, mut from_hub) = slowlink::session(inputs, register).await;
-    let start = tokio::time::Instant::now();
-    let active = &mut HashMap::new();
-    let session = session_loop(&mut from_hub, active, &to_hub, &ctx, Duration::ZERO);
-    if let Ok(e) = tokio::time::timeout(slowlink::LONG, session).await {
-        panic!("the session died after {:?}: {e:?}", start.elapsed());
-    }
-    Ok(())
+/// A hub that reads the worker's Session (its outputs) for `reading`,
+/// floods it with `inputs` if asked, and cancels the worker's build "b" on
+/// its Control at LONG / 2.
+fn cancelling(reading: Duration, inputs: bool) -> impl WorkerHub {
+    slowlink::hub(
+        move |(mut from_worker, to_worker): HubEnd, (mut bulk, to_bulk)| async move {
+            let at = tokio::time::Instant::now() + slowlink::LONG / 2;
+            tokio::spawn(async move { while let Ok(Some(_)) = from_worker.message().await {} });
+            if inputs {
+                slowlink::flood(to_bulk.clone(), || {
+                    Ok(HubMessage {
+                        msg: Some(hub_message::Msg::Chunk(slowlink::bulk())),
+                    })
+                });
+            }
+            let read = async { while let Ok(Some(_)) = bulk.message().await {} };
+            let _ = tokio::time::timeout(reading, read).await;
+            tokio::time::sleep_until(at).await;
+            let c = CancelBuild {
+                build_id: "b".into(),
+                dedupe_key: "k".into(),
+            };
+            let cancel = hub_message::Msg::Cancel(c);
+            let _ = to_worker.send(Ok(HubMessage { msg: Some(cancel) })).await;
+            // Held, unread, for as long as the session lasts.
+            tokio::time::sleep(slowlink::LONG).await;
+            drop((bulk, to_bulk));
+        },
+    )
 }
 
-/// A worker sending outputs over a slow link keeps its session: its loop
-/// reads the hub's beats while the outputs fill its channel. It reads all
-/// else the hub sends too, a cancel here, once the hub takes no more
-/// outputs and the channel stays full: a loop waiting for room in the
-/// channel, for its heartbeat, would read nothing more.
-#[tokio::test(start_paused = true)]
-async fn a_worker_uploading_outputs_over_a_slow_link_keeps_its_session() -> Result<()> {
+/// The session loop on `hub` lives until the hub's cancel, and has taken
+/// it once the link could have carried one more chunk.
+async fn takes_the_cancel(hub: impl WorkerHub, outputs: bool) -> Result<()> {
     let dir = tempfile::tempdir()?;
     let ctx = WorkerCtx::for_test(dir.path(), 1, vec![])?;
     ResumableBuild::insert(&ctx, "k".into(), "b".into(), dir.path().join("b"), None);
-    // hub::beat's beats; it reads all the worker sends for LONG / 4, then
-    // nothing, and at LONG / 2 sends a cancel.
-    let beats = slowlink::hub(|mut from_worker, to_worker| async move {
-        tokio::spawn(hub::beat(to_worker.clone()));
-        let read = async { while let Ok(Some(_)) = from_worker.message().await {} };
-        let _ = tokio::time::timeout(slowlink::LONG / 4, read).await;
-        tokio::time::sleep(slowlink::LONG / 4).await;
-        let c = CancelBuild {
-            build_id: "b".into(),
-            dedupe_key: "k".into(),
-        };
-        let cancel = hub_message::Msg::Cancel(c);
-        let _ = to_worker.send(Ok(HubMessage { msg: Some(cancel) })).await;
-        // Held, unread, for as long as the session lasts.
-        tokio::time::sleep(slowlink::LONG).await;
-        drop(from_worker);
-    });
-    let register = msg(worker_message::Msg::Register(Register::default()));
-    let (to_hub, mut from_hub) = slowlink::session(beats, register).await;
-    slowlink::flood(to_hub.clone(), || {
-        msg(worker_message::Msg::Chunk(slowlink::bulk()))
-    });
+    let ((to_hub, mut from_hub), (to_bulk, mut from_bulk)) = slowlink::session(hub).await;
+    if outputs {
+        slowlink::flood(to_bulk.clone(), || {
+            msg(worker_message::Msg::Chunk(slowlink::bulk()))
+        });
+    }
     let start = tokio::time::Instant::now();
-    let active = &mut HashMap::new();
-    let session = session_loop(&mut from_hub, active, &to_hub, &ctx, Duration::ZERO);
-    if let Ok(e) = tokio::time::timeout(slowlink::LONG, session).await {
+    let (streams, active) = ((&mut from_hub, &mut from_bulk), &mut HashMap::new());
+    let session = session_loop(streams, active, (&to_hub, &to_bulk), &ctx, Duration::ZERO);
+    if let Ok(e) = tokio::time::timeout(slowlink::LONG / 2 + slowlink::one_chunk(), session).await {
         panic!("the session died after {:?}: {e:?}", start.elapsed());
     }
     assert!(
@@ -73,4 +58,19 @@ async fn a_worker_uploading_outputs_over_a_slow_link_keeps_its_session() -> Resu
         "no cancel read"
     );
     Ok(())
+}
+
+/// A hub's cancel reaches the worker at once while its inputs fill the
+/// link: the hub's Control waits behind none of them.
+#[tokio::test(start_paused = true)]
+async fn a_cancel_crosses_a_link_full_of_inputs() -> Result<()> {
+    takes_the_cancel(cancelling(slowlink::LONG / 2, true), false).await
+}
+
+/// A worker uploading outputs over a slow link reads all the hub sends,
+/// a cancel here, though the hub takes no more outputs and they wait:
+/// the loop never waits on them.
+#[tokio::test(start_paused = true)]
+async fn a_worker_uploading_outputs_over_a_slow_link_keeps_its_session() -> Result<()> {
+    takes_the_cancel(cancelling(slowlink::LONG / 4, false), true).await
 }
