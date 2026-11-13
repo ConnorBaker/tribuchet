@@ -22,9 +22,11 @@ use crate::proto::worker_hub_client::WorkerHubClient;
 use crate::proto::worker_hub_server::{WorkerHub, WorkerHubServer};
 use crate::proto::{ChunkFrame, HubMessage, Register, WorkerMessage, worker_message};
 
-/// The link's rate in bytes per second, about that of the relayed paths
-/// of 2026-11-12.
-pub(crate) const RATE: f64 = 1e6;
+/// The link's rate in bytes per second, as slow as the relayed paths of
+/// 2026-11-12. h2 keeps over 2/3 of a stream window (16 MiB) of a busy
+/// stream in flight, which takes 28 s here: an HTTP/2 PING sent behind it
+/// would miss a 20 s keepalive timeout and kill a live session.
+pub(crate) const RATE: f64 = 4e5;
 
 /// Longer than the hub waits for a silent worker.
 pub(crate) const LONG: Duration = Duration::from_mins(6);
