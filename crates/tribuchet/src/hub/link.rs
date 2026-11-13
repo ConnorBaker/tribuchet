@@ -72,7 +72,8 @@ impl Pending {
         // None for a worker predating Control: its Register names no
         // session, and Control takes none without one.
         let Some(control) = control else {
-            tracing::warn!("refusing a Session without a Control");
+            let worker = register.worker_name;
+            tracing::warn!(worker, "refusing a Session without a Control");
             return Err(Status::failed_precondition(
                 "open Control first: this hub takes a worker's control on its own connection",
             ));
