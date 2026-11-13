@@ -191,6 +191,27 @@ fn servable(dir: &Path) -> Result<(Arc<WorkerCtx>, [u8; 32])> {
     Ok((ctx, hash))
 }
 
+/// The chunks a Need asks of a finished result, and their eof, go on the
+/// session's Session and none on its Control, where control would queue
+/// behind bulk again.
+#[tokio::test]
+async fn output_chunks_go_on_the_session_not_the_control() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (ctx, hash) = servable(dir.path())?;
+    let (ctl, mut ctl_rx) = tokio::sync::mpsc::channel(4);
+    let (bulk, mut bulk_rx) = tokio::sync::mpsc::channel(4);
+    serve_chunks(&ctx, "b".into(), &hash, (ctl, bulk));
+    let mut eofs = Vec::new();
+    while let Ok(Some(m)) = tokio::time::timeout(Duration::from_secs(10), bulk_rx.recv()).await {
+        if let Some(worker_message::Msg::Chunk(c)) = m.msg {
+            eofs.push(c.eof);
+        }
+    }
+    assert_eq!(eofs, [false, true], "not the chunk and its eof");
+    assert!(ctl_rx.try_recv().is_err(), "something on the Control");
+    Ok(())
+}
+
 /// Chunks sent on a Session the hub takes nothing from, its Control
 /// alive, wait no longer than the hub's silence may last: then the
 /// session is gone, and the result is kept for the next one.

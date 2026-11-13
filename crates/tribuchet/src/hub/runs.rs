@@ -65,4 +65,14 @@ mod tests {
         let again = Runs::open(&path).next();
         assert_eq!((again.epoch, again.seq), (ahead + 2, 1));
     }
+
+    /// A hub whose epoch file is lost numbers its runs past the clock's
+    /// seconds, as every hub before it did at its start: not from 1 again.
+    #[test]
+    fn a_hub_whose_epoch_file_is_lost_numbers_runs_past_the_clock() {
+        let dir = tempfile::tempdir().unwrap();
+        let before = unix_now();
+        let run = Runs::open(&dir.path().join("run-epoch")).next();
+        assert!(run.epoch >= before, "epoch {} before {before}", run.epoch);
+    }
 }

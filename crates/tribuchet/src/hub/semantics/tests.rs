@@ -187,6 +187,32 @@ impl World {
         rs
     }
 
+    /// The waiting keys whose live run is on `w`, unless `kept` (by the
+    /// run and its phase in the hub): an event that ends the rest ends them
+    /// with no known cause.
+    fn ending(&self, w: usize, kept: impl Fn(Run, Phase) -> bool) -> Vec<Key> {
+        let live = self
+            .hub
+            .builds
+            .iter()
+            .filter_map(|(k, b)| Some((*k, b.live?)));
+        let on = |(k, run)| Some((k, run, self.hub.runs.get(&run)?));
+        let ends = |(k, run, r): (Key, Run, &RunOf)| {
+            (r.worker == w as Worker && !kept(run, r.phase)).then_some(k)
+        };
+        live.filter_map(on).filter_map(ends).collect()
+    }
+
+    /// D4, complete: a run lost with no known cause isolates its key.
+    fn isolates(&self, keys: &[Key]) {
+        for b in keys.iter().filter_map(|k| self.hub.builds.get(k)) {
+            assert!(
+                b.lost,
+                "D4: a run lost with no known cause isolates its key"
+            );
+        }
+    }
+
     fn deliver(&mut self, w: usize) {
         let wk = &mut self.wk[w];
         match (!wk.inbox.is_empty()).then(|| wk.inbox.remove(0)) {
@@ -224,7 +250,9 @@ impl World {
                 let wk = &mut self.wk[w];
                 (wk.up, wk.inbox) = (true, Vec::new());
                 let keep = wk.runs.iter().filter(|r| !r.1.2);
-                let held = keep.map(|(r, (k, p, _))| (*r, *k, *p)).collect();
+                let held: Vec<_> = keep.map(|(r, (k, p, _))| (*r, *k, *p)).collect();
+                let listed = |r, p| p != Phase::Started || held.iter().any(|h| h.0 == r);
+                let ending = self.ending(w, listed);
                 self.known.insert(w, serves(w));
                 let (worker, serves) = (w as Worker, serves(w));
                 self.send(Event::Register {
@@ -232,6 +260,7 @@ impl World {
                     serves,
                     held,
                 });
+                self.isolates(&ending);
             }
             Act::Down(w) | Act::Crash(w) => {
                 let wk = &mut self.wk[w];
@@ -360,7 +389,9 @@ impl World {
                     }
                 }
                 let worker = w as Worker;
+                let ending = self.ending(w, |_, p| matches!(p, Phase::Finished(_)));
                 self.send(Event::Suspect { worker });
+                self.isolates(&ending);
                 let kept = self.hub.runs.values().any(|r| r.worker == worker);
                 assert!(!kept, "a suspected worker's runs are kept");
             }

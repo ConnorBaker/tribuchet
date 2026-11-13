@@ -27,7 +27,8 @@ pub fn io_ctx(step: &'static str, path: &Path) -> impl FnOnce(io::Error) -> io::
     move |e| io::Error::new(e.kind(), format!("{step} {}: {e}", path.display()))
 }
 
-/// Replace `path` with `content` at once: written beside it, synced, renamed.
+/// Replace `path` with `content` at once: written beside it, synced,
+/// renamed, and the rename synced with its directory.
 pub fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
     {
@@ -35,7 +36,10 @@ pub fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
         f.write_all(content.as_bytes())?;
         f.sync_all()?;
     }
-    fs::rename(&tmp, path).map_err(io_ctx("renaming into", path))
+    fs::rename(&tmp, path).map_err(io_ctx("renaming into", path))?;
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    let dir = dir.unwrap_or(Path::new("."));
+    (fs::File::open(dir).and_then(|d| d.sync_all())).map_err(io_ctx("syncing", dir))
 }
 
 /// Write a secret file atomically with mode 0600: created via a temp
@@ -113,6 +117,25 @@ mod tests {
         for key in ["fil", "MemAvailable", "bad", "absent"] {
             assert_eq!(stat_field(text, key), None, "{key}");
         }
+    }
+
+    /// An atomic write syncs its directory after the rename, so the new
+    /// name survives a crash: a directory it cannot open to sync (here
+    /// searchable and writable, not readable) fails the write. Root reads
+    /// it all the same, so the test shows nothing as root and is skipped.
+    #[test]
+    fn an_atomic_write_fails_if_it_cannot_sync_its_directory() {
+        if rustix::process::geteuid().is_root() {
+            return;
+        }
+        let t = tempfile::tempdir().unwrap();
+        let d = t.path().join("d");
+        fs::create_dir(&d).unwrap();
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o300)).unwrap();
+        let res = write_atomic(&d.join("f"), "x");
+        fs::set_permissions(&d, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(fs::read_to_string(d.join("f")).unwrap(), "x");
+        assert!(res.is_err(), "the rename's directory went unsynced");
     }
 
     #[test]
