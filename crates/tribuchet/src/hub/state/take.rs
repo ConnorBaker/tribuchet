@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use super::losses::{Charge, Run};
 use super::{HubState, Job, WorkerCaps, losses};
+use crate::proto::CancelBuild;
 
 /// The builds a worker session holds from before, by dedupe key: the
 /// keys it listed last (Register's, then each Heartbeat's
@@ -42,6 +43,42 @@ impl HubState {
             .unwrap()
             .get(&worker)
             .map_or(0, |h| h.beats)
+    }
+
+    /// Build `job` is dispatched to worker `name`: a run of it there that
+    /// outlives every build of its key is cancelled (strays).
+    pub(in crate::hub) fn ran(&self, name: &str, job: &Job) {
+        let mut ran = self.ran.lock().unwrap();
+        let on = ran.entry(name.to_owned()).or_default();
+        on.insert(job.id.clone(), job.key.clone());
+    }
+
+    /// The runs worker session `worker` lists as held, of builds dispatched
+    /// to its worker, that no build wants: none of their key is queued,
+    /// dispatched or listed for dedupe. The hub ended their builds without
+    /// a verdict from that run, or with one from another, maybe while the
+    /// worker was away, and no timeout ends a run nobody cancels. Each is
+    /// told at each listing until the worker lists it no more.
+    pub(in crate::hub) async fn strays(&self, worker: u64) -> Vec<CancelBuild> {
+        let key = |j: &Job| j.key.clone();
+        let mut wanted: HashSet<String> = self.queue.lock().await.iter().map(key).collect();
+        wanted.extend(self.inflight.lock().unwrap().by_key.keys().cloned());
+        let dispatched = self.dispatched.lock().unwrap();
+        wanted.extend(dispatched.values().map(|d| d.key.clone()));
+        drop(dispatched);
+        let held = (self.holding.lock().unwrap().get(&worker)).map(|h| h.keys.clone());
+        let name = (self.worker_caps.lock().unwrap().get(&worker)).map(|c| c.name.clone());
+        let mut ran = self.ran.lock().unwrap();
+        let (Some(held), Some(on)) = (held, name.and_then(|n| ran.get_mut(&n))) else {
+            return Vec::new();
+        };
+        on.retain(|_, k| held.contains(k) || wanted.contains(k));
+        let stray = on.iter().filter(|(_, k)| !wanted.contains(*k));
+        let cancel = |(id, k): (&String, &String)| CancelBuild {
+            build_id: id.clone(),
+            dedupe_key: k.clone(),
+        };
+        stray.map(cancel).collect()
     }
 
     /// Whether a heartbeat of worker session `worker` after its first

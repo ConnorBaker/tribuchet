@@ -147,6 +147,9 @@ pub(super) struct HubState {
     pub(super) departed: StdMutex<Vec<(WorkerCaps, Instant)>>,
     /// worker id -> the builds it holds from before (Holding).
     pub(super) holding: StdMutex<HashMap<u64, Holding>>,
+    /// Worker name -> build id -> key, of the builds dispatched to it,
+    /// until no build wants the key and the worker lists it no more (strays).
+    ran: StdMutex<HashMap<String, HashMap<String, String>>>,
     /// Woken when worker capabilities change so waiting submissions
     /// re-check servability without polling.
     pub(super) caps_changed: Notify,
@@ -249,6 +252,7 @@ impl HubState {
             started_at: Instant::now(),
             departed: StdMutex::default(),
             holding: StdMutex::default(),
+            ran: StdMutex::default(),
             caps_changed: Notify::default(),
             metrics: Metrics::default(),
             nix_config: nix_config.map(Self::nix_config_writer),
