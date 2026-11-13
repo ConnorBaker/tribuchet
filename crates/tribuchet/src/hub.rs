@@ -396,7 +396,7 @@ async fn worker_loop(state: Arc<HubState>, register: Register, ctl: Half, bulk: 
         state.clone(),
         worker_id,
     ));
-    let mut bulk = tokio::spawn(route_bulk(bulk_rx, router.clone()));
+    let mut bulk = tokio::spawn(route_bulk(bulk_rx, router.clone(), bulk_tx.clone()));
     let sess = Arc::new(WorkerSession::new(register.worker_name.clone(), bulk_tx));
     let mut listed = None;
 
@@ -485,6 +485,7 @@ async fn supervise_job(
     state.ran(&worker.1, &job);
     let dispatch_listed = state.list_dispatch(&job, worker.0);
     let mut dispatch = Dispatch::default();
+    let bulk = sess.bulk.clone();
     let res = run_job(
         &state,
         &job,
@@ -512,9 +513,9 @@ async fn supervise_job(
     };
     // A worker that no longer lists a build it resumed, or dropped its
     // result, lost it as much as one whose session died, though the
-    // session lives on.
+    // session lives on. Either half of the session failing is its death.
     let gone = matches!(err, Error::Unlisted | Error::ResultGone);
-    let session_dead = gone || router.is_closed() || out_tx.is_closed();
+    let session_dead = gone || router.is_closed() || out_tx.is_closed() || bulk.is_closed();
     if matches!(err, Error::Superseded) {
         // Its worker delivers to the dispatch that took its key over.
         tracing::info!(

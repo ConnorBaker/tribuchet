@@ -85,9 +85,18 @@ impl Pending {
 }
 
 /// Route the session's bulk, which has no deadline: the worker's control
-/// says whether it is there.
-pub(super) async fn route_bulk(mut in_rx: mpsc::Receiver<WorkerMessage>, router: Router) {
-    while let Some(m) = in_rx.recv().await {
+/// says whether it is there. Either of its halves closing ends the session.
+pub(super) async fn route_bulk(
+    mut in_rx: mpsc::Receiver<WorkerMessage>,
+    router: Router,
+    out: mpsc::Sender<Result<HubMessage, Status>>,
+) {
+    loop {
+        let m = tokio::select! {
+            m = in_rx.recv() => m,
+            () = out.closed() => None,
+        };
+        let Some(m) = m else { break };
         if let Some(m) = m.msg {
             router.route(m).await;
         }

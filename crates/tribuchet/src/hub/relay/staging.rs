@@ -36,7 +36,7 @@ pub(in crate::hub) struct WorkerSession {
     /// The worker's name, as it registered: for the log lines.
     pub(super) worker: String,
     /// Its Session, for the session's bulk: manifests, chunks, tmp dirs.
-    pub(super) bulk: mpsc::Sender<Result<HubMessage, Status>>,
+    pub(in crate::hub) bulk: mpsc::Sender<Result<HubMessage, Status>>,
     /// One permit: the Need that sends the next chunk frame. A path is
     /// asked for by one build only; the others wait on its claim
     /// (spec/staging.qnt).
