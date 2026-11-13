@@ -11,7 +11,7 @@ use crate::proto::{BuildAssignment, CancelBuild, WorkerMessage, worker_message};
 use crate::sockpath;
 use crate::worker::agents::tests::pool::{Calls, fake_agent};
 use crate::worker::agents::tests::spawn_agent;
-use crate::worker::session::handle_cancel;
+use crate::worker::session::{Outbox, handle_cancel};
 use crate::worker::unix_now;
 
 mod cancel;
@@ -136,13 +136,13 @@ struct Held {
 }
 
 impl Held {
-    fn cancel(&self, session: &str, out: &tokio::sync::mpsc::Sender<WorkerMessage>) -> Result<()> {
+    fn cancel(&self, session: &str) {
         let c = CancelBuild {
             build_id: session.into(),
             dedupe_key: "k".into(),
         };
-        let rt = self.rt.as_ref().unwrap();
-        rt.block_on(handle_cancel(c, &mut HashMap::new(), out, &self.ctx))
+        let (rt, outbox) = (self.rt.as_ref().unwrap(), Outbox::default());
+        rt.block_on(handle_cancel(c, &mut HashMap::new(), &outbox, &self.ctx));
     }
 
     /// Assign the build to `session`, on the runtime, as a session does.
@@ -285,7 +285,7 @@ fn run(row: &str) -> Result<()> {
                     .or_insert_with(|| tokio::sync::mpsc::channel(cap));
                 let tx = tx.0.clone();
                 if what == "cancel" {
-                    h.cancel(arg, &tx)?;
+                    h.cancel(arg);
                 } else {
                     assert!(h.assign(arg, &tx), "{row}");
                 }

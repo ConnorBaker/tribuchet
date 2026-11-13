@@ -26,6 +26,7 @@ mod daemon;
 pub(super) mod fake_daemon;
 mod rank;
 mod reconnect;
+mod slow_link;
 mod unlisted;
 mod usage;
 

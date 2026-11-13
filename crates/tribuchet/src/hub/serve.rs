@@ -173,17 +173,11 @@ async fn run_async(cfg: HubConfig) -> Result<()> {
         .await
         .map_err(err_ctx("binding worker listen address"))?,
     };
-    let mut builder = Server::builder();
+    let mut builder = chunkio::session_server();
     if let Some(tls) = tls {
         builder = builder.tls_config(tls)?;
     }
     let worker_server = builder
-        // Detect dead/half-open worker connections instead of relying on
-        // the workers' own traffic.
-        .http2_keepalive_interval(Some(Duration::from_secs(30)))
-        .http2_keepalive_timeout(Some(Duration::from_secs(20)))
-        .initial_stream_window_size(Some(chunkio::H2_STREAM_WINDOW))
-        .initial_connection_window_size(Some(chunkio::H2_CONNECTION_WINDOW))
         .add_service(
             WorkerHubServer::new(WorkerSvc {
                 state: state.clone(),
