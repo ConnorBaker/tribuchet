@@ -31,7 +31,8 @@ pub enum Answer {
     Refuse,
 }
 
-/// How far a run is known to have got. It only moves forward.
+/// How far a run is known to have got. It only moves forward, and once
+/// Finished it is final.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Phase {
     Assigned,
@@ -234,6 +235,9 @@ impl Hub {
             return;
         };
         let was = r.phase;
+        if let Phase::Finished(_) = was {
+            return; // A run has one outcome: a report against it changes nothing.
+        }
         r.phase = was.max(now);
         if let (Some(key), Phase::Finished(o)) = (key, r.phase)
             && was != r.phase

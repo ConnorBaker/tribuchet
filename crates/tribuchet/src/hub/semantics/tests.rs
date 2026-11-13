@@ -30,6 +30,8 @@ enum Act {
     Fetched(usize),
     /// A protocol-breaking worker: any run it holds is "fetched".
     BogusFetched(usize, usize),
+    /// A protocol-breaking worker: a finished run's other outcome.
+    Contradict(usize),
     /// Every stream ends; workers re-register and clients resubmit.
     HubRestart,
     Place(Key, usize),
@@ -71,6 +73,8 @@ struct World {
     said: Vec<(Run, Option<Phase>)>,
     /// Answers seen: Give Failed, Give Built, Defer, Refuse; then isolation.
     answers: [usize; 5],
+    /// The outcome the hub first knew each run finished with.
+    finals: BTreeMap<Run, Outcome>,
 }
 
 fn serves(w: usize) -> BTreeSet<Sys> {
@@ -306,6 +310,18 @@ impl World {
                     self.send(Event::Fetched { run });
                 }
             }
+            Act::Contradict(i) => {
+                let done = |s: &&(Run, Option<Phase>)| matches!(s.1, Some(Phase::Finished(_)));
+                let said: Vec<_> = self.said.iter().filter(done).copied().collect();
+                if let Some(&(run, Some(Phase::Finished(o)))) = said.get(i % said.len().max(1)) {
+                    let o = match o {
+                        Outcome::Built => Outcome::Failed(1),
+                        Outcome::Failed(_) => Outcome::Built,
+                    };
+                    let now = Some(Phase::Finished(o));
+                    self.send(Event::Ran { run, now });
+                }
+            }
             Act::HubRestart => {
                 (self.hub, self.hubs) = (self.hub.restarted(), self.hubs + 1);
                 for w in 0..3 {
@@ -359,6 +375,12 @@ impl World {
                 "D4: isolation only after a loss of no known cause"
             );
             self.answers[4] = self.answers[4].max(usize::from(b.lost));
+        }
+        for (run, r) in &self.hub.runs {
+            if let Phase::Finished(o) = r.phase {
+                let first = *self.finals.entry(*run).or_insert(o);
+                assert_eq!(first, o, "a finished run's outcome is final");
+            }
         }
     }
 
@@ -416,6 +438,7 @@ fn act() -> impl Strategy<Value = Act> {
         3 => (0..64usize).prop_map(Act::Replay),
         2 => w.clone().prop_map(Act::Fetched),
         1 => (w.clone(), 0..4usize).prop_map(|(w, i)| Act::BogusFetched(w, i)),
+        1 => (0..64usize).prop_map(Act::Contradict),
         1 => Just(Act::HubRestart),
         5 => (0..4u32, w.clone()).prop_map(|(k, w)| Act::Place(k, w)),
         2 => (0..8usize, 0..8u32).prop_map(|(i, k)| Act::Adopt(i, k)),
