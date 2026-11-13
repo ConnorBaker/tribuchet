@@ -267,6 +267,7 @@ async fn route_loop(
         if let worker_message::Msg::Heartbeat(h) = &m {
             state.hold(worker, &h.resumable_keys, true);
             state.record_frozen(worker, h);
+            state.shadow.lost(&h.lost);
             let changed = h.max_jobs.is_some_and(|jobs| {
                 let mut caps = state.worker_caps.lock().unwrap();
                 caps.get_mut(&worker)
