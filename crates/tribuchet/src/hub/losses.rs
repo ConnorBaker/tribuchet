@@ -191,6 +191,7 @@ pub(super) async fn count(state: &HubState, mut job: Job, charge: Charge) -> Opt
 /// under it). This is the only place it lives. It fails the build.
 async fn after_too_many_losses(state: &HubState, job: Job, err: String) {
     tracing::warn!(id = job.id, "build failed: {err}");
+    job.shadow("genuine-loss cap", "Failed");
     Metrics::inc(&state.metrics.failed);
     job.replay.publish(attach_event::Event::Error(err)).await;
     state.finish(&job).await;
@@ -200,11 +201,13 @@ async fn after_too_many_losses(state: &HubState, job: Job, err: String) {
 /// clients' Nix to build itself (DECLINE_EXIT_CODE), as one no worker
 /// serves does: their output transfers dropped first. Not one with
 /// network, which would run in the client host's own network, outside
-/// every fod-network policy: it keeps waiting for a worker.
+/// every fod-network policy: it keeps waiting for a worker. So does one a
+/// client's Nix would not build (canLocal false), which would fail it.
 async fn defer(state: &HubState, job: Job, losses: u32) -> Option<Job> {
-    if job.req.fixed_output {
+    if job.req.fixed_output || job.replay.can_local().contains(&false) {
         return Some(job);
     }
+    job.shadow("transport-loss cap", "Defer");
     tracing::warn!(
         id = job.id,
         losses,
