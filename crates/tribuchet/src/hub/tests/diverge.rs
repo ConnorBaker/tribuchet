@@ -105,7 +105,7 @@ async fn per_call(waiting: usize) -> Duration {
         let client = j.replay.subscribe().await;
         jobs.push((j, client));
     }
-    let start = std::time::Instant::now();
+    let start = Instant::now();
     for (i, (j, _)) in jobs.iter().enumerate() {
         let run = RunId {
             epoch: 1,

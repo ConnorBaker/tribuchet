@@ -1,6 +1,9 @@
 //! The session loop over a slow link (crate::slowlink).
 
+use std::result;
+
 use super::*;
+use crate::hub::tests::slow_link::service;
 use crate::proto::worker_hub_server::WorkerHub;
 use crate::slowlink::{self, HubEnd};
 
@@ -68,7 +71,7 @@ fn hub_beats(ctl: &Tx, bulk: &Tx) {
     }
 }
 
-type Tx = mpsc::Sender<std::result::Result<HubMessage, tonic::Status>>;
+type Tx = mpsc::Sender<result::Result<HubMessage, tonic::Status>>;
 
 /// How long the session loop on `hub` lives, up to LONG.
 async fn lives(hub: impl WorkerHub) -> Duration {
@@ -112,8 +115,7 @@ async fn a_hub_silent_on_either_stream_ends_the_session_after_its_silence() {
         );
     }
     assert_eq!(lives(silent([true, true])).await, slowlink::LONG);
-    let hub = crate::hub::tests::slow_link::service();
-    assert_eq!(lives(hub).await, slowlink::LONG, "the hub ended it");
+    assert_eq!(lives(service()).await, slowlink::LONG, "the hub ended it");
 }
 
 /// A hub's cancel reaches the worker at once while its inputs fill the

@@ -7,6 +7,7 @@ use rustix::fs::{CWD, FileType, Mode, mknodat};
 use rustix::process::geteuid;
 
 use super::*;
+use crate::chunkio::SILENCE_TIMEOUT;
 
 /// A build dir whose removal stops part-way, as when the worker stops
 /// meanwhile, leaves no build to adopt: its state.json goes first. Here
@@ -228,7 +229,7 @@ async fn a_chunk_request_waits_on_a_silent_session_no_longer_than_its_silence() 
     }
     thread::sleep(Duration::from_millis(100));
     // A blocking task holds the paused clock still unless it is advanced.
-    tokio::time::advance(crate::chunkio::SILENCE_TIMEOUT + Duration::from_secs(1)).await;
+    tokio::time::advance(SILENCE_TIMEOUT + Duration::from_secs(1)).await;
     for _ in (0..1000).take_while(|_| bulk_rx.sender_strong_count() > 0) {
         thread::sleep(Duration::from_millis(1));
     }

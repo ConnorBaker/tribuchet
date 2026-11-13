@@ -56,7 +56,7 @@ async fn a_worker_predating_control_is_refused_and_the_hub_serves_on() {
 }
 
 /// The hub's worker service, for a worker's tests.
-pub(crate) fn service() -> impl crate::proto::worker_hub_server::WorkerHub {
+pub(crate) fn service() -> impl WorkerHub {
     WorkerSvc {
         state: Arc::new(HubState::for_test(Duration::from_secs(30))),
         auth: Arc::new(PeerAuth::Mtls),
