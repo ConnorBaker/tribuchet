@@ -20,6 +20,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::server::TcpConnectInfo;
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::chunkio::{self, SILENCE_TIMEOUT};
 use crate::proto::worker_hub_server::WorkerHub;
 use crate::tailscale;
 
@@ -58,12 +59,6 @@ use losses::Dispatch;
 use metrics::Metrics;
 use relay::{Inbox, WorkerSession, run_job, send};
 use state::{HubState, Job, WorkerCaps};
-
-/// No worker message for this long tears the session down and fails
-/// its builds: heartbeats flow every chunkio::HEARTBEAT, so silence
-/// means a dead worker that would otherwise pin its builds (and dedupe
-/// keys) forever.
-const WORKER_SILENCE_TIMEOUT: Duration = Duration::from_mins(3);
 
 /// In tailscale mode the hub asks tailscaled who the peer is on every
 /// session and uses that as the worker name; mTLS mode trusts the
@@ -237,11 +232,11 @@ async fn route_loop(
     worker: u64,
 ) {
     loop {
-        let m = match tokio::time::timeout(WORKER_SILENCE_TIMEOUT, in_rx.recv()).await {
+        let m = match tokio::time::timeout(SILENCE_TIMEOUT, in_rx.recv()).await {
             Err(_) => {
                 tracing::warn!(
                     "worker sent nothing for {}s; assuming it is dead",
-                    WORKER_SILENCE_TIMEOUT.as_secs()
+                    SILENCE_TIMEOUT.as_secs()
                 );
                 break;
             }
@@ -398,6 +393,9 @@ async fn worker_loop(state: Arc<HubState>, register: Register, ctl: Half, bulk: 
     ));
     let mut bulk = tokio::spawn(route_bulk(bulk_rx, router.clone(), bulk_tx.clone()));
     let sess = Arc::new(WorkerSession::new(register.worker_name.clone(), bulk_tx));
+    for tx in [&out_tx, &sess.bulk] {
+        chunkio::beat(tx, || Ok(HubMessage::default()));
+    }
     let mut listed = None;
 
     'outer: loop {
@@ -515,7 +513,9 @@ async fn supervise_job(
     // result, lost it as much as one whose session died, though the
     // session lives on. Either half of the session failing is its death.
     let gone = matches!(err, Error::Unlisted | Error::ResultGone);
-    let session_dead = gone || router.is_closed() || out_tx.is_closed() || bulk.is_closed();
+    let silent = matches!(err, Error::Silent);
+    let session_dead =
+        gone || silent || router.is_closed() || out_tx.is_closed() || bulk.is_closed();
     if matches!(err, Error::Superseded) {
         // Its worker delivers to the dispatch that took its key over.
         tracing::info!(
@@ -596,4 +596,4 @@ async fn cancel(out_tx: &mpsc::Sender<Result<HubMessage, Status>>, job: &Job) ->
 }
 
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;

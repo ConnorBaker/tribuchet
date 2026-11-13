@@ -9,7 +9,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
-use super::{Router, WORKER_SILENCE_TIMEOUT};
+use super::{Router, SILENCE_TIMEOUT};
 use crate::errors::chain;
 use crate::proto::{HubMessage, Register, WorkerMessage, worker_message};
 
@@ -44,7 +44,7 @@ impl Pending {
         pending.lock().unwrap().insert(session.clone(), bulk_tx);
         let worker = register.worker_name.clone();
         async move {
-            let bulk = tokio::time::timeout(WORKER_SILENCE_TIMEOUT, bulk).await;
+            let bulk = tokio::time::timeout(SILENCE_TIMEOUT, bulk).await;
             pending.lock().unwrap().remove(&session);
             let Ok(Ok((bulk_tx, bulk))) = bulk else {
                 tracing::warn!(worker, "worker opened no Session for its Control");
@@ -84,8 +84,8 @@ impl Pending {
     }
 }
 
-/// Route the session's bulk, which has no deadline: the worker's control
-/// says whether it is there. Either of its halves closing ends the session.
+/// Route the session's bulk. Either of its halves closing ends the
+/// session, as does its silence: the worker beats on it as on its Control.
 pub(super) async fn route_bulk(
     mut in_rx: mpsc::Receiver<WorkerMessage>,
     router: Router,
@@ -93,7 +93,7 @@ pub(super) async fn route_bulk(
 ) {
     loop {
         let m = tokio::select! {
-            m = in_rx.recv() => m,
+            m = tokio::time::timeout(SILENCE_TIMEOUT, in_rx.recv()) => m.ok().flatten(),
             () = out.closed() => None,
         };
         let Some(m) = m else { break };

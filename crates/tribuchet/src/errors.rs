@@ -41,6 +41,10 @@ pub enum Error {
     /// which delivers to that dispatch: nothing more for this one.
     #[error("a later dispatch took the build over")]
     Superseded,
+    /// The worker took nothing sent on a stream of its session for
+    /// SILENCE_TIMEOUT: it may be gone, a lost session.
+    #[error("the worker read nothing for too long")]
+    Silent,
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]

@@ -137,14 +137,21 @@ async fn session_loop(
     let mut negotiations = tokio::task::JoinSet::<Negotiation>::new();
     // The loop's sends wait on control alone: the bulk has its own stream.
     out_tx.send(capacity(active, &ready, &env)).await?;
+    // When each of the hub's streams last said anything: a silent one may
+    // mean a hub gone, as the hub reads the worker's (chunkio).
+    let mut heard = [tokio::time::Instant::now(); 2];
     loop {
         let m = tokio::select! {
+            () = tokio::time::sleep_until(heard[0].min(heard[1]) + chunkio::SILENCE_TIMEOUT) => {
+                return Err(err_msg("the hub sent nothing for too long; assuming it is gone"));
+            }
             () = ctx.agents.changed.notified() => {
                 grant_slots(active, &mut ready, &env);
                 out_tx.send(capacity(active, &ready, &env)).await?;
                 continue;
             }
             _ = heartbeat.tick() => {
+                let _ = bulk_tx.try_send(WorkerMessage::default());
                 out_tx.send(beat(active, ctx)).await?;
                 out_tx.send(capacity(active, &ready, &env)).await?;
                 continue;
@@ -166,9 +173,11 @@ async fn session_loop(
                 continue;
             }
             m = inbound.message() => {
+                heard[0] = tokio::time::Instant::now();
                 m?.ok_or_else(|| err_msg("hub closed the session"))?
             }
             m = bulk_in.message() => {
+                heard[1] = tokio::time::Instant::now();
                 m?.ok_or_else(|| err_msg("hub closed the session"))?
             }
         };

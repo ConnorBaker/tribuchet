@@ -55,6 +55,36 @@ async fn a_worker_predating_control_is_refused_and_the_hub_serves_on() {
     assert!(served(), "the next worker was not served");
 }
 
+/// The hub's worker service, for a worker's tests.
+pub(crate) fn service() -> impl crate::proto::worker_hub_server::WorkerHub {
+    WorkerSvc {
+        state: Arc::new(HubState::for_test(Duration::from_secs(30))),
+        auth: Arc::new(PeerAuth::Mtls),
+        pending: Default::default(),
+    }
+}
+
+/// The hub beats on each stream of a session, and ends one whose Session
+/// says nothing for SILENCE_TIMEOUT, its Control beating: a peer silent on
+/// either stream may be gone, to the hub as to the worker.
+#[tokio::test(start_paused = true)]
+async fn the_hub_beats_and_ends_a_session_silent_on_its_session() {
+    let start = tokio::time::Instant::now();
+    let ((to_hub, mut from_hub), (_to_bulk, mut from_bulk)) = slowlink::session(service()).await;
+    keep_alive(&to_hub);
+    for stream in [&mut from_hub, &mut from_bulk] {
+        let beat = tokio::time::timeout(chunkio::HEARTBEAT * 2, stream.message()).await;
+        assert!(
+            matches!(beat, Ok(Ok(Some(HubMessage { msg: None })))),
+            "{beat:?}"
+        );
+    }
+    while let Ok(Some(_)) = from_hub.message().await {}
+    let lived = start.elapsed();
+    let silence = SILENCE_TIMEOUT..SILENCE_TIMEOUT + slowlink::one_chunk();
+    assert!(silence.contains(&lived), "lived {lived:?}");
+}
+
 /// worker_loop on one stream each way, which the test reads and writes
 /// as both the session's Control and its Session.
 pub(super) fn spawn_session(
@@ -64,6 +94,8 @@ pub(super) fn spawn_session(
     in_rx: mpsc::Receiver<WorkerMessage>,
 ) -> tokio::task::JoinHandle<()> {
     let (bulk, bulk_rx) = mpsc::channel(1);
+    // Its Session beats, as a worker's does.
+    chunkio::beat(&bulk, WorkerMessage::default);
     tokio::spawn(async move {
         let _bulk = bulk;
         worker_loop(state, register, (out_tx.clone(), in_rx), (out_tx, bulk_rx)).await;

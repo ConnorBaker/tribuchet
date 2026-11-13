@@ -11,6 +11,7 @@ fn cancelling(reading: Duration, inputs: bool) -> impl WorkerHub {
     slowlink::hub(
         move |(mut from_worker, to_worker): HubEnd, (mut bulk, to_bulk)| async move {
             let at = tokio::time::Instant::now() + slowlink::LONG / 2;
+            hub_beats(&to_worker, &to_bulk);
             tokio::spawn(async move { while let Ok(Some(_)) = from_worker.message().await {} });
             if inputs {
                 slowlink::flood(to_bulk.clone(), || {
@@ -58,6 +59,61 @@ async fn takes_the_cancel(hub: impl WorkerHub, outputs: bool) -> Result<()> {
         "no cancel read"
     );
     Ok(())
+}
+
+/// The hub's heartbeats on its Control and its Session, as it sends them.
+fn hub_beats(ctl: &Tx, bulk: &Tx) {
+    for tx in [ctl, bulk] {
+        chunkio::beat(tx, || Ok(HubMessage::default()));
+    }
+}
+
+type Tx = mpsc::Sender<std::result::Result<HubMessage, tonic::Status>>;
+
+/// How long the session loop on `hub` lives, up to LONG.
+async fn lives(hub: impl WorkerHub) -> Duration {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = WorkerCtx::for_test(dir.path(), 1, vec![]).unwrap();
+    let ((to_hub, mut from_hub), (to_bulk, mut from_bulk)) = slowlink::session(hub).await;
+    let (streams, active) = ((&mut from_hub, &mut from_bulk), &mut HashMap::new());
+    let start = tokio::time::Instant::now();
+    let session = session_loop(streams, active, (&to_hub, &to_bulk), &ctx, Duration::ZERO);
+    let _ = tokio::time::timeout(slowlink::LONG, session).await;
+    start.elapsed()
+}
+
+/// A hub that beats on its Control, its Session, both or neither, and is
+/// else never heard from (its host gone: no FIN, no RST).
+fn silent(on: [bool; 2]) -> impl WorkerHub {
+    slowlink::hub(
+        move |(_from_worker, ctl): HubEnd, (_bulk, bulk)| async move {
+            let none = mpsc::channel(1).0;
+            hub_beats(
+                if on[0] { &ctl } else { &none },
+                if on[1] { &bulk } else { &none },
+            );
+            tokio::time::sleep(slowlink::LONG * 2).await;
+            drop((ctl, bulk));
+        },
+    )
+}
+
+/// The worker ends a session whose hub sends nothing on its Control, or
+/// on its Session, for SILENCE_TIMEOUT, as the hub ends a silent worker's;
+/// a hub beating on both keeps it, as does the hub itself.
+#[tokio::test(start_paused = true)]
+async fn a_hub_silent_on_either_stream_ends_the_session_after_its_silence() {
+    let silence = chunkio::SILENCE_TIMEOUT..chunkio::SILENCE_TIMEOUT + slowlink::one_chunk();
+    for on in [[false, false], [true, false], [false, true]] {
+        let lived = lives(silent(on)).await;
+        assert!(
+            silence.contains(&lived),
+            "beating on {on:?}: lived {lived:?}"
+        );
+    }
+    assert_eq!(lives(silent([true, true])).await, slowlink::LONG);
+    let hub = crate::hub::tests::slow_link::service();
+    assert_eq!(lives(hub).await, slowlink::LONG, "the hub ended it");
 }
 
 /// A hub's cancel reaches the worker at once while its inputs fill the

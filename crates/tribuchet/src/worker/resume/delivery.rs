@@ -13,6 +13,7 @@ use tokio::sync::mpsc;
 
 use super::{BuildState, Ending};
 use crate::chunker::parse_hashes;
+use crate::chunkio;
 use crate::chunkstore::Hash;
 use crate::errors::{Error, Result, chain, err_msg};
 use crate::fsutil::io_ctx;
@@ -384,23 +385,36 @@ fn send_chunks(
             let mut frame = vec![0u8; c.len as usize];
             f.read_exact_at(&mut frame, c.off)
                 .map_err(io_ctx("reading", path))?;
-            out_tx.blocking_send(msg(worker_message::Msg::Chunk(ChunkFrame {
-                build_id: build_id.into(),
-                hash: c.hash.to_vec(),
-                zstd: frame,
-                eof: false,
-            })))?;
+            send_bulk(
+                out_tx,
+                msg(worker_message::Msg::Chunk(ChunkFrame {
+                    build_id: build_id.into(),
+                    hash: c.hash.to_vec(),
+                    zstd: frame,
+                    eof: false,
+                })),
+            )?;
         }
     }
     if !needed.is_empty() {
         return Err(err_msg("hub asked for chunks outside the result recipes"));
     }
-    out_tx.blocking_send(msg(worker_message::Msg::Chunk(ChunkFrame {
+    let eof = ChunkFrame {
         build_id: build_id.into(),
         eof: true,
         ..Default::default()
-    })))?;
-    Ok(())
+    };
+    send_bulk(out_tx, msg(worker_message::Msg::Chunk(eof)))
+}
+
+/// Send `m` on the session's bulk, blocking, as long as the hub's silence
+/// may last (chunkio::SILENCE_TIMEOUT); longer fails as a closed session.
+fn send_bulk(tx: &mpsc::Sender<WorkerMessage>, m: WorkerMessage) -> Result<()> {
+    let sent = tokio::time::timeout(chunkio::SILENCE_TIMEOUT, tx.send(m));
+    match tokio::runtime::Handle::current().block_on(sent) {
+        Ok(Ok(())) => Ok(()),
+        _ => Err(mpsc::error::SendError(WorkerMessage::default()).into()),
+    }
 }
 
 /// Serve a NeedChunks for a finished build on a blocking thread. A result
