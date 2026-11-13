@@ -254,7 +254,7 @@ mod tests {
         io_hook::off_runtime(|| cache.admit(a, &compress(b"hello", 3).unwrap()).unwrap());
 
         let (tx, mut rx) = mpsc::channel(8);
-        let sess = WorkerSession::new("w".into());
+        let sess = WorkerSession::new("w".into(), tx.clone());
 
         let todo: HashSet<Hash> = [a, b].into();
         let wire = AtomicU64::default();

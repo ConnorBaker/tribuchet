@@ -5,8 +5,14 @@ package tribuchet.v1;
 // Worker-facing service. Workers dial the hub and keep a long-lived
 // bidirectional stream open (NAT-friendly; the hub never dials workers).
 service WorkerHub {
-  // Single bidi stream multiplexing registration, heartbeats, build
-  // assignment, path negotiation, chunk transfer, logs and results.
+  // A worker's control: registration, heartbeats, assignments, cancels,
+  // Needs, Started, logs, results and acks. Opened first, on a
+  // connection of its own, so that no chunk is ever queued ahead of it.
+  rpc Control(stream WorkerMessage) returns (stream HubMessage);
+  // The same worker's bulk, on a second connection: chunks, manifests and
+  // tmp dirs. Its first message is a Register carrying only the session
+  // of the worker's open Control. A Register without one (a worker
+  // predating Control) is refused.
   rpc Session(stream WorkerMessage) returns (stream HubMessage);
 }
 
@@ -154,6 +160,9 @@ message Register {
   // where the worker cannot tell, and by workers predating the fields.
   optional uint32 cores = 5;
   optional uint64 build_memory = 6;
+  // Random, chosen by the worker per session: names its Control to its
+  // Session.
+  bytes session = 7;
 }
 
 message Heartbeat {

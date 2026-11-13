@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use tokio::task::spawn_blocking;
 use tonic::Status;
 
-use super::{msg_name, recv, send};
+use super::{Inbox, msg_name, recv, send};
 use crate::chunker::{Recipe, decode_chunk, parse_recipe};
 use crate::chunkstore::Hash;
 use crate::errors::{Error, Result, err_ctx, err_msg};
@@ -62,7 +62,7 @@ pub(super) fn verify_set(
 struct ChunkSource<'a> {
     cache: &'a Arc<ChunkCache>,
     needed: HashSet<Hash>,
-    in_rx: &'a mut mpsc::Receiver<worker_message::Msg>,
+    in_rx: &'a mut Inbox,
 }
 
 impl ChunkSource<'_> {
@@ -118,7 +118,7 @@ pub(super) async fn deliver_outputs(
     state: &HubState,
     job: &Job,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
-    in_rx: &mut mpsc::Receiver<worker_message::Msg>,
+    in_rx: &mut Inbox,
     outputs: Vec<Announced>,
 ) -> Result<()> {
     let cache = &state.chunks;

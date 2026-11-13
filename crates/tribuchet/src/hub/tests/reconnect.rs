@@ -14,7 +14,7 @@ async fn supervise_dead(state: &Arc<HubState>, job: Job, session: (u64, String),
     let (out_tx, out_rx) = mpsc::channel(64);
     let _out_rx = reached.then_some(out_rx);
     router.close_all();
-    let sess = Arc::new(WorkerSession::new("w".into()));
+    let sess = Arc::new(WorkerSession::new("w".into(), out_tx.clone()));
     let admission = Arc::new(Mutex::new(Admission::default()));
     supervise_job(
         state.clone(),

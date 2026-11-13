@@ -24,9 +24,10 @@ async fn a_stalled_negotiation_leaves_the_loop_reading_the_hub() -> Result<()> {
     // A hub assigning a build and then cancelling it, which passes on all
     // it reads.
     let (read_tx, mut read) = mpsc::unbounded_channel();
-    let stalled = slowlink::hub(move |mut from_worker, to_worker| {
+    let stalled = slowlink::hub(move |(mut from_worker, to_worker), bulk| {
         let read = read_tx.clone();
         async move {
+            let (_bulk, to_bulk) = bulk;
             let a = base_assignment();
             let (build_id, dedupe_key) = (a.build_id.clone(), a.dedupe_key.clone());
             let tmp_dir = hub_message::Msg::TmpDir(TmpDirArchive::eof(&build_id));
@@ -34,18 +35,23 @@ async fn a_stalled_negotiation_leaves_the_loop_reading_the_hub() -> Result<()> {
                 build_id,
                 dedupe_key,
             });
-            for m in [hub_message::Msg::Assignment(a), tmp_dir, cancel] {
-                let _ = to_worker.send(Ok(HubMessage { msg: Some(m) })).await;
-            }
+            let hub_msg = |m| Ok(HubMessage { msg: Some(m) });
+            let _ = to_worker
+                .send(hub_msg(hub_message::Msg::Assignment(a)))
+                .await;
+            // The tmp dir after the assignment, on the other connection.
+            tokio::time::sleep(chunkio::HEARTBEAT).await;
+            let _ = to_bulk.send(hub_msg(tmp_dir)).await;
+            let _ = to_worker.send(hub_msg(cancel)).await;
             while let Ok(Some(m)) = from_worker.message().await {
                 let _ = read.send(m);
             }
         }
     });
-    let register = msg(worker_message::Msg::Register(Register::default()));
-    let (to_hub, mut from_hub) = slowlink::session(stalled, register).await;
+    let ((to_hub, mut from_hub), (to_bulk, mut from_bulk)) = slowlink::session(stalled).await;
     let active = &mut HashMap::new();
-    let session = session_loop(&mut from_hub, active, &to_hub, &ctx, Duration::ZERO);
+    let streams = (&mut from_hub, &mut from_bulk);
+    let session = session_loop(streams, active, (&to_hub, &to_bulk), &ctx, Duration::ZERO);
     let _ = tokio::time::timeout(4 * chunkio::HEARTBEAT, session).await;
     let read: Vec<_> = iter::from_fn(|| read.try_recv().ok()).collect();
     let beat = |m: &&WorkerMessage| matches!(m.msg, Some(worker_message::Msg::Heartbeat(_)));

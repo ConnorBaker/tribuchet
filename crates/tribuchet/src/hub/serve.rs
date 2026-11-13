@@ -182,6 +182,7 @@ async fn run_async(cfg: HubConfig) -> Result<()> {
             WorkerHubServer::new(WorkerSvc {
                 state: state.clone(),
                 auth: Arc::new(peer_auth),
+                pending: Default::default(),
             })
             .max_decoding_message_size(MAX_MSG_SIZE)
             .max_encoding_message_size(MAX_MSG_SIZE),

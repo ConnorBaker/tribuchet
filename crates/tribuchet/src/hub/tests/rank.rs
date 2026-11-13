@@ -28,10 +28,11 @@ pub(super) fn sized_worker(state: &Arc<HubState>, name: &str, cores: u32, gib: u
         max_jobs: 2,
         cores: Some(cores),
         build_memory: Some(gib << 30),
+        ..Register::default()
     };
     let (out_tx, from_hub) = mpsc::channel(256);
     let (to_hub, in_rx) = mpsc::channel(64);
-    let hub = tokio::spawn(worker_loop(state.clone(), register, out_tx, in_rx));
+    let hub = spawn_session(state.clone(), register, out_tx, in_rx);
     Worker {
         to_hub,
         from_hub,

@@ -12,6 +12,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::PollSender;
+use tonic::Streaming;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 use super::build::{ActiveBuild, Negotiation, StagingStatus, Wake, validate_assignment};
@@ -48,13 +49,20 @@ pub(super) async fn session(opts: &WorkerConfig, ctx: &Arc<WorkerCtx>) -> Result
             ));
         endpoint = endpoint.tls_config(tls)?;
     }
-    let channel = chunkio::session_endpoint(endpoint)
-        .connect()
-        .await
-        .map_err(err_ctx("connecting to hub"))?;
-    let mut client = WorkerHubClient::new(channel)
-        .max_decoding_message_size(MAX_MSG_SIZE)
-        .max_encoding_message_size(MAX_MSG_SIZE);
+    // Control and bulk each on a connection of its own, so that no chunk
+    // is queued ahead of control in a send buffer.
+    let connect = async |endpoint| {
+        let channel = (chunkio::session_endpoint(endpoint).connect().await)
+            .map_err(err_ctx("connecting to hub"))?;
+        Ok::<_, Error>(
+            WorkerHubClient::new(channel)
+                .max_decoding_message_size(MAX_MSG_SIZE)
+                .max_encoding_message_size(MAX_MSG_SIZE),
+        )
+    };
+    let (mut control, mut bulk) = (connect(endpoint.clone()).await?, connect(endpoint).await?);
+    let mut session = vec![0; 16];
+    getrandom::fill(&mut session).map_err(|e| err_msg(format!("randomness: {e}")))?;
 
     let (out_tx, out_rx) = mpsc::channel::<WorkerMessage>(64);
     // Register must be the first message the hub reads; it fits in the
@@ -71,21 +79,29 @@ pub(super) async fn session(opts: &WorkerConfig, ctx: &Arc<WorkerCtx>) -> Result
                 Path::new("/proc/meminfo"),
                 &own_cgroup().unwrap_or_default(),
             ),
+            session: session.clone(),
         })))
         .await?;
+    let (bulk_tx, bulk_rx) = mpsc::channel::<WorkerMessage>(64);
+    let register = Register {
+        session,
+        ..Register::default()
+    };
+    bulk_tx
+        .send(msg(worker_message::Msg::Register(register)))
+        .await?;
 
-    let mut inbound = client
-        .session(ReceiverStream::new(out_rx))
-        .await?
-        .into_inner();
+    // Control first: the hub then expects its Session.
+    let mut inbound = (control.control(ReceiverStream::new(out_rx)).await?).into_inner();
+    let mut bulk_in = (bulk.session(ReceiverStream::new(bulk_rx)).await?).into_inner();
     tracing::info!(hub = opts.hub, systems = ?opts.systems, "connected to hub");
     sd::notify_status(CONNECTED_STATUS);
 
     let mut active: HashMap<String, ActiveBuild> = HashMap::new();
     let result = session_loop(
-        &mut inbound,
+        (&mut inbound, &mut bulk_in),
         &mut active,
-        &out_tx,
+        (&out_tx, &bulk_tx),
         ctx,
         Duration::from_secs(opts.build_timeout_secs),
     )
@@ -99,10 +115,12 @@ pub(super) async fn session(opts: &WorkerConfig, ctx: &Arc<WorkerCtx>) -> Result
     result
 }
 
+/// Drive a session: `inbound` and `out_tx` are its Control, `bulk_in`
+/// and `bulk_tx` its Session.
 async fn session_loop(
-    inbound: &mut tonic::Streaming<HubMessage>,
+    (inbound, bulk_in): (&mut Streaming<HubMessage>, &mut Streaming<HubMessage>),
     active: &mut HashMap<String, ActiveBuild>,
-    out_tx: &mpsc::Sender<WorkerMessage>,
+    (out_tx, bulk_tx): (&mpsc::Sender<WorkerMessage>, &mpsc::Sender<WorkerMessage>),
     ctx: &Arc<WorkerCtx>,
     build_timeout: Duration,
 ) -> Result<()> {
@@ -170,6 +188,9 @@ async fn session_loop(
             m = inbound.message() => {
                 m?.ok_or_else(|| err_msg("hub closed the session"))?
             }
+            m = bulk_in.message() => {
+                m?.ok_or_else(|| err_msg("hub closed the session"))?
+            }
         };
         let Some(m) = m.msg else { continue };
         match m {
@@ -206,7 +227,12 @@ async fn session_loop(
                 env.outbox.declare.set(true);
             }
             hub_message::Msg::Need(n) => {
-                serve_chunks(ctx, n.build_id, &n.hashes, out_tx.clone());
+                serve_chunks(
+                    ctx,
+                    n.build_id,
+                    &n.hashes,
+                    (out_tx.clone(), bulk_tx.clone()),
+                );
             }
             hub_message::Msg::ResultAck(a) => {
                 ack_delivery(ctx, &a.dedupe_key, &a.build_id);
