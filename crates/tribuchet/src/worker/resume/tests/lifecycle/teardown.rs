@@ -7,6 +7,7 @@ use rustix::fs::{CWD, FileType, Mode, mknodat};
 use rustix::process::geteuid;
 
 use super::*;
+use crate::chunkio::SILENCE_TIMEOUT;
 
 /// A build dir whose removal stops part-way, as when the worker stops
 /// meanwhile, leaves no build to adopt: its state.json goes first. Here
@@ -163,6 +164,78 @@ async fn a_chunk_request_it_cannot_serve_is_answered_result_gone() -> Result<()>
         let after = (gone.build_id.as_str(), held(&ctx, "k").is_some());
         assert_eq!(after, (id, kept));
     }
+    Ok(())
+}
+
+/// A worker holding the finished result "b" of key "k", one chunk of it
+/// on disk, whose hash it returns.
+fn servable(dir: &Path) -> Result<(Arc<WorkerCtx>, [u8; 32])> {
+    let ctx = WorkerCtx::for_test(dir, 4, vec![])?;
+    let build = dir.join("builds/k");
+    fs::create_dir_all(&build)?;
+    let (mut fin, hash) = (finished(&build), [7; 32]);
+    let frames_file = build.join("frames");
+    fs::write(&frames_file, [1])?;
+    let chunks = vec![OutChunk {
+        hash,
+        size: 1,
+        off: 0,
+        len: 1,
+    }];
+    let scratch = "/nix/store/out".into();
+    fin.outputs = vec![PackedOutput {
+        scratch,
+        frames_file,
+        chunks,
+    }];
+    ResumableBuild::insert(&ctx, "k".into(), "b".into(), build, Some(fin));
+    Ok((ctx, hash))
+}
+
+/// The chunks a Need asks of a finished result, and their eof, go on the
+/// session's Session and none on its Control, where control would queue
+/// behind bulk again.
+#[tokio::test]
+async fn output_chunks_go_on_the_session_not_the_control() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (ctx, hash) = servable(dir.path())?;
+    let (ctl, mut ctl_rx) = tokio::sync::mpsc::channel(4);
+    let (bulk, mut bulk_rx) = tokio::sync::mpsc::channel(4);
+    serve_chunks(&ctx, "b".into(), &hash, (ctl, bulk));
+    let mut eofs = Vec::new();
+    while let Ok(Some(m)) = tokio::time::timeout(Duration::from_secs(10), bulk_rx.recv()).await {
+        if let Some(worker_message::Msg::Chunk(c)) = m.msg {
+            eofs.push(c.eof);
+        }
+    }
+    assert_eq!(eofs, [false, true], "not the chunk and its eof");
+    assert!(ctl_rx.try_recv().is_err(), "something on the Control");
+    Ok(())
+}
+
+/// Chunks sent on a Session the hub takes nothing from, its Control
+/// alive, wait no longer than the hub's silence may last: then the
+/// session is gone, and the result is kept for the next one.
+#[tokio::test(start_paused = true)]
+async fn a_chunk_request_waits_on_a_silent_session_no_longer_than_its_silence() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (ctx, hash) = servable(dir.path())?;
+    let (ctl, mut ctl_rx) = tokio::sync::mpsc::channel(4);
+    let (bulk, bulk_rx) = tokio::sync::mpsc::channel(1);
+    serve_chunks(&ctx, "b".into(), &hash, (ctl, bulk));
+    // The chunk fills the Session; its eof waits.
+    while bulk_rx.is_empty() {
+        thread::sleep(Duration::from_millis(1));
+    }
+    thread::sleep(Duration::from_millis(100));
+    // A blocking task holds the paused clock still unless it is advanced.
+    tokio::time::advance(SILENCE_TIMEOUT + Duration::from_secs(1)).await;
+    for _ in (0..1000).take_while(|_| bulk_rx.sender_strong_count() > 0) {
+        thread::sleep(Duration::from_millis(1));
+    }
+    assert_eq!(bulk_rx.sender_strong_count(), 0, "still waiting");
+    assert!(ctl_rx.try_recv().is_err(), "said more than the chunks");
+    assert!(held(&ctx, "k").is_some(), "the result went");
     Ok(())
 }
 

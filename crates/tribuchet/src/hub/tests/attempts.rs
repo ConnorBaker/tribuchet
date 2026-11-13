@@ -396,9 +396,21 @@ async fn an_assignment_the_worker_never_got_counts_no_loss() {
 
 /// A dispatch whose Session cannot take its bulk (the tmp dir, at the
 /// first Need), its Control alive, lost its session: the build is
-/// requeued, one loss in transport, and its client is never failed.
-#[tokio::test]
+/// requeued, one loss in transport, and its client is never failed. So
+/// does one whose Session takes nothing for SILENCE_TIMEOUT.
+#[tokio::test(start_paused = true)]
 async fn a_bulk_send_that_fails_loses_the_session_not_the_build() {
+    for closed in [true, false] {
+        let (bulk, unread) = mpsc::channel(1);
+        bulk.try_send(Ok(HubMessage::default())).unwrap();
+        // The Session's hub-to-worker half is gone, or stuck; nothing else is.
+        let unread = (!closed).then_some(unread);
+        lose_bulk(bulk).await;
+        drop(unread);
+    }
+}
+
+async fn lose_bulk(bulk: mpsc::Sender<Result<HubMessage, Status>>) {
     let state = Arc::new(HubState::for_test(Duration::ZERO));
     let mut client = queued_build(&state, (false, true)).await;
     let w = register(&state, "w1", &[]);
@@ -406,8 +418,7 @@ async fn a_bulk_send_that_fails_loses_the_session_not_the_build() {
     let router = Router::default();
     let in_rx = router.register(&job.id);
     let (out_tx, mut from_hub) = mpsc::channel(64);
-    // The Session's hub-to-worker half is gone; nothing else is.
-    let sess = Arc::new(WorkerSession::new("w".into(), mpsc::channel(1).0));
+    let sess = Arc::new(WorkerSession::new("w".into(), bulk));
     let session = (w.id, w.caps.name.clone());
     let admission = Arc::new(Mutex::new(Admission::default()));
     let settled = tokio::spawn(supervise_job(

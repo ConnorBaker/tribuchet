@@ -27,7 +27,7 @@ mod diverge;
 pub(super) mod fake_daemon;
 mod rank;
 mod reconnect;
-mod slow_link;
+pub(crate) mod slow_link;
 use slow_link::spawn_session;
 mod unlisted;
 mod usage;
