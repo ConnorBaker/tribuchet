@@ -125,6 +125,7 @@ pub(super) async fn run_job(
             worker_message::Msg::Started(_) => {
                 dispatch.reached = dispatch.reached.max(Run::Started);
             }
+            worker_message::Msg::ResultGone(_) => return Err(Error::ResultGone),
             worker_message::Msg::Log(l) => {
                 job.replay.publish(attach_event::Event::Log(l.data)).await;
             }
@@ -191,6 +192,7 @@ pub(crate) fn msg_name(msg: &worker_message::Msg) -> &'static str {
         worker_message::Msg::RequestJob(_) => "RequestJob",
         worker_message::Msg::Resumed(_) => "Resumed",
         worker_message::Msg::Started(_) => "Started",
+        worker_message::Msg::ResultGone(_) => "ResultGone",
     }
 }
 

@@ -33,6 +33,10 @@ pub enum Error {
     /// longer has it (its agent did not). A loss, as of a dead session.
     #[error("the worker no longer holds the build")]
     Unlisted,
+    /// The worker dropped the build's finished result, or could not serve
+    /// it (ResultGone): lost in transport, its session alive.
+    #[error("the worker no longer has the build's result")]
+    ResultGone,
     /// Given up, then dispatched again by its key to the same worker,
     /// which delivers to that dispatch: nothing more for this one.
     #[error("a later dispatch took the build over")]

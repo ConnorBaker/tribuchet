@@ -9,10 +9,11 @@
 //!   the build back by key and resuming it costs nothing.
 //! - Transport evidence, all else: the session died while the build was
 //!   staged, before the worker answered its assignment, while its run
-//!   was resumed, or while its finished result was delivered; or the
-//!   run's worker, not back within its grace or with another worker
-//!   holding the build, may still run it. That says how the farm moves
-//!   the build, not what the build does, so it never fails it.
+//!   was resumed, or while its finished result was delivered; the worker
+//!   dropped the result (ResultGone); or the run's worker, not back
+//!   within its grace or with another worker holding the build, may
+//!   still run it. That says how the farm moves the build, not what the
+//!   build does, so it never fails it.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};

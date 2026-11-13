@@ -35,7 +35,14 @@ message WorkerMessage {
     // spawned, so before anything else of the run. A Resumed stands for
     // it on a resume.
     Started started = 9;
+    // Answer to a Need for output chunks of a result the worker no longer
+    // has, or cannot read: it has dropped the result.
+    ResultGone result_gone = 10;
   }
+}
+
+message ResultGone {
+  string build_id = 1;
 }
 
 message Resumed {

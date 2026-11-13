@@ -14,9 +14,11 @@ use tokio::sync::mpsc;
 use super::{BuildState, Ending};
 use crate::chunker::parse_hashes;
 use crate::chunkstore::Hash;
-use crate::errors::{Result, chain, err_msg};
+use crate::errors::{Error, Result, chain, err_msg};
 use crate::fsutil::io_ctx;
-use crate::proto::{BuildResult, BuildUsage, ChunkFrame, Manifest, WorkerMessage, worker_message};
+use crate::proto::{
+    BuildResult, BuildUsage, ChunkFrame, Manifest, ResultGone, WorkerMessage, worker_message,
+};
 use crate::worker::build::ActiveBuild;
 use crate::worker::lease::Lease;
 use crate::worker::logtail::LogTail;
@@ -37,11 +39,28 @@ pub(in crate::worker) fn spawn_resumable_reaper(ctx: Arc<WorkerCtx>) {
     });
 }
 
-/// The dir of a result finished over `ttl` ago that no session is sent.
+/// The dir of a result no session is sent, unwanted for over `ttl`: kept
+/// while the session it is held for is open, from its finish or that
+/// session's close on, whichever is later.
 fn expired(e: &ResumableBuild, ttl: Duration) -> Option<&PathBuf> {
     let fin = e.finished.as_ref()?;
+    let since = match e.released {
+        None if e.out_tx.is_some() => return None,
+        released => released.map_or(fin.finished_at, |r| r.max(fin.finished_at)),
+    };
     let idle = !e.delivering && Arc::strong_count(fin) == 1;
-    (idle && fin.finished_at.elapsed() > ttl).then_some(&fin.dir)
+    (idle && since.elapsed() > ttl).then_some(&fin.dir)
+}
+
+/// Session `tx` closed: the results held for it are no longer wanted
+/// by it (expired).
+pub(in crate::worker) fn release(ctx: &WorkerCtx, tx: &mpsc::Sender<WorkerMessage>) {
+    let now = Instant::now();
+    for e in ctx.resumable.lock().unwrap().values_mut() {
+        if e.out_tx.as_ref().is_some_and(|t| t.same_channel(tx)) {
+            e.released = Some(now);
+        }
+    }
 }
 
 /// End the results `expired` names (Ending), off the registry lock; one a
@@ -75,6 +94,8 @@ pub(in crate::worker) struct ResumableBuild {
     /// build *finishes* may not be the one that assigned it. None for
     /// a freshly re-adopted build no session has assigned yet.
     pub(in crate::worker) out_tx: Option<mpsc::Sender<WorkerMessage>>,
+    /// When the session of `out_tx` closed (release); None while open.
+    pub(in crate::worker) released: Option<Instant>,
     pub(in crate::worker) finished: Option<Arc<FinishedBuild>>,
     /// A delivery is in flight; a concurrent re-assignment must not
     /// start a second one.
@@ -360,7 +381,10 @@ fn send_chunks(
     Ok(())
 }
 
-/// Serve a NeedChunks for a finished build on a blocking thread.
+/// Serve a NeedChunks for a finished build on a blocking thread. A result
+/// it does not have, or cannot serve, is gone (ResultGone): one it cannot
+/// serve is dropped first, so that no later assignment adopts it again.
+/// One whose session closed meanwhile stays, for the next.
 pub(in crate::worker) fn serve_chunks(
     ctx: &Arc<WorkerCtx>,
     build_id: String,
@@ -368,39 +392,40 @@ pub(in crate::worker) fn serve_chunks(
     out_tx: mpsc::Sender<WorkerMessage>,
 ) {
     // holding the Arc keeps the reaper off the build dir
-    let fin = ctx
-        .resumable
-        .lock()
-        .unwrap()
-        .values()
-        .find(|e| e.build_id == build_id)
-        .and_then(|e| e.finished.clone());
-    let Some(fin) = fin else {
-        tracing::warn!(id = build_id, "chunk request for an unknown build");
-        return;
-    };
-    let hashes = hashes.to_vec();
+    let held = (ctx.resumable.lock().unwrap().iter())
+        .find(|(_, e)| e.build_id == build_id)
+        .and_then(|(key, e)| Some((key.clone(), e.finished.clone()?)));
+    let (ctx, hashes) = (ctx.clone(), hashes.to_vec());
     tokio::task::spawn_blocking(move || {
+        let gone = ResultGone {
+            build_id: build_id.clone(),
+        };
+        let Some((key, fin)) = held else {
+            tracing::warn!(id = build_id, "chunk request for an unknown build");
+            let _ = out_tx.blocking_send(msg(worker_message::Msg::ResultGone(gone)));
+            return;
+        };
         let res = parse_hashes(&hashes)
             .and_then(|needed| send_chunks(&fin, &build_id, needed.into_iter().collect(), &out_tx));
-        if let Err(e) = res {
-            let err = chain(&e);
-            tracing::warn!(id = build_id, "sending output chunks failed: {err}");
-            let _ = out_tx.blocking_send(msg(worker_message::Msg::Result(BuildResult {
-                build_id,
-                exit_code: 1,
-                error: format!("worker could not serve output chunks: {err}"),
-                ..Default::default()
-            })));
+        match res {
+            Ok(()) | Err(Error::Send(_)) => {}
+            Err(e) => {
+                let err = chain(&e);
+                tracing::warn!(id = build_id, "sending output chunks failed: {err}");
+                let dir = fin.dir.clone();
+                drop(fin);
+                Ending(Some(key), dir, None, None).end(&ctx, None);
+                let _ = out_tx.blocking_send(msg(worker_message::Msg::ResultGone(gone)));
+            }
         }
     });
 }
 
 /// Drop a build whose result the hub confirmed: only now is it safe
 /// to forget it, a result merely handed to a dying session would
-/// otherwise be lost and cost a rebuild. Matched by dedupe key (the
-/// stable identity); the ack's build_id may predate a concurrent
-/// resume that rotated the entry's id.
+/// otherwise be lost and cost a rebuild. Only for its latest adoption's
+/// build id: an ack or cancel predating a resume that rotated the id
+/// leaves the result to the dispatch that resumed it.
 pub(in crate::worker) fn ack_delivery(ctx: &Arc<WorkerCtx>, key: &str, build_id: &str) {
     let (ctx, key, build_id) = (ctx.clone(), key.to_owned(), build_id.to_owned());
     tokio::task::spawn_blocking(move || acked(&ctx, &key, &build_id));
@@ -410,7 +435,7 @@ pub(super) fn acked(ctx: &WorkerCtx, key: &str, build_id: &str) {
     let removed = {
         let map = ctx.resumable.lock().unwrap();
         match map.get(key) {
-            Some(e) if e.finished.is_some() => Some(e.dir.clone()),
+            Some(e) if e.finished.is_some() && e.build_id == build_id => Some(e.dir.clone()),
             _ => None,
         }
     };

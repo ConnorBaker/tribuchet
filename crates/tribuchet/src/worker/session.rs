@@ -7,7 +7,7 @@ use std::future::poll_fn;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
@@ -18,8 +18,8 @@ use super::build::{ActiveBuild, Negotiation, StagingStatus, Wake, validate_assig
 use super::caps::{build_memory, cores, own_cgroup, system_caps};
 use super::lease::Lease;
 use super::resume::{
-    CANCELLED, ResumableBuild, ack_delivery, execute_to_finished, record_finished, serve_chunks,
-    try_deliver,
+    CANCELLED, ResumableBuild, ack_delivery, execute_to_finished, record_finished, release,
+    serve_chunks, try_deliver,
 };
 use super::{WorkerCtx, hostname, loadavg1, msg};
 use crate::chunkio;
@@ -95,6 +95,7 @@ pub(super) async fn session(opts: &WorkerConfig, ctx: &Arc<WorkerCtx>) -> Result
     for (_, build) in active.drain() {
         build.abort().await;
     }
+    release(ctx, &out_tx);
     result
 }
 
@@ -335,7 +336,15 @@ pub(super) async fn handle_cancel(
         let open = |e: &&mut ResumableBuild| e.finished.is_none() && !(e.cancelled && !e.adopting);
         if let Some(e) = map.get_mut(&c.dedupe_key).filter(open) {
             e.cancelled = true;
-            ctx.cancelled.lock().unwrap().insert(c.dedupe_key);
+            ctx.cancelled.lock().unwrap().insert(c.dedupe_key.clone());
+        }
+        // A finished result is its run's outcome: the cancel says that its
+        // dispatch wants it no longer, not that no later one will. Kept for
+        // those (adopt_assignment), it is reaped a ttl on, as when its
+        // session closes; a cancel for an earlier adoption leaves it.
+        let held = |e: &&mut ResumableBuild| e.finished.is_some() && e.build_id == c.build_id;
+        if let Some(e) = map.get_mut(&c.dedupe_key).filter(held) {
+            e.released.get_or_insert_with(Instant::now);
         }
         drop(map);
         // A build waiting for an agent looks at its cancel now.

@@ -77,12 +77,25 @@ const ROWS: &[(Entry, &[Tell], Then)] = &[
         &[Assign("new", true)],
         (&[], &[("new", "")], Some(("new", true)), true),
     ),
-    // A cancel of a finished run, or one that beat it to the finish, is no
-    // flag that would fail the key's next run here.
+    // A cancel of a finished run keeps its result: its dispatch wants it no
+    // longer, and the next dispatch of its key takes it, with no rebuild.
+    // One for an earlier adoption leaves the later's. None, nor one that
+    // beat the run to the finish, is a flag that would fail the key's next
+    // run here.
     (
         Entry::Finished(""),
         &[Cancel],
         (&[], &[], Some(("old", true)), true),
+    ),
+    (
+        Entry::Finished(""),
+        &[Cancel, Assign("new", true)],
+        (&[], &[("new", "")], Some(("new", true)), true),
+    ),
+    (
+        Entry::Finished(""),
+        &[Assign("new", true), Cancel],
+        (&[], &[("new", "")], Some(("new", true)), true),
     ),
     (
         Entry::Running,
@@ -132,6 +145,8 @@ fn every_cancel_and_assignment_ends_as_the_table_says() -> Result<()> {
                     };
                     let outbox = Outbox::default();
                     rt.block_on(handle_cancel(c, &mut HashMap::new(), &outbox, &ctx));
+                    // What it hands off the loop, e.g. an ack, runs by then.
+                    thread::sleep(Duration::from_millis(100));
                 }
                 Fail => fail_cancelled(&ctx, "k"),
                 Take => {
@@ -179,6 +194,8 @@ fn every_cancel_and_assignment_ends_as_the_table_says() -> Result<()> {
         };
         assert_eq!(results(&mut old_rx), pairs(to_old), "row {row}: old");
         assert_eq!(results(&mut new_rx), pairs(to_new), "row {row}: new");
+        // A key goes before its dir (Ending).
+        until(&format!("row {row}: b1"), || b1.exists() == b1_there);
         let entry = ctx
             .resumable
             .lock()
@@ -190,7 +207,6 @@ fn every_cancel_and_assignment_ends_as_the_table_says() -> Result<()> {
             then.map(|(id, f)| (id.to_owned(), f)),
             "row {row}: entry"
         );
-        until(&format!("row {row}: b1"), || b1.exists() == b1_there);
         let next = ctx.abort_reason("k", &b1.join("build.log"), None, None);
         assert_eq!(next, None, "row {row}: the key's next run is aborted");
     }
