@@ -53,6 +53,10 @@ pub struct BuildJson {
     pub timeout: u64,
     #[serde(default)]
     pub max_silent_time: u64,
+    /// Whether Nix builds the derivation itself if attach declines it,
+    /// by the rule it then applies; absent from a Nix that does not say.
+    #[serde(default)]
+    pub can_build_locally: Option<bool>,
 }
 
 impl BuildJson {
@@ -79,6 +83,13 @@ impl BuildJson {
     pub fn network_allowed(&self, attrs: Option<&serde_json::Value>) -> bool {
         let env = |name: &str| self.env.get(name).map(String::as_str);
         fixed_output(&self.store_dir, &self.outputs, env, attrs)
+    }
+
+    /// Whether the client's Nix builds it once declined (canLocal), as Nix
+    /// says; never one with `network`, which would run in the client host's
+    /// own network (tribuchet's rule). None if Nix does not say.
+    pub fn can_local(&self, network: bool) -> Option<bool> {
+        self.can_build_locally.map(|nix| nix && !network)
     }
 }
 
@@ -189,7 +200,12 @@ pub(crate) mod tests {
     }
 
     fn doc(env: &serde_json::Value) -> BuildJson {
-        serde_json::from_value(serde_json::json!({
+        serde_json::from_value(written(env)).unwrap()
+    }
+
+    /// A build.json as Nix writes it, of a build with `env`.
+    fn written(env: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
             "version": 1,
             "builder": "/bin/sh",
             "args": [],
@@ -200,8 +216,7 @@ pub(crate) mod tests {
             "system": "x86_64-linux",
             "inputPaths": [],
             "outputs": {},
-        }))
-        .unwrap()
+        })
     }
 
     /// Nix's own output paths (`nix eval` of each derivation's outPath):
@@ -248,5 +263,22 @@ pub(crate) mod tests {
         assert!(doc.network_allowed(Some(&attrs)));
         doc.outputs = BTreeMap::from([("out".to_owned(), INPUT_ADDRESSED.to_owned())]);
         assert!(!doc.network_allowed(Some(&serde_json::json!({"__impure": true}))));
+    }
+
+    /// canLocal is what Nix wrote, absent if it wrote none, and false for
+    /// a build with network whatever Nix says.
+    #[test]
+    fn can_local_is_what_nix_says_but_never_for_a_build_with_network() {
+        let mut got = Vec::new();
+        for said in [Some(true), Some(false), None] {
+            let mut written = written(&serde_json::json!({}));
+            if let Some(said) = said {
+                written["canBuildLocally"] = said.into();
+            }
+            let doc: BuildJson = serde_json::from_value(written).unwrap();
+            got.push([false, true].map(|network| doc.can_local(network)));
+        }
+        let want = [[Some(true), Some(false)], [Some(false); 2], [None; 2]];
+        assert_eq!(got, want);
     }
 }

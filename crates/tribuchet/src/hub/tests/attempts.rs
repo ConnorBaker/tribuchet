@@ -11,11 +11,17 @@ use Take::{Back, Fresh};
 use Verdict::{Declined, Failed, Gone};
 use losses::{MAX_JOB_ATTEMPTS, MAX_TRANSPORT_LOSSES};
 
-/// One queued build with its client attached, `fod` a build with network.
-async fn queued_build(state: &HubState, fod: bool) -> mpsc::Receiver<Result<AttachEvent, Status>> {
+/// A build with network or not, and whether its client's Nix builds it.
+type Kind = (bool, bool);
+
+/// One queued build of `kind`, its client attached.
+async fn queued_build(
+    state: &HubState,
+    (fod, can_local): Kind,
+) -> mpsc::Receiver<Result<AttachEvent, Status>> {
     let mut j = job(1, Arc::new(Replay::default()));
     j.req.fixed_output = fod;
-    let client = j.replay.subscribe().await;
+    let client = j.replay.subscribe_as(can_local).await;
     state.queue.lock().await.push_back(j);
     client
 }
@@ -110,18 +116,18 @@ enum Said {
     Nothing,
 }
 
-/// The queued build, a build with network if `fod`, taken as `take` after
+/// The queued build of `kind`, taken as `take` after
 /// dispatches taken and lost as `lost`: its genuine losses, losses in
 /// transport and whether a loss is pending; or, once it
 /// is no longer handed out, the client's verdict, which ends its stream,
 /// the build counted as such and not queued.
 async fn after_losses(
-    fod: bool,
+    kind: Kind,
     lost: &[(Take, Said)],
     take: Take,
 ) -> Result<(u32, u32, bool), Verdict> {
     let state = Arc::new(HubState::for_test(Duration::ZERO));
-    let mut client = queued_build(&state, fod).await;
+    let mut client = queued_build(&state, kind).await;
     for (n, &(t, s)) in lost.iter().enumerate() {
         let Some((j, w)) = taken(&state, t).await else {
             return Err(Gone(n));
@@ -255,7 +261,7 @@ async fn each_sequence_of_losses_counts_as_decided() {
     ];
     let mut wrong = Vec::new();
     for (n, (lost, take, verdict)) in rows.into_iter().enumerate() {
-        let after = after_losses(false, &lost, take).await;
+        let after = after_losses((false, true), &lost, take).await;
         if after != verdict {
             wrong.push(format!("row {n}: {after:?}, not {verdict:?}"));
         }
@@ -265,7 +271,8 @@ async fn each_sequence_of_losses_counts_as_decided() {
 
 /// A build with network the farm keeps losing in transport is never
 /// declined, which would build it in the client host's own network: it
-/// keeps waiting for a worker.
+/// keeps waiting for a worker. So does one its client's Nix would not
+/// build (canLocal false), which declining would fail.
 #[tokio::test]
 async fn a_build_with_network_lost_in_transport_keeps_waiting() {
     let rows = [
@@ -275,10 +282,12 @@ async fn a_build_with_network_lost_in_transport_keeps_waiting() {
         (vec![(Back("w1"), Resumed); 13], Back("w1"), true),
     ];
     let mut wrong = Vec::new();
-    for (n, (lost, take, pending)) in rows.into_iter().enumerate() {
-        let after = after_losses(true, &lost, take).await;
-        if after != Ok((0, 13, pending)) {
-            wrong.push(format!("row {n}: {after:?}"));
+    for kind in [(true, true), (false, false)] {
+        for (n, (lost, take, pending)) in rows.clone().into_iter().enumerate() {
+            let after = after_losses(kind, &lost, take).await;
+            if after != Ok((0, 13, pending)) {
+                wrong.push(format!("{kind:?} row {n}: {after:?}"));
+            }
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
@@ -296,7 +305,7 @@ async fn what_a_returning_worker_says_settles_the_loss_before() {
     let max = MAX_JOB_ATTEMPTS;
     for (resumes, losses) in [(true, 2 * (max + 1)), (false, MAX_TRANSPORT_LOSSES)] {
         let state = Arc::new(HubState::for_test(Duration::from_secs(30)));
-        let mut client = queued_build(&state, false).await;
+        let mut client = queued_build(&state, (false, true)).await;
         let mut w = connect(&state, "w1", 1, &[]);
         w.to_hub.send(request_job(1, Some(0))).await.unwrap();
         assert!(w.assignment().await.is_some(), "first dispatch");
@@ -348,7 +357,7 @@ async fn what_a_returning_worker_says_settles_the_loss_before() {
 #[tokio::test]
 async fn an_assignment_the_worker_never_got_counts_no_loss() {
     let state = Arc::new(HubState::for_test(Duration::ZERO));
-    let mut client = queued_build(&state, false).await;
+    let mut client = queued_build(&state, (false, true)).await;
     let w = register(&state, "w1", &[]);
     let job = state
         .take_job(&caps("w1"), None)
@@ -400,7 +409,7 @@ async fn a_run_of_a_build_the_hub_ended_is_cancelled_on_its_worker() {
     let mut wrong = Vec::new();
     for (n, (lost, clientless, want)) in rows.into_iter().enumerate() {
         let state = Arc::new(HubState::for_test(Duration::ZERO));
-        let client = queued_build(&state, false).await;
+        let client = queued_build(&state, (false, true)).await;
         for &(t, s) in &lost {
             let Some((j, w)) = taken(&state, t).await else {
                 break;

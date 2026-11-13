@@ -572,6 +572,7 @@ async fn supervise_job(
         state.requeue(job).await;
     } else {
         tracing::warn!(id = job.id, "build failed: {err}");
+        job.shadow("hub-side error", "Failed");
         Metrics::inc(&state.metrics.failed);
         // The session is still up and may hold a half-staged or
         // running build for this id. Cancel frees that slot.

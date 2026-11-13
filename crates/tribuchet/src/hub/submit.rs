@@ -13,6 +13,7 @@ use tonic::{Request, Response, Status, Streaming};
 use super::metrics::Metrics;
 use super::naming::drv_name;
 use super::placement::Expected;
+use super::shadow;
 use super::state::{HubState, Inflight, Job, Replay, Servability, unserved};
 use crate::proto::{
     AttachEvent, BuildMessage, BuildRequest, DECLINE_EXIT_CODE, NETWORK, attach_event,
@@ -114,6 +115,7 @@ pub(super) fn dedupe_key(req: &BuildRequest, tmp_dir_pack: &[u8]) -> String {
     let req = BuildRequest {
         timeout_secs: 0,
         max_silent_secs: 0,
+        can_local: None,
         ..req.clone()
     };
     let mut h = Sha256::new();
@@ -145,9 +147,11 @@ impl AttachSvc {
         &self,
         system: &str,
         features: &[String],
+        can_local: bool,
     ) -> Option<Response<BuildStream>> {
         let decline = || {
             tracing::info!(system, "no capable worker; declining");
+            shadow::answer("", "no capable worker", "Defer", &[can_local]);
             Metrics::inc(&self.state.metrics.declined);
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             let _ = tx.try_send(Ok(AttachEvent {
@@ -198,6 +202,9 @@ impl attach_hub_server::AttachHub for AttachSvc {
         }
         let tmp_dir_pack = Arc::new(tmp_dir_pack);
         let key = dedupe_key(&req, &tmp_dir_pack);
+        // Unsaid (a Nix or attach predating canLocal): today's rule, a
+        // build without network.
+        let can_local = req.can_local.unwrap_or(!req.fixed_output);
 
         // A build with network goes only to a worker that gives it a
         // network of its own; one that does not would refuse it.
@@ -209,7 +216,8 @@ impl attach_hub_server::AttachHub for AttachSvc {
         // daemon, in its network, outside every fod-network policy: it
         // waits for a worker, queued and its clients told (hold_unservable).
         if !req.fixed_output
-            && let Some(declined) = self.await_capable_worker(&req.system, &features).await
+            && let Some(declined) =
+                (self.await_capable_worker(&req.system, &features, can_local)).await
         {
             return Ok(declined);
         }
@@ -233,7 +241,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 .cloned();
             if let Some(replay) = existing {
                 tracing::info!(key, "deduplicating build submission");
-                break replay.subscribe().await;
+                break replay.subscribe_as(can_local).await;
             }
             let id = new_id();
             let replay = Arc::new(Replay::new(id.clone()));
@@ -249,7 +257,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 notified.await;
                 continue;
             };
-            let rx = replay.subscribe().await;
+            let rx = replay.subscribe_as(can_local).await;
             let mut job = Job {
                 id,
                 key,
@@ -370,6 +378,7 @@ mod tests {
         let req = BuildRequest {
             timeout_secs: 600,
             max_silent_secs: 60,
+            can_local: Some(true),
             ..base_request()
         };
         assert_eq!(a, dedupe_key(&req, b""));
@@ -415,6 +424,30 @@ mod tests {
             tokio::time::timeout(Duration::from_secs(10), submit(&state, base_request())).await;
         assert!(second.is_ok(), "the resubmission did not join the build");
         assert_eq!(state.queue.lock().await.len(), 1, "queued twice");
+    }
+
+    /// canLocal is each client's: clients whose Nix can and cannot build a
+    /// request share its build, and each is recorded as it said, or by
+    /// today's rule (no network) if unsaid; a client gone counts no more.
+    #[tokio::test]
+    async fn each_client_of_a_build_says_whether_its_nix_builds_it() {
+        let state = hub();
+        let asks = [Some(true), Some(false), None].map(|can_local| BuildRequest {
+            can_local,
+            ..base_request()
+        });
+        let mut clients = Vec::new();
+        for req in asks {
+            clients.push(tokio::time::timeout(Duration::from_secs(10), submit(&state, req)).await);
+        }
+        assert_eq!(state.queue.lock().await.len(), 1, "not one build");
+        let replay = state.queue.lock().await[0].replay.clone();
+        assert_eq!(replay.can_local(), [true, false, true]);
+        drop(clients.remove(0));
+        for _ in (0..1000).take_while(|_| replay.can_local().len() > 2) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(replay.can_local(), [false, true]);
     }
 
     /// With no worker for its system, a build with network is not declined,

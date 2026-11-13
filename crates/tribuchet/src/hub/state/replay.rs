@@ -51,6 +51,9 @@ pub(in crate::hub) struct Replay {
     /// Since when it has had no client, and when its current run
     /// started: kept across its dispatches (state/clientless.rs).
     hold: StdMutex<Hold>,
+    /// Each client, and whether its own Nix can build the key (canLocal):
+    /// a client's, not the build's, since clients sharing a key may differ.
+    clients: StdMutex<Vec<(mpsc::WeakSender<Result<AttachEvent, Status>>, bool)>>,
 }
 
 #[derive(Default)]
@@ -421,11 +424,21 @@ impl Replay {
         self.grew.notify_waiters();
     }
 
+    #[cfg(test)]
     pub(in crate::hub) async fn subscribe(
         self: &Arc<Self>,
     ) -> mpsc::Receiver<Result<AttachEvent, Status>> {
+        self.subscribe_as(true).await
+    }
+
+    /// A client subscribes, whose own Nix can build the key or not.
+    pub(in crate::hub) async fn subscribe_as(
+        self: &Arc<Self>,
+        can_local: bool,
+    ) -> mpsc::Receiver<Result<AttachEvent, Status>> {
         self.hold.lock().unwrap().clientless = None;
         let (tx, rx) = mpsc::channel(SUB_CHANNEL_SLACK);
+        (self.clients.lock().unwrap()).push((tx.downgrade(), can_local));
         // Before the reader, which takes it out when it ends.
         self.inner.lock().await.subs.push(tx.clone());
         tokio::spawn(read(self.clone(), tx));
@@ -494,6 +507,17 @@ impl Replay {
         }
         drop(inner);
         self.grew.notify_waiters();
+    }
+
+    /// Whether each client still listening can build the key itself.
+    pub(in crate::hub) fn can_local(&self) -> Vec<bool> {
+        let open = |(c, l): &(mpsc::WeakSender<_>, _)| (!c.upgrade()?.is_closed()).then_some(*l);
+        self.clients
+            .lock()
+            .unwrap()
+            .iter()
+            .filter_map(open)
+            .collect()
     }
 
     /// Any attach client still listening? Subscribers whose stream was
