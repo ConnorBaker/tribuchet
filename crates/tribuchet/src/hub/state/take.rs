@@ -65,7 +65,9 @@ impl HubState {
         loop {
             // Read before the queue lock, so that nothing more is taken
             // under it; afresh on a rescan, which passes over again.
-            let mut rooms = asker.map(|id| self.placement.lock().unwrap().rooms_for(id));
+            let open = asker.map(|_| self.open_clientless()).unwrap_or_default();
+            let mut rooms = asker.map(|id| self.placement.lock().unwrap().rooms_for(id, &open));
+            let mut wanted = Vec::new();
             let (taken, left) = {
                 let mut queue = self.queue.lock().await;
                 let holding = self.holding.lock().unwrap();
@@ -84,6 +86,9 @@ impl HubState {
                     let demand = j.expected.demand;
                     let to = (rooms.as_mut())
                         .and_then(|r| r.passes(demand, &mut j.deferred, serves, now));
+                    for s in rooms.iter_mut().flat_map(|r| r.wants.drain(..)) {
+                        wanted.push((s, j.id.clone(), j.replay.clone()));
+                    }
                     if let Some(to) = to.filter(|_| first) {
                         left.push((j.id.clone(), workers.get(&to).map(|c| c.name.clone())));
                     }
@@ -91,6 +96,11 @@ impl HubState {
                 });
                 (pos.and_then(|p| queue.remove(p)), left)
             };
+            for (s, id, replay) in wanted {
+                if let Some(s) = self.placement.lock().unwrap().sessions.get_mut(&s) {
+                    s.wants.insert(id, replay);
+                }
+            }
             for (id, to) in &left {
                 tracing::info!(
                     id,
