@@ -72,6 +72,28 @@ async fn an_assignment_never_sent_is_kept_for_no_worker() {
     );
 }
 
+/// Each dispatch of a build is a run of its own: its worker, back after its
+/// session died and holding the build, is assigned it under a new run id.
+#[tokio::test]
+async fn a_build_dispatched_again_is_a_new_run() {
+    let state = Arc::new(HubState::for_test(Duration::from_secs(30)));
+    let replay = Arc::new(Replay::default());
+    let _client = replay.subscribe().await;
+    state.queue.lock().await.push_back(job(0, replay));
+    let mut runs = Vec::new();
+    for n in 1..=2 {
+        let mut w = connect(&state, "w", 1, &["k0"]);
+        runs.push(w.assignment().await.expect("not assigned").run);
+        drop(w.to_hub);
+        let requeued = || state.metrics.requeued.load(Ordering::Relaxed);
+        for _ in (0..500).take_while(|_| requeued() < n) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+    assert!(runs.iter().all(Option::is_some), "{runs:?}");
+    assert_ne!(runs[0], runs[1], "one run id for two dispatches");
+}
+
 /// The session is gone when the assignment is sent: the send fails, so
 /// the worker never got the build, and it is kept for no worker.
 #[tokio::test]

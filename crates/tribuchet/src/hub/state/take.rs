@@ -29,10 +29,10 @@ impl Holding {
 impl HubState {
     /// Worker session `worker` lists `keys` as held: at registration,
     /// or in a heartbeat (`beat`), which also counts it.
-    pub(in crate::hub) fn hold(&self, worker: u64, keys: HashSet<String>, beat: bool) {
+    pub(in crate::hub) fn hold(&self, worker: u64, keys: &[String], beat: bool) {
         let mut holding = self.holding.lock().unwrap();
         let h = holding.entry(worker).or_default();
-        (h.beats, h.keys) = (h.beats + u64::from(beat), keys);
+        (h.beats, h.keys) = (h.beats + u64::from(beat), keys.iter().cloned().collect());
         h.taken.clear();
     }
 

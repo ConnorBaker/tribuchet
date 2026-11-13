@@ -17,7 +17,7 @@ use crate::chunkstore::Hash;
 use crate::errors::{Error, Result, chain, err_msg};
 use crate::fsutil::io_ctx;
 use crate::proto::{
-    BuildResult, BuildUsage, ChunkFrame, Manifest, ResultGone, WorkerMessage, worker_message,
+    BuildResult, BuildUsage, ChunkFrame, Manifest, ResultGone, RunId, WorkerMessage, worker_message,
 };
 use crate::worker::build::ActiveBuild;
 use crate::worker::lease::Lease;
@@ -89,6 +89,9 @@ pub(super) fn reap(ctx: &WorkerCtx, ttl: Duration) {
 pub(in crate::worker) struct ResumableBuild {
     /// From the latest assignment; result messages carry this id.
     pub(in crate::worker) build_id: String,
+    /// The run: the assignment it started for numbered it, and a later one
+    /// that adopts it stands for it. None if a hub predating run ids sent it.
+    pub(in crate::worker) run: Option<RunId>,
     /// Sender of the session that issued that assignment. Kept here,
     /// not captured by the build thread: the session alive when the
     /// build *finishes* may not be the one that assigned it. None for
@@ -141,11 +144,23 @@ impl ResumableBuild {
         }
     }
 
-    /// Register a build no session has assigned yet.
+    /// Register a build of no numbered run (a hub predating run ids).
+    #[cfg(test)]
     pub(in crate::worker) fn insert(
         ctx: &Arc<WorkerCtx>,
         key: String,
         build_id: String,
+        dir: PathBuf,
+        finished: Option<FinishedBuild>,
+    ) {
+        Self::insert_run(ctx, key, (build_id, None), dir, finished);
+    }
+
+    /// Register a build no session has assigned yet.
+    pub(in crate::worker) fn insert_run(
+        ctx: &Arc<WorkerCtx>,
+        key: String,
+        (build_id, run): (String, Option<RunId>),
         dir: PathBuf,
         finished: Option<FinishedBuild>,
     ) {
@@ -154,6 +169,7 @@ impl ResumableBuild {
             key,
             Self {
                 build_id,
+                run,
                 finished,
                 dir,
                 ..Self::default()
@@ -237,14 +253,14 @@ pub(in crate::worker) struct PackedOutput {
 pub(in crate::worker) fn record_finished(ctx: &Arc<WorkerCtx>, key: &str, fin: FinishedBuild) {
     // build_id may have changed via a resume assignment meanwhile
     let held = match ctx.resumable.lock().unwrap().get(key) {
-        Some(e) if e.dir == fin.dir => Some(e.build_id.clone()),
+        Some(e) if e.dir == fin.dir => Some((e.build_id.clone(), e.run)),
         _ => None,
     };
     // Written under no lock, before the registry has the
     // result: what removes a result's state.json (the reaper, an ack)
     // waits for that, so this write never follows it.
-    if let Some(build_id) = held {
-        persist_finished(key, &build_id, &fin);
+    if let Some((build_id, run)) = held {
+        persist_finished(key, (&build_id, run), &fin);
     }
     {
         let mut map = ctx.resumable.lock().unwrap();
@@ -270,10 +286,15 @@ pub(in crate::worker) fn record_finished(ctx: &Arc<WorkerCtx>, key: &str, fin: F
 
 /// Persist for redelivery by a replacement worker; the rename
 /// atomically supersedes the running state.
-pub(in crate::worker) fn persist_finished(key: &str, build_id: &str, fin: &FinishedBuild) {
+pub(in crate::worker) fn persist_finished(
+    key: &str,
+    (build_id, run): (&str, Option<RunId>),
+    fin: &FinishedBuild,
+) {
     let state = BuildState::Finished {
         dedupe_key: key.to_string(),
         build_id: build_id.to_string(),
+        run,
         exit_code: fin.exit_code,
         usage: fin.usage,
         error: fin.error.clone(),
@@ -318,11 +339,12 @@ pub(in crate::worker) fn execute_to_finished(
 /// NeedChunks. Blocking.
 fn deliver(
     fin: &FinishedBuild,
-    build_id: &str,
+    (build_id, run): (&str, Option<RunId>),
     out_tx: &mpsc::Sender<WorkerMessage>,
 ) -> Result<()> {
     out_tx.blocking_send(msg(worker_message::Msg::Result(BuildResult {
         build_id: build_id.into(),
+        run,
         exit_code: fin.exit_code,
         usage: Some(fin.usage.into()),
         outputs: fin
@@ -395,13 +417,14 @@ pub(in crate::worker) fn serve_chunks(
     // holding the Arc keeps the reaper off the build dir
     let held = (ctx.resumable.lock().unwrap().iter())
         .find(|(_, e)| e.build_id == build_id)
-        .and_then(|(key, e)| Some((key.clone(), e.finished.clone()?)));
+        .and_then(|(key, e)| Some((key.clone(), e.finished.clone()?, e.run)));
     let (ctx, hashes) = (ctx.clone(), hashes.to_vec());
     tokio::task::spawn_blocking(move || {
         let gone = ResultGone {
             build_id: build_id.clone(),
+            run: held.as_ref().and_then(|h| h.2),
         };
-        let Some((key, fin)) = held else {
+        let Some((key, fin, _)) = held else {
             tracing::warn!(id = build_id, "chunk request for an unknown build");
             let _ = out_tx.blocking_send(msg(worker_message::Msg::ResultGone(gone)));
             return;
@@ -446,9 +469,10 @@ pub(super) fn acked(ctx: &WorkerCtx, key: &str, build_id: &str) {
     }
 }
 
-/// What a claimed delivery takes: build id, session, result, log replay.
+/// What a claimed delivery takes: build id and run, session, result, log
+/// replay.
 type Claim = (
-    String,
+    (String, Option<RunId>),
     mpsc::Sender<WorkerMessage>,
     Arc<FinishedBuild>,
     Option<LogTail>,
@@ -465,7 +489,7 @@ fn claim(e: &mut ResumableBuild) -> Option<Claim> {
     }
     e.delivering = true;
     e.delivered = Some(e.adoption);
-    Some((e.build_id.clone(), out_tx, fin, e.log_tail.take()))
+    Some(((e.build_id.clone(), e.run), out_tx, fin, e.log_tail.take()))
 }
 
 /// Deliver `key`'s finished result if there is one to its latest
@@ -487,12 +511,12 @@ pub(in crate::worker) fn try_deliver(ctx: &Arc<WorkerCtx>, key: &str, resumed: O
         }
         claim(e)
     };
-    while let Some((build_id, out_tx, fin, log_tail)) = next {
+    while let Some(((build_id, run), out_tx, fin, log_tail)) = next {
         // Flush any log replay first so the result arrives after the log.
         if let Some(t) = log_tail {
             t.stop();
         }
-        match deliver(&fin, &build_id, &out_tx) {
+        match deliver(&fin, (&build_id, run), &out_tx) {
             Ok(()) => {
                 tracing::info!(id = build_id, "build result sent, awaiting chunk request");
             }

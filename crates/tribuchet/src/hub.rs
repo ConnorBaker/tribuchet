@@ -42,9 +42,11 @@ mod record;
 mod relay;
 #[cfg(test)]
 pub(crate) use relay::msg_name;
+mod runs;
 #[cfg(test)]
 mod semantics;
 mod serve;
+mod shadow;
 mod state;
 mod submit;
 #[cfg(test)]
@@ -269,7 +271,8 @@ async fn route_loop(
             continue;
         }
         if let worker_message::Msg::Heartbeat(h) = &m {
-            state.hold(worker, h.resumable_keys.iter().cloned().collect(), true);
+            state.hold(worker, &h.resumable_keys, true);
+            shadow::report(worker, &h.held, &h.lost);
             state.record_frozen(worker, h);
             let changed = h.max_jobs.is_some_and(|jobs| {
                 let mut caps = state.worker_caps.lock().unwrap();
@@ -380,11 +383,8 @@ async fn worker_loop(state: Arc<HubState>, register: Register, ctl: Half, bulk: 
     // with these keys go to it regardless of capacity (their slots are
     // already occupied by them).
     let worker_id = caps_guard.id;
-    state.hold(
-        worker_id,
-        register.resumable_keys.iter().cloned().collect(),
-        false,
-    );
+    state.hold(worker_id, &register.resumable_keys, false);
+    shadow::report(&register.worker_name, &register.held, &register.lost);
     let admission = Arc::new(Mutex::new(Admission::default()));
     state.placement.lock().unwrap().open(
         worker_id,
