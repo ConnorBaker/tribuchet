@@ -21,7 +21,10 @@ async fn queued_build(
 ) -> mpsc::Receiver<Result<AttachEvent, Status>> {
     let mut j = job(1, Arc::new(Replay::default()));
     j.req.fixed_output = fod;
-    let client = j.replay.subscribe_as(can_local).await;
+    let client = j
+        .replay
+        .subscribe_as(shadow::Client::untracked(can_local))
+        .await;
     state.queue.lock().await.push_back(j);
     client
 }

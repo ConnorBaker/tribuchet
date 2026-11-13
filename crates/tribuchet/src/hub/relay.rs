@@ -52,6 +52,8 @@ pub(super) async fn run_job(
     let inputs = staging.assignment_inputs().await?;
     let run = state.runs.next();
     tracing::debug!(id = job.id, %run, "assigning a run");
+    state.shadow.assigned(&run, &job.key, worker);
+    dispatch.run = Some(run.clone());
     send(
         out_tx,
         hub_message::Msg::Assignment(BuildAssignment {
@@ -94,6 +96,7 @@ pub(super) async fn run_job(
             }
             () = given_up.cancelled(), if !cancel_sent => {
                 tracing::info!(id = job.id, "no attach client left; cancelling build");
+                state.shadow.abort("clientless give-up", dispatch.run.as_ref());
                 cancel(out_tx, job).await?;
                 cancel_sent = true;
                 continue;
@@ -101,6 +104,7 @@ pub(super) async fn run_job(
             _ = abandon_check.tick() => {
                 if resumed_after.is_some_and(|n| state.unlisted(session, &job.key, n)) {
                     tracing::warn!(id = job.id, "the worker no longer lists the build it resumed");
+                    state.shadow.gone("unlisted", dispatch.run.as_ref());
                     return Err(Error::Unlisted);
                 }
                 if cancel_sent && state.superseded(&job.id) {
@@ -123,11 +127,18 @@ pub(super) async fn run_job(
                 resumed_after = Some(state.heartbeats(session));
                 let held = r.run.as_ref().map(ToString::to_string);
                 tracing::info!(id = job.id, held, "worker resumed an in-flight build");
+                state
+                    .shadow
+                    .resumed(dispatch.run.as_ref(), r.run.as_ref(), &job.key);
             }
-            worker_message::Msg::Started(_) => {
+            worker_message::Msg::Started(s) => {
                 dispatch.reached = dispatch.reached.max(Run::Started);
+                state.shadow.started(s.run.as_ref());
             }
-            worker_message::Msg::ResultGone(_) => return Err(Error::ResultGone),
+            worker_message::Msg::ResultGone(g) => {
+                state.shadow.gone("result gone", g.run.as_ref());
+                return Err(Error::ResultGone);
+            }
             worker_message::Msg::Log(l) => {
                 job.replay.publish(attach_event::Event::Log(l.data)).await;
             }
@@ -136,6 +147,7 @@ pub(super) async fn run_job(
                 // once the worker has answered its assignment: none of it
                 // can overtake the assignment then.
                 if !dispatch.staged {
+                    state.shadow.need(dispatch.run.as_ref());
                     stream_tmp_dir(&job.id, &job.tmp_dir_pack, &sess.bulk).await?;
                 }
                 dispatch.staged = true;
@@ -167,12 +179,14 @@ pub(super) async fn run_job(
                         "build usage"
                     );
                 }
+                state.shadow.result(job, res.run.as_ref(), res.exit_code);
                 if res.exit_code != 0 {
                     return publish_worker_failure(state, out_tx, job, &res).await;
                 }
                 dispatch.reached = Run::Finished;
                 let outputs = verify_set(res.outputs, &job.req.outputs)?;
                 deliver_outputs(state, job, out_tx, &mut in_rx, outputs).await?;
+                state.shadow.fetched(job, res.run.as_ref());
                 finish_relay(state, out_tx, &job.replay, job).await;
                 return Ok(());
             }

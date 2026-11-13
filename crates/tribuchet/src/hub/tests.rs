@@ -23,6 +23,7 @@ mod clientless;
 mod clientless_chain;
 mod clientless_farm;
 mod daemon;
+mod diverge;
 pub(super) mod fake_daemon;
 mod rank;
 mod reconnect;

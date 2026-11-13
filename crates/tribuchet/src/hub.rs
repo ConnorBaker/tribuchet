@@ -43,7 +43,6 @@ mod relay;
 #[cfg(test)]
 pub(crate) use relay::msg_name;
 mod runs;
-#[cfg(test)]
 mod semantics;
 mod serve;
 mod shadow;
@@ -272,7 +271,6 @@ async fn route_loop(
         }
         if let worker_message::Msg::Heartbeat(h) = &m {
             state.hold(worker, &h.resumable_keys, true);
-            shadow::report(worker, &h.held, &h.lost);
             state.record_frozen(worker, h);
             let changed = h.max_jobs.is_some_and(|jobs| {
                 let mut caps = state.worker_caps.lock().unwrap();
@@ -384,7 +382,7 @@ async fn worker_loop(state: Arc<HubState>, register: Register, ctl: Half, bulk: 
     // already occupied by them).
     let worker_id = caps_guard.id;
     state.hold(worker_id, &register.resumable_keys, false);
-    shadow::report(&register.worker_name, &register.held, &register.lost);
+    state.shadow.register(&register);
     let admission = Arc::new(Mutex::new(Admission::default()));
     state.placement.lock().unwrap().open(
         worker_id,
@@ -553,7 +551,7 @@ async fn supervise_job(
         if job.replay.has_subscribers().await {
             tracing::warn!(id = job.id, "build failed before dispatch: {err}");
             Metrics::inc(&state.metrics.failed);
-            job.replay.publish(attach_event::Event::Error(err)).await;
+            job.fail(&state, "before dispatch", None, err).await;
         } else {
             tracing::info!(id = job.id, "dropping build before dispatch: {err}");
         }
@@ -572,12 +570,12 @@ async fn supervise_job(
         state.requeue(job).await;
     } else {
         tracing::warn!(id = job.id, "build failed: {err}");
-        job.shadow("hub-side error", "Failed");
         Metrics::inc(&state.metrics.failed);
         // The session is still up and may hold a half-staged or
         // running build for this id. Cancel frees that slot.
         let _ = cancel(&out_tx, &job).await;
-        job.replay.publish(attach_event::Event::Error(err)).await;
+        job.fail(&state, "hub-side error", dispatch.run.as_ref(), err)
+            .await;
         state.finish(&job).await;
     }
 }

@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use super::metrics::Metrics;
 use super::state::{Holding, HubState, Job, WorkerCaps};
-use crate::proto::{DECLINE_EXIT_CODE, attach_event};
+use crate::proto::{DECLINE_EXIT_CODE, RunId, attach_event};
 
 /// Genuine losses a build survives; the next fails it.
 pub(super) const MAX_JOB_ATTEMPTS: u32 = 3;
@@ -44,6 +44,8 @@ pub(super) struct Dispatch {
     pub(super) reached: Run,
     /// The worker said it holds a run of the build already (Resumed).
     pub(super) resumed: bool,
+    /// The run it assigned.
+    pub(super) run: Option<RunId>,
 }
 
 /// How far the build's run is known to have got, across dispatches.
@@ -191,9 +193,8 @@ pub(super) async fn count(state: &HubState, mut job: Job, charge: Charge) -> Opt
 /// under it). This is the only place it lives. It fails the build.
 async fn after_too_many_losses(state: &HubState, job: Job, err: String) {
     tracing::warn!(id = job.id, "build failed: {err}");
-    job.shadow("genuine-loss cap", "Failed");
     Metrics::inc(&state.metrics.failed);
-    job.replay.publish(attach_event::Event::Error(err)).await;
+    job.fail(state, "genuine-loss cap", None, err).await;
     state.finish(&job).await;
 }
 
@@ -207,7 +208,7 @@ async fn defer(state: &HubState, job: Job, losses: u32) -> Option<Job> {
     if job.req.fixed_output || job.replay.can_local().contains(&false) {
         return Some(job);
     }
-    job.shadow("transport-loss cap", "Defer");
+    state.shadow.deferred(&job);
     tracing::warn!(
         id = job.id,
         losses,
