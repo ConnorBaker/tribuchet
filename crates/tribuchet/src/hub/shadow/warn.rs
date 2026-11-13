@@ -1,8 +1,33 @@
 //! The shadow's warnings: found under its lock, logged after it, and as
-//! long as the build they are about, whatever its worker holds.
+//! long as the build they are about, whatever its worker holds. And what
+//! the tests read of the core.
 
 use super::Mirror;
 use super::sem::{self, Answer, Command, Event};
+#[cfg(test)]
+use super::{Shadow, key};
+
+#[cfg(test)]
+impl Shadow {
+    /// Whether the core runs `k` alone (D4), if a build of it waits.
+    pub(in crate::hub) fn isolated(&self, k: &str) -> Option<bool> {
+        let mut lost = None;
+        self.with(|m| lost = key(k).and_then(|k| m.hub.builds.get(&k)).map(|b| b.lost));
+        lost
+    }
+
+    /// Whether its lock is held.
+    pub(in crate::hub) fn busy(&self) -> bool {
+        self.0.try_lock().is_err()
+    }
+
+    /// Assignments it holds unanswered.
+    pub(in crate::hub) fn pending(&self) -> usize {
+        let mut n = 0;
+        self.with(|m| n = m.pending.len() + m.pending_of.len());
+        n
+    }
+}
 
 /// A divergence, to log once the lock is let go.
 pub(super) type Warning = Box<dyn FnOnce() + Send>;

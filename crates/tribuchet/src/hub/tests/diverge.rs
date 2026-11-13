@@ -230,6 +230,19 @@ async fn a_run_its_worker_lost_isolates_its_key() {
     );
 }
 
+/// An assignment no worker answered is freed as its build ends, its last
+/// client gone: no Place can follow it. Before, it was kept for good.
+#[tokio::test]
+async fn an_unanswered_assignment_is_freed_as_its_build_ends() {
+    let shadow = Arc::new(HubState::for_test(Duration::ZERO)).shadow.clone();
+    let sys: (&str, &[String]) = ("x86_64-linux", &[]);
+    let client = shadow.submit(&key_of(0), sys, false);
+    shadow.assigned(&RunId { epoch: 1, seq: 1 }, &key_of(0), "w");
+    assert_eq!(shadow.pending(), 2, "not held while its build waits");
+    drop(client);
+    assert_eq!(shadow.pending(), 0);
+}
+
 /// A panic in the core turns the shadow off; the hub answers on.
 #[tokio::test]
 async fn a_panic_in_the_core_turns_the_shadow_off() {

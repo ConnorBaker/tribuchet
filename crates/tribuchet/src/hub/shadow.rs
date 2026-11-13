@@ -48,6 +48,9 @@ pub(super) struct Mirror {
     /// Runs assigned that no worker answered yet: the answer says whether
     /// the hub placed a new run or adopted one held.
     pending: HashMap<(u64, u64), (sem::Key, sem::Worker)>,
+    /// The other way: each waiting build's one run in `pending`, freed with
+    /// the build, which no Place can follow.
+    pending_of: HashMap<sem::Key, (u64, u64)>,
     /// The last number given a run first heard of from a worker: down from
     /// the top, the core's own count up.
     held: sem::Run,
@@ -211,6 +214,9 @@ impl Mirror {
         // Only what this step touched can have ended: no scan of the rest.
         for k in keys.iter().filter(|k| !self.hub.builds.contains_key(k)) {
             self.seen.remove(k);
+            if let Some(r) = self.pending_of.remove(k) {
+                self.pending.remove(&r);
+            }
         }
         for r in runs.iter().filter(|r| !self.hub.runs.contains_key(r)) {
             for h in self.hub_runs.remove(r).unwrap_or_default() {
@@ -218,6 +224,13 @@ impl Mirror {
             }
         }
         out
+    }
+
+    /// The assignment `run` is pending no more: its key and worker if it was.
+    fn answered(&mut self, run: (u64, u64)) -> Option<(sem::Key, sem::Worker)> {
+        let p = self.pending.remove(&run)?;
+        self.pending_of.remove(&p.0);
+        Some(p)
     }
 
     /// The hub's run `hub` is, or stands for, the core's `core`.
@@ -229,7 +242,7 @@ impl Mirror {
     /// The core's run for the hub's `run`; at the worker's first word of a
     /// run assigned and not yet answered, the hub placed it (Place).
     fn bind(&mut self, point: &str, run: (u64, u64)) -> Option<sem::Run> {
-        if let Some((key, worker)) = self.pending.remove(&run)
+        if let Some((key, worker)) = self.answered(run)
             && !self.runs.contains_key(&run)
             && let Some(Command::Assign { run: r, .. }) = self
                 .feed(point, &[], vec![Event::Place { key, worker }])
@@ -269,20 +282,6 @@ impl Shadow {
             mem::take(&mut m.warnings)
         };
         warnings.into_iter().for_each(|w| w());
-    }
-
-    /// Whether the core runs `k` alone (D4), if a build of it waits.
-    #[cfg(test)]
-    pub(super) fn isolated(&self, k: &str) -> Option<bool> {
-        let mut lost = None;
-        self.with(|m| lost = key(k).and_then(|k| m.hub.builds.get(&k)).map(|b| b.lost));
-        lost
-    }
-
-    /// Whether its lock is held, for tests.
-    #[cfg(test)]
-    pub(super) fn busy(&self) -> bool {
-        self.0.try_lock().is_err()
     }
 
     /// A client asks for `key`; it leaves as the returned Client drops.
@@ -371,8 +370,15 @@ impl Shadow {
             let (Some(key), worker) = (key(k), m.name(worker)) else {
                 return;
             };
-            m.pending.retain(|_, p| p.0 != key);
-            m.pending.insert((run.epoch, run.seq), (key, worker));
+            // With no build waiting, no Place can follow it.
+            if !m.hub.builds.contains_key(&key) {
+                return;
+            }
+            let run = (run.epoch, run.seq);
+            if let Some(old) = m.pending_of.insert(key, run) {
+                m.pending.remove(&old);
+            }
+            m.pending.insert(run, (key, worker));
         });
     }
 
@@ -437,7 +443,7 @@ impl Shadow {
         self.with(|m| {
             let a = assigned.map(|a| (a.epoch, a.seq));
             if let Some(a) = a {
-                m.pending.remove(&a);
+                m.answered(a);
             }
             let (Some(h), Some(key)) = (id("resumed", held), key(k)) else {
                 return;
@@ -473,7 +479,7 @@ impl Shadow {
             let Some(r) = run.map(|r| (r.epoch, r.seq)) else {
                 return;
             };
-            m.pending.remove(&r);
+            m.answered(r);
             if let Some(&run) = m.runs.get(&r) {
                 m.feed(point, &[], vec![Event::Abort { run }]);
             }
