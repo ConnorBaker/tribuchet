@@ -1,17 +1,14 @@
 //! Hub session: connect, register, and drive the per-build message loop.
 
-use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-use std::future::poll_fn;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
-use tokio_util::sync::PollSender;
 use tonic::Streaming;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
@@ -129,50 +126,31 @@ async fn session_loop(
         out_tx,
         build_timeout,
         assignments: AtomicU64::default(),
-        outbox: Outbox::default(),
     };
     // Builds staged to completion but waiting for a free slot.
     let mut ready: VecDeque<String> = VecDeque::new();
     let mut heartbeat = tokio::time::interval(chunkio::HEARTBEAT);
-    let mut sender = PollSender::new(out_tx.clone());
     let (wake_tx, mut wake_rx) = mpsc::unbounded_channel::<Wake>();
     // Negotiations with the daemon, off the loop: it reads the hub meanwhile.
     let mut negotiations = tokio::task::JoinSet::<Negotiation>::new();
-    env.outbox.declare.set(true);
+    // The loop's sends wait on control alone: the bulk has its own stream.
+    out_tx.send(capacity(active, &ready, &env)).await?;
     loop {
         let m = tokio::select! {
-            room = poll_fn(|cx| sender.poll_reserve(cx)), if env.outbox.pending() => {
-                let lost = |_| err_msg("hub connection lost");
-                room.map_err(lost)?;
-                let queued = env.outbox.queue.borrow_mut().pop_front();
-                let (m, sent) = queued.unwrap_or_else(|| {
-                    if env.outbox.declare.take() {
-                        (capacity(active, &ready, &env), None)
-                    } else {
-                        env.outbox.beat.set(false);
-                        (beat(active, ctx), None)
-                    }
-                });
-                sender.send_item(m).map_err(lost)?;
-                if let Some(sent) = sent {
-                    let _ = sent.send(());
-                }
-                continue;
-            }
             () = ctx.agents.changed.notified() => {
                 grant_slots(active, &mut ready, &env);
-                env.outbox.declare.set(true);
+                out_tx.send(capacity(active, &ready, &env)).await?;
                 continue;
             }
             _ = heartbeat.tick() => {
-                env.outbox.beat.set(true);
-                env.outbox.declare.set(true);
+                out_tx.send(beat(active, ctx)).await?;
+                out_tx.send(capacity(active, &ready, &env)).await?;
                 continue;
             }
             Some(w) = wake_rx.recv() => {
                 if let Some(build) = active.get_mut(&w.build_id) {
                     let res = build.woken(&w.path);
-                    advance_staging(active, &mut ready, &w.build_id, res, &env).await;
+                    advance_staging(active, &mut ready, &w.build_id, res, &env).await?;
                 }
                 continue;
             }
@@ -181,7 +159,7 @@ async fn session_loop(
                 // Not cancelled, nor its id assigned again, meanwhile.
                 if let Some(build) = active.get_mut(&id).filter(|b| b.dir == dir) {
                     let res = build.negotiated(checked);
-                    advance_staging(active, &mut ready, &id, res, &env).await;
+                    advance_staging(active, &mut ready, &id, res, &env).await?;
                 }
                 continue;
             }
@@ -196,35 +174,35 @@ async fn session_loop(
         match m {
             hub_message::Msg::Assignment(a) => {
                 env.assignments.fetch_add(1, Ordering::Relaxed);
-                if let Some(id) = handle_assignment(a, active, &wake_tx, &env).await {
+                if let Some(id) = handle_assignment(a, active, &wake_tx, &env).await? {
                     negotiations.spawn(active[&id].negotiation());
                 }
-                env.outbox.declare.set(true);
+                out_tx.send(capacity(active, &ready, &env)).await?;
             }
             hub_message::Msg::TmpDir(t) => {
                 let id = t.build_id.clone();
                 if let Some(build) = active.get_mut(&id) {
                     let res = build.feed_tmp_dir(t).await.map(|s| (None, s));
-                    advance_staging(active, &mut ready, &id, res, &env).await;
+                    advance_staging(active, &mut ready, &id, res, &env).await?;
                 }
             }
             hub_message::Msg::Manifest(m) => {
                 let id = m.build_id.clone();
                 if let Some(build) = active.get_mut(&id) {
                     let res = build.feed_manifest(&m);
-                    advance_staging(active, &mut ready, &id, res, &env).await;
+                    advance_staging(active, &mut ready, &id, res, &env).await?;
                 }
             }
             hub_message::Msg::Chunk(c) => {
                 let id = c.build_id.clone();
                 if let Some(build) = active.get_mut(&id) {
                     let res = build.feed_chunk(&c);
-                    advance_staging(active, &mut ready, &id, res, &env).await;
+                    advance_staging(active, &mut ready, &id, res, &env).await?;
                 }
             }
             hub_message::Msg::Cancel(c) => {
-                handle_cancel(c, active, &env.outbox, ctx).await;
-                env.outbox.declare.set(true);
+                handle_cancel(c, active, out_tx, ctx).await?;
+                out_tx.send(capacity(active, &ready, &env)).await?;
             }
             hub_message::Msg::Need(n) => {
                 serve_chunks(
@@ -269,38 +247,6 @@ fn beat(active: &HashMap<String, ActiveBuild>, ctx: &WorkerCtx) -> WorkerMessage
     }))
 }
 
-/// What session_loop sends, held until the session channel has room.
-/// Outputs can fill the channel for minutes on a slow link; a loop
-/// waiting there would stop reading the hub, whose messages are what
-/// keeps the worker's keepalive from PINGing behind those outputs.
-#[derive(Default)]
-pub(super) struct Outbox {
-    /// Sent in order, each told to its waiter (if any) once in the channel.
-    queue: RefCell<VecDeque<(WorkerMessage, Option<oneshot::Sender<()>>)>>,
-    /// A capacity declaration, a heartbeat due. Each is read as it is
-    /// sent: it says the worker's state, so the latest is all that counts.
-    declare: Cell<bool>,
-    beat: Cell<bool>,
-}
-
-impl Outbox {
-    fn send(&self, m: WorkerMessage) {
-        self.queue.borrow_mut().push_back((m, None));
-    }
-
-    /// Queue `m`; the receiver hears once it is in the session channel,
-    /// or errs if the session ends first.
-    fn send_told(&self, m: WorkerMessage) -> oneshot::Receiver<()> {
-        let (tx, rx) = oneshot::channel();
-        self.queue.borrow_mut().push_back((m, Some(tx)));
-        rx
-    }
-
-    fn pending(&self) -> bool {
-        self.declare.get() || self.beat.get() || !self.queue.borrow().is_empty()
-    }
-}
-
 /// Act on a staging step: forward a Need, launch, or abort.
 async fn advance_staging(
     active: &mut HashMap<String, ActiveBuild>,
@@ -308,16 +254,15 @@ async fn advance_staging(
     id: &str,
     res: Result<(Option<Need>, StagingStatus)>,
     env: &LaunchEnv<'_>,
-) {
+) -> Result<()> {
     let status = match res {
         Err(e) => {
-            abort_active(active, id, &env.outbox, &e).await;
-            env.outbox.declare.set(true);
-            return;
+            abort_active(active, id, env.out_tx, &e).await?;
+            return Ok(env.out_tx.send(capacity(active, ready, env)).await?);
         }
         Ok((need, status)) => {
             if let Some(n) = need {
-                env.outbox.send(msg(worker_message::Msg::Need(n)));
+                env.out_tx.send(msg(worker_message::Msg::Need(n))).await?;
             }
             status
         }
@@ -328,13 +273,14 @@ async fn advance_staging(
             let build = active.get_mut(id).unwrap();
             let Some(lease) = build.lease.take().or_else(|| env.ctx.agents.lease()) else {
                 ready.push_back(id.to_string());
-                return;
+                return Ok(());
             };
             let build = active.remove(id).unwrap();
             launch_build(build, lease, env);
-            env.outbox.declare.set(true);
+            env.out_tx.send(capacity(active, ready, env)).await?;
         }
     }
+    Ok(())
 }
 
 /// Cancel a build. Still staging: tear it down right here. Already
@@ -344,13 +290,13 @@ async fn advance_staging(
 pub(super) async fn handle_cancel(
     c: CancelBuild,
     active: &mut HashMap<String, ActiveBuild>,
-    outbox: &Outbox,
+    out_tx: &mpsc::Sender<WorkerMessage>,
     ctx: &Arc<WorkerCtx>,
-) {
+) -> Result<()> {
     tracing::info!(id = c.build_id, "hub cancelled the build");
     if let Some(build) = active.remove(&c.build_id) {
         build.abort().await;
-        fail_build(outbox, &c.build_id, &err_msg(CANCELLED));
+        fail_build(out_tx, &c.build_id, &err_msg(CANCELLED)).await?;
     } else {
         // Only flag builds that are still running: a key flagged for
         // an already-finished build would never be consumed and would
@@ -377,6 +323,7 @@ pub(super) async fn handle_cancel(
         // A build waiting for an agent looks at its cancel now.
         ctx.agents.wake();
     }
+    Ok(())
 }
 
 /// Everything needed to launch a staged build.
@@ -386,7 +333,6 @@ struct LaunchEnv<'a> {
     build_timeout: Duration,
     /// Assignments received this session, declared with the capacity.
     assignments: AtomicU64,
-    outbox: Outbox,
 }
 
 /// Hand freed slots to staged builds waiting for one.
@@ -415,7 +361,7 @@ async fn handle_assignment(
     active: &mut HashMap<String, ActiveBuild>,
     wake: &mpsc::UnboundedSender<Wake>,
     env: &LaunchEnv<'_>,
-) -> Option<String> {
+) -> Result<Option<String>> {
     let ctx = env.ctx;
     // A key we already hold means a hub (likely freshly restarted)
     // re-dispatched a build we are running or have finished: adopt
@@ -435,7 +381,7 @@ async fn handle_assignment(
                 try_deliver(&ctx, &a.dedupe_key, Some(adoption));
             }
         });
-        return None;
+        return Ok(None);
     }
     tracing::info!(id = a.build_id, "build assigned");
     // build ids are never reused; a duplicate is a confused hub
@@ -448,11 +394,11 @@ async fn handle_assignment(
         Ok(mut b) => {
             b.lease = ctx.agents.lease();
             active.insert(build_id.clone(), b);
-            Some(build_id)
+            Ok(Some(build_id))
         }
         Err(e) => {
-            fail_build(&env.outbox, &build_id, &e);
-            None
+            fail_build(env.out_tx, &build_id, &e).await?;
+            Ok(None)
         }
     }
 }
@@ -475,14 +421,13 @@ fn launch_build(build: ActiveBuild, mut lease: Lease, env: &LaunchEnv<'_>) {
             ..ResumableBuild::default()
         },
     );
-    // The hub is told that the run starts after all the loop queued for
-    // the build (its Need) and before the run sends anything: the run
-    // waits for its Started to enter the channel. A session gone by then
-    // misses it, as one gone just after it would.
+    // The run's first message, after the build's Needs, which the loop has
+    // sent on the same channel, and before its builder spawns. A session
+    // gone by then misses it, as one gone just after it would.
     let build_id = build.assignment.build_id.clone();
-    let started = (env.outbox).send_told(msg(worker_message::Msg::Started(Started { build_id })));
+    let started = msg(worker_message::Msg::Started(Started { build_id }));
     tokio::task::spawn_blocking(move || {
-        let _ = started.blocking_recv();
+        let _ = out_tx.blocking_send(started);
         let fin = execute_to_finished(&build, &mut lease, &out_tx, build_timeout);
         drop((build, lease));
         record_finished(&ctx, &key, fin);
@@ -493,26 +438,33 @@ fn launch_build(build: ActiveBuild, mut lease: Lease, env: &LaunchEnv<'_>) {
 async fn abort_active(
     active: &mut HashMap<String, ActiveBuild>,
     id: &str,
-    outbox: &Outbox,
+    out_tx: &mpsc::Sender<WorkerMessage>,
     e: &Error,
-) {
+) -> Result<()> {
     if let Some(build) = active.remove(id) {
         build.abort().await;
     }
-    fail_build(outbox, id, e);
+    fail_build(out_tx, id, e).await
 }
 
 /// Report a per-build failure to the hub without tearing the session down.
-fn fail_build(outbox: &Outbox, build_id: &str, err: &Error) {
+async fn fail_build(
+    out_tx: &mpsc::Sender<WorkerMessage>,
+    build_id: &str,
+    err: &Error,
+) -> Result<()> {
     let err = chain(err);
     tracing::error!(id = build_id, "build setup failed: {err}");
-    outbox.send(msg(worker_message::Msg::Result(BuildResult {
-        build_id: build_id.into(),
-        exit_code: 1,
-        outputs: vec![],
-        error: err,
-        usage: None,
-    })));
+    out_tx
+        .send(msg(worker_message::Msg::Result(BuildResult {
+            build_id: build_id.into(),
+            exit_code: 1,
+            outputs: vec![],
+            error: err,
+            usage: None,
+        })))
+        .await?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -541,7 +493,6 @@ mod tests {
             out_tx: &out_tx,
             build_timeout: Duration::ZERO,
             assignments: AtomicU64::default(),
-            outbox: Outbox::default(),
         };
         for (ready, want) in [(vec![], (2, Some(1))), (vec!["b".into()], (1, Some(1)))] {
             let Some(worker_message::Msg::RequestJob(r)) =

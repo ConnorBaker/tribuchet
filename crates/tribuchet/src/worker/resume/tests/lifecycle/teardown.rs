@@ -106,8 +106,8 @@ fn a_result_is_kept_while_its_session_is_open() -> Result<()> {
                 build_id: "b".into(),
                 dedupe_key: "k".into(),
             };
-            let (rt, outbox) = (tokio::runtime::Runtime::new()?, Outbox::default());
-            rt.block_on(handle_cancel(c, &mut HashMap::new(), &outbox, &ctx));
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(handle_cancel(c, &mut HashMap::new(), &tx, &ctx))?;
         } else {
             delivery::release(&ctx, &tx);
         }
