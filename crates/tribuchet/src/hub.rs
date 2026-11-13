@@ -311,10 +311,20 @@ impl WorkerHub for WorkerSvc {
 
         let (out_tx, out_rx) = mpsc::channel::<Result<HubMessage, Status>>(64);
         let (in_tx, in_rx) = mpsc::channel::<WorkerMessage>(64);
+        let worker = register.worker_name.clone();
         tokio::spawn(async move {
-            while let Ok(Some(m)) = inbound.message().await {
-                if in_tx.send(m).await.is_err() {
-                    break;
+            loop {
+                match inbound.message().await {
+                    Ok(Some(m)) => {
+                        if in_tx.send(m).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(None) => break,
+                    Err(e) => {
+                        tracing::warn!(worker, "worker stream failed: {}", chain(&e));
+                        break;
+                    }
                 }
             }
         });
