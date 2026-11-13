@@ -11,6 +11,8 @@ use tokio::sync::futures::Notified;
 use crate::proto::BuildResult;
 use placement::{Demand, Expected, GRACE, Level, Room, Rooms, Size};
 
+mod clientless;
+
 const GIB: f64 = 1_073_741_824.0;
 
 /// Worker `name` serving x86_64-linux with two agents, `cores` cores and
@@ -133,12 +135,10 @@ fn a_size_is_the_registered_cores_and_memory() {
         idle: 1,
         size,
         load: Demand::default(),
+        clientless: Demand::default(),
     };
     let rooms = [(1, size(Some(4), 2, None)), (2, size(None, 0, None))].map(room);
-    let mut rooms = Rooms {
-        asker: 1,
-        rooms: rooms.to_vec(),
-    };
+    let mut rooms = Rooms::new(1, rooms.to_vec());
     let got = rooms.passes(Demand::default(), &mut None, |_| true, Instant::now());
     assert_eq!(got, None, "an idle build passed to the worker of no cores");
 }
@@ -355,6 +355,7 @@ fn a_build_is_passed_over_within_grace_to_the_least_full_room() {
         idle,
         size: SMALL,
         load: Demand { cores, memory: 0.0 },
+        clientless: Demand::default(),
     };
     let build = Demand {
         cores: 2.0,
@@ -431,10 +432,7 @@ fn a_build_is_passed_over_within_grace_to_the_least_full_room() {
         ),
     ];
     for (row, first, at, mine, others, passes) in rows {
-        let mut rooms = Rooms {
-            asker: 1,
-            rooms: [vec![mine], others].concat(),
-        };
+        let mut rooms = Rooms::new(1, [vec![mine], others].concat());
         for (n, want) in passes.into_iter().enumerate() {
             let mut since = first;
             let got = rooms.passes(build, &mut since, |_| true, t0 + at);
@@ -461,6 +459,7 @@ fn fullness_weighs_size_and_memory_where_every_room_reported_it() {
             cores: used,
             memory: gib * GIB,
         },
+        clientless: Demand::default(),
     };
     let build = Demand {
         cores: 0.5,
@@ -488,10 +487,7 @@ fn fullness_weighs_size_and_memory_where_every_room_reported_it() {
         ("this one's memory counted", a_half, b_busy, Some(2)),
     ];
     for (row, mine, other, want) in rows {
-        let mut rooms = Rooms {
-            asker: 1,
-            rooms: vec![mine, other],
-        };
+        let mut rooms = Rooms::new(1, vec![mine, other]);
         let got = rooms.passes(build, &mut None, |_| true, Instant::now());
         assert_eq!(got, want, "{row}");
     }

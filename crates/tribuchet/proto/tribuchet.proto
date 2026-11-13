@@ -164,6 +164,11 @@ message Heartbeat {
   // Current Register.max_jobs: reachable build agents change. Unset by
   // workers predating the field.
   optional uint32 max_jobs = 4;
+  // The dedupe keys of the builds the worker's CPU arbiter holds frozen,
+  // and of the build it lets run meanwhile, its leader; none, and unset,
+  // with none frozen, and from workers predating the fields.
+  repeated string frozen_keys = 5;
+  optional string leader_key = 6;
 }
 
 message BuildAssignment {

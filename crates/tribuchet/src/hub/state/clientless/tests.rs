@@ -101,13 +101,45 @@ async fn the_decider_gives_up_what_waiting_work_needs() {
         (&[], &[gone(7, 60, 14)], &[], &[0]),
     ];
     for (n, &(workers, runs, queued, given_up)) in rows.iter().enumerate() {
-        assert_eq!(decided(workers, runs, queued).await, given_up, "row {n}");
+        assert_eq!(
+            decided(workers, runs, queued, None).await,
+            given_up,
+            "row {n}"
+        );
     }
 }
 
-/// The builds of `runs` that the decider gives up, with `workers` and
-/// `queued`.
-async fn decided(workers: &[(u32, bool)], runs: &[Run], queued: &[Queued]) -> Vec<usize> {
+/// Worker 0's heartbeat: its CPU arbiter's leader and the builds it
+/// keeps frozen, of the runs.
+type Frozen = Option<(usize, &'static [usize])>;
+
+/// A build with no client that, as its worker's arbiter's leader, keeps
+/// one with a client frozen is given up once its clients have been gone
+/// FLOOR, whatever its run time, with no work waiting; not when it has
+/// a client, nor when the builds it keeps frozen have none.
+#[tokio::test(start_paused = true)]
+async fn the_decider_gives_up_a_clientless_leader_freezing_a_client() {
+    let rows: &[(&[Run], Frozen, &[usize])] = &[
+        (&[gone(0, HOUR, 14), here(0, 60)], Some((0, &[1])), &[0]),
+        (&[gone(0, HOUR, 13), here(0, 60)], Some((0, &[1])), &[]),
+        (&[here(0, HOUR), here(0, 60)], Some((0, &[1])), &[]),
+        (&[gone(0, HOUR, 14), gone(0, 60, 5)], Some((0, &[1])), &[]),
+        (&[gone(0, HOUR, 14), here(0, 60)], Some((0, &[])), &[]),
+        (&[gone(0, HOUR, 14), here(0, 60)], None, &[]),
+    ];
+    for (n, &(runs, frozen, given_up)) in rows.iter().enumerate() {
+        assert_eq!(decided(TWO, runs, &[], frozen).await, given_up, "row {n}");
+    }
+}
+
+/// The builds of `runs` that the decider gives up, with `workers`,
+/// `queued` and worker 0's heartbeat `frozen`.
+async fn decided(
+    workers: &[(u32, bool)],
+    runs: &[Run],
+    queued: &[Queued],
+    frozen: Frozen,
+) -> Vec<usize> {
     let state = Arc::new(HubState::for_test(Duration::from_secs(30)));
     state.deciding.store(true, Ordering::Relaxed);
     for (id, &(slots, free)) in (0..).zip(workers) {
@@ -169,6 +201,15 @@ async fn decided(workers: &[(u32, bool)], runs: &[Run], queued: &[Queued]) -> Ve
         }
     }
     tokio::time::advance(t0 + Duration::from_secs(end) - Instant::now()).await;
+    if let Some((leader, held)) = frozen {
+        let key = |b: &usize| jobs[*b].key.clone();
+        let h = Heartbeat {
+            leader_key: Some(key(&leader)),
+            frozen_keys: held.iter().map(key).collect(),
+            ..Heartbeat::default()
+        };
+        state.record_frozen(0, &h);
+    }
     state.give_up_clientless().await;
     let given_up = |b: &usize| state.given_up(&jobs[*b].id).is_cancelled();
     (0..jobs.len()).filter(given_up).collect()
