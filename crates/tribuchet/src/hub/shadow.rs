@@ -7,6 +7,7 @@
 //! flight; present adds nothing the run's own messages and Register do not).
 
 use std::collections::HashMap;
+use std::mem;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::{Arc, Mutex, PoisonError};
 
@@ -14,6 +15,9 @@ use super::losses::Loss;
 use super::semantics::{self as sem, Answer, Command, Event, Hub, Outcome, Phase};
 use super::state::{HubState, Job, unserved};
 use crate::proto::{HeldRun, Register, RunId, SystemCaps, attach_event};
+
+mod warn;
+use warn::{Warning, brief};
 
 /// A request's system and the features it requires.
 pub(super) type Sys<'a> = (&'a str, &'a [String]);
@@ -38,6 +42,8 @@ pub(super) struct Mirror {
     caps: HashMap<sem::Worker, Vec<SystemCaps>>,
     /// The hub's run -> the core's run it is, or stands for (Resumed).
     runs: HashMap<(u64, u64), sem::Run>,
+    /// The other way: each core run's hub runs, freed as the core's goes.
+    hub_runs: HashMap<sem::Run, Vec<(u64, u64)>>,
     /// Runs assigned that no worker answered yet: the answer says whether
     /// the hub placed a new run or adopted one held.
     pending: HashMap<(u64, u64), (sem::Key, sem::Worker)>,
@@ -45,8 +51,10 @@ pub(super) struct Mirror {
     /// the top, the core's own count up.
     held: sem::Run,
     clients: sem::Client,
-    /// Each waiting build's events, for the warnings.
+    /// Each waiting build's events, for the warnings; freed as it ends.
     seen: HashMap<sem::Key, Vec<String>>,
+    /// Divergences, logged once the lock is let go (Shadow::with).
+    warnings: Vec<Warning>,
 }
 
 /// A client reading a build; dropped once it stops (the core's Leave).
@@ -137,40 +145,47 @@ impl Mirror {
         s
     }
 
-    fn keys(&self, ev: &Event) -> Vec<sem::Key> {
-        let on = |w| self.hub.runs.values().filter(move |r| r.worker == w);
-        let of = |run| self.hub.runs.get(run).map(|r| r.key).into_iter().collect();
+    /// The runs `ev` is about, and the keys: its own and those of its runs.
+    fn touches(&self, ev: &Event) -> (Vec<sem::Key>, Vec<sem::Run>) {
+        let runs: Vec<sem::Run> = match *ev {
+            Event::Ran { run, .. } | Event::Fetched { run } | Event::Abort { run } => vec![run],
+            Event::Adopt { run, .. } => vec![run],
+            Event::Register { worker, .. } | Event::Suspect { worker } => (self.hub.runs.iter())
+                .filter(|r| r.1.worker == worker)
+                .map(|r| *r.0)
+                .collect(),
+            _ => vec![],
+        };
+        let mut keys: Vec<_> = (runs.iter())
+            .filter_map(|run| self.hub.runs.get(run).map(|r| r.key))
+            .collect();
         match *ev {
             Event::Submit { key, .. } | Event::Leave { key, .. } | Event::Place { key, .. } => {
-                vec![key]
+                keys.push(key);
             }
             Event::Adopt { key, .. } | Event::Defer { key, .. } | Event::Refuse { key } => {
-                vec![key]
+                keys.push(key);
             }
-            Event::Ran { run, .. } | Event::Fetched { run } | Event::Abort { run } => of(&run),
-            Event::Register { worker, .. } | Event::Suspect { worker } => {
-                on(worker).map(|r| r.key).collect()
-            }
-            #[cfg(test)]
-            Event::Decommission { .. } => vec![],
+            _ => {}
         }
+        (keys, runs)
     }
 
     /// Step the core by `evs` at the hub's `point`, where it answers `today`.
     fn feed(&mut self, point: &str, today: &[(sem::Key, Answer)], evs: Vec<Event>) -> Vec<Command> {
         let mut out = Vec::new();
         let mut keys: Vec<_> = today.iter().map(|t| t.0).collect();
+        let mut runs = Vec::new();
         for ev in evs {
-            let k = self.keys(&ev);
+            let (k, r) = self.touches(&ev);
+            let line = format!("{point}: {}", brief(&ev));
             for k in &k {
-                self.seen
-                    .entry(*k)
-                    .or_default()
-                    .push(format!("{point}: {ev:?}"));
+                self.seen.entry(*k).or_default().push(line.clone());
             }
+            runs.extend(r);
             let choice = matches!(ev, Event::Place { .. } | Event::Abort { .. });
-            let did = sem::step(&mut self.hub, ev.clone());
-            tracing::debug!(target: "tribuchet::shadow", point, ?ev, ?did, "core step");
+            let did = sem::step(&mut self.hub, ev);
+            tracing::debug!(target: "tribuchet::shadow", line, ?did, "core step");
             if choice && did.is_empty() {
                 self.diverged(point, &k, "the core refuses the hub's choice", &[], &did);
             }
@@ -192,32 +207,22 @@ impl Mirror {
             keys.extend(core.iter().map(|c| c.0));
             self.diverged(point, &keys, "answers differ", today, &out);
         }
-        self.seen.retain(|k, _| self.hub.builds.contains_key(k));
-        self.runs.retain(|_, r| self.hub.runs.contains_key(r));
+        // Only what this step touched can have ended: no scan of the rest.
+        for k in keys.iter().filter(|k| !self.hub.builds.contains_key(k)) {
+            self.seen.remove(k);
+        }
+        for r in runs.iter().filter(|r| !self.hub.runs.contains_key(r)) {
+            for h in self.hub_runs.remove(r).unwrap_or_default() {
+                self.runs.remove(&h);
+            }
+        }
         out
     }
 
-    fn diverged(
-        &self,
-        point: &str,
-        keys: &[sem::Key],
-        what: &str,
-        live: &[(u32, Answer)],
-        core: &[Command],
-    ) {
-        let mut keys = keys.to_vec();
-        keys.dedup();
-        for k in keys {
-            let build = self.hub.builds.get(&k);
-            let run = build.and_then(|b| b.live);
-            let hub_run: Vec<_> = (self.runs.iter())
-                .filter(|r| Some(*r.1) == run)
-                .map(|r| r.0)
-                .collect();
-            let (key, seen) = (format!("{k:08x}"), self.seen.get(&k));
-            tracing::warn!(target: "tribuchet::shadow", point, key, what, ?live, ?core, ?build,
-                ?hub_run, ?seen, "shadow divergence");
-        }
+    /// The hub's run `hub` is, or stands for, the core's `core`.
+    fn link(&mut self, hub: (u64, u64), core: sem::Run) {
+        self.runs.insert(hub, core);
+        self.hub_runs.entry(core).or_default().push(hub);
     }
 
     /// The core's run for the hub's `run`; at the worker's first word of a
@@ -229,7 +234,7 @@ impl Mirror {
                 .feed(point, &[], vec![Event::Place { key, worker }])
                 .first()
         {
-            self.runs.insert(run, *r);
+            self.link(run, *r);
         }
         self.runs.get(&run).copied()
     }
@@ -249,14 +254,26 @@ impl Mirror {
 
 impl Shadow {
     /// Run `f` on the core, unless it panicked before.
+    /// Its warnings are logged after the lock is let go.
     pub(super) fn with(&self, f: impl FnOnce(&mut Mirror)) {
-        let mut on = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(m) = on.as_mut()
-            && catch_unwind(AssertUnwindSafe(|| f(m))).is_err()
-        {
-            tracing::error!(target: "tribuchet::shadow", "the semantic core panicked; shadow off");
-            *on = None;
-        }
+        let warnings = {
+            let mut on = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+            let Some(m) = on.as_mut() else { return };
+            if catch_unwind(AssertUnwindSafe(|| f(m))).is_err() {
+                *on = None;
+                drop(on);
+                tracing::error!(target: "tribuchet::shadow", "the semantic core panicked; shadow off");
+                return;
+            }
+            mem::take(&mut m.warnings)
+        };
+        warnings.into_iter().for_each(|w| w());
+    }
+
+    /// Whether its lock is held, for tests.
+    #[cfg(test)]
+    pub(super) fn busy(&self) -> bool {
+        self.0.try_lock().is_err()
     }
 
     /// A client asks for `key`; it leaves as the returned Client drops.
@@ -410,7 +427,7 @@ impl Shadow {
             };
             let run = m.run(h);
             if let Some(a) = a {
-                m.runs.insert(a, run);
+                m.link(a, run);
             }
             let other = |m: &Mirror| (m.hub.builds.get(&key)).is_some_and(|b| b.live != Some(run));
             let mut evs = vec![Event::Ran {
@@ -491,11 +508,12 @@ impl Shadow {
 impl Mirror {
     /// The core's number for the hub's `run`, a new one if unseen.
     fn run(&mut self, run: (u64, u64)) -> sem::Run {
-        let held = &mut self.held;
-        *self.runs.entry(run).or_insert_with(|| {
-            *held = held.wrapping_sub(1);
-            *held
-        })
+        if let Some(&r) = self.runs.get(&run) {
+            return r;
+        }
+        self.held = self.held.wrapping_sub(1);
+        self.link(run, self.held);
+        self.held
     }
 
     fn held(&mut self, h: &HeldRun) -> Option<(sem::Run, sem::Key, Phase)> {

@@ -2,7 +2,7 @@
 //! client differently there is a warning, and where they agree none.
 
 use super::*;
-use crate::proto::{BuildResult, DECLINE_EXIT_CODE, Started};
+use crate::proto::{BuildResult, DECLINE_EXIT_CODE, HeldRun, RunId, Started};
 
 fn request(system: &str, can_local: Option<bool>) -> BuildRequest {
     BuildRequest {
@@ -73,6 +73,113 @@ async fn a_build_run_to_its_outcome_is_no_divergence() {
     for bad in ["shadow divergence", "shadow unmappable"] {
         assert_eq!(log.count(bad), 0, "{}", log.line(bad));
     }
+}
+
+/// A dedupe key the core maps to `i`.
+fn key_of(i: usize) -> String {
+    format!("{i:08x}{}", "0".repeat(56))
+}
+
+/// The time a shadow call takes with `waiting` builds waiting: over 200
+/// dispatches of five calls each, as probe C of the line review timed it.
+async fn per_call(waiting: usize) -> Duration {
+    let shadow = Arc::new(HubState::for_test(Duration::ZERO)).shadow.clone();
+    let caps = vec![SystemCaps {
+        system: "x86_64-linux".into(),
+        features: vec![],
+    }];
+    let r = Register {
+        worker_name: "w".into(),
+        caps,
+        ..Register::default()
+    };
+    shadow.register(&r);
+    let sys: (&str, &[String]) = ("x86_64-linux", &[]);
+    let waits: Vec<_> = (0..waiting + 200)
+        .map(|i| shadow.submit(&key_of(i), sys, true))
+        .collect();
+    let mut jobs = Vec::new();
+    for i in 0..200 {
+        let mut j = job(i, Arc::new(Replay::default()));
+        j.key = key_of(i);
+        let client = j.replay.subscribe().await;
+        jobs.push((j, client));
+    }
+    let start = std::time::Instant::now();
+    for (i, (j, _)) in jobs.iter().enumerate() {
+        let run = RunId {
+            epoch: 1,
+            seq: i as u64 + 1,
+        };
+        shadow.assigned(&run, &j.key, "w");
+        shadow.need(Some(&run));
+        shadow.started(Some(&run));
+        shadow.result(j, Some(&run), 0);
+        shadow.fetched(j, Some(&run));
+    }
+    let took = start.elapsed() / 1000;
+    drop((waits, jobs));
+    took
+}
+
+/// A shadow call costs the same however many builds wait: it frees what a
+/// build had as it ends and scans nothing else. Before, each call scanned
+/// every waiting build (253 µs a call with 20,000 waiting, in release).
+#[tokio::test]
+async fn a_shadow_call_costs_the_same_however_many_builds_wait() {
+    let (few, many) = (per_call(100).await, per_call(20_000).await);
+    eprintln!("a shadow call: {few:?} with 100 waiting, {many:?} with 20,000");
+    assert!(
+        many < few * 10,
+        "a call: {few:?} with 100 waiting, {many:?} with 20,000"
+    );
+}
+
+/// A divergence is logged once the shadow's lock is let go, and a warning
+/// says how many runs a Register held, not which: before, each warning of
+/// a key on a worker carried every run the worker held, under the lock.
+#[tokio::test]
+async fn a_divergence_is_logged_short_and_outside_the_shadows_lock() {
+    let log = Captured;
+    let _guard = log.install();
+    let state = Arc::new(HubState::for_test(Duration::ZERO));
+    let shadow = state.shadow.clone();
+    let sys: (&str, &[String]) = ("x86_64-linux", &[]);
+    let _client = shadow.submit(&key_of(0), sys, false);
+    let held = (0..1000).map(|i| HeldRun {
+        run: Some(RunId { epoch: 1, seq: i }),
+        dedupe_key: key_of(i as usize),
+        ..HeldRun::default()
+    });
+    let r = Register {
+        worker_name: "w".into(),
+        caps: vec![SystemCaps {
+            system: "x86_64-linux".into(),
+            features: vec![],
+        }],
+        held: held.collect(),
+        ..Register::default()
+    };
+    shadow.register(&r);
+    shadow.register(&r);
+    let busy = Arc::new(Mutex::new(Vec::new()));
+    let (s, b) = (shadow.clone(), busy.clone());
+    let sub = tracing_subscriber::fmt()
+        .with_writer(move || {
+            b.lock().unwrap().push(s.busy());
+            io::sink()
+        })
+        .finish();
+    {
+        let _scoped = tracing::subscriber::set_default(sub);
+        shadow.declined(&key_of(0), sys, false);
+    }
+    let busy = busy.lock().unwrap().clone();
+    assert!(!busy.is_empty() && !busy.contains(&true), "{busy:?}");
+    shadow.declined(&key_of(0), sys, false);
+    let line = log.line("shadow divergence");
+    assert!(line.contains("held: 1000"), "{line}");
+    assert!(line.len() < 4096, "{} bytes", line.len());
 }
 
 /// A panic in the core turns the shadow off; the hub answers on.
