@@ -27,9 +27,12 @@ fn worker_defaults_and_emulate_map() {
     .unwrap();
     assert_eq!(cfg.hub, "https://hub:7437");
     assert_eq!(cfg.max_jobs, 2);
-    assert_eq!(cfg.build_timeout_secs.get(), 24 * 3600);
-    let err = toml::from_str::<WorkerConfig>("hub = \"x\"\nbuild-timeout-secs = 0").unwrap_err();
-    assert!(err.to_string().contains("build-timeout-secs"), "{err}");
+    assert_eq!(
+        cfg.build_timeout_secs, 0,
+        "no running-time limit by default"
+    );
+    let set: WorkerConfig = toml::from_str("hub = \"x\"\nbuild-timeout-secs = 600").unwrap();
+    assert_eq!(set.build_timeout_secs, 600);
     assert_eq!(cfg.state_dir, PathBuf::from("/var/lib/tribuchet/worker"));
     assert_eq!(
         cfg.emulate.get("aarch64-linux"),

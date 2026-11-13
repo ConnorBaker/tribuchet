@@ -69,7 +69,7 @@ impl ActiveBuild {
             store_inputs: self.input_list(),
             ..sandbox::SandboxSpec::default()
         };
-        let deadline = Instant::now() + Duration::from_mins(10);
+        let deadline = Some(Instant::now() + Duration::from_mins(10));
         let (exit_code, error, outputs) = match pack_outputs(&self.dir, &spec, deadline) {
             Ok(o) => (0, String::new(), o),
             Err(e) => (1, chain(&e), vec![]),
@@ -185,7 +185,7 @@ impl ActiveBuild {
             pid: build.pid,
             spec,
             started_unix,
-            deadline_unix: started_unix + limit(timeout, a.timeout_secs).as_secs(),
+            deadline_unix: deadline(started_unix, timeout, a.timeout_secs),
             max_silent_secs: a.max_silent_secs,
             agent_socket: socket.clone(),
         };
@@ -303,7 +303,8 @@ pub(in crate::worker) fn supervise_agent(
         // packing.
         let deadline_unix = st.deadline_unix.saturating_add(tracking.frozen().as_secs());
         let remaining = Duration::from_secs(deadline_unix.saturating_sub(unix_now()));
-        let deadline = Instant::now() + remaining.max(Duration::from_mins(10));
+        // None past the clock's range: a build with no limit.
+        let deadline = Instant::now().checked_add(remaining.max(Duration::from_mins(10)));
         let packed = agents::finish(socket, &st.build_id)
             .map_err(err_ctx("finishing the build on its agent"))
             .and_then(|()| pack_outputs(&dir, &st.spec, deadline));
@@ -338,6 +339,15 @@ fn limit(own: Duration, asked: u64) -> Duration {
         asked
     } else {
         own
+    }
+}
+
+/// When a build started at `started_unix` runs out its time (limit's),
+/// never where neither the worker nor its client set a limit.
+fn deadline(started_unix: u64, own: Duration, asked: u64) -> u64 {
+    match limit(own, asked).as_secs() {
+        0 => u64::MAX,
+        secs => started_unix + secs,
     }
 }
 
@@ -434,6 +444,17 @@ mod tests {
             let secs = Duration::from_secs;
             assert_eq!(limit(secs(own), asked), secs(lesser), "{own} {asked}");
         }
+    }
+
+    /// With no limit, the worker's or its client's, a build never runs
+    /// out its time; with either, it does at its start plus the lesser.
+    #[test]
+    fn a_build_with_no_limit_never_runs_out_its_time() {
+        let secs = Duration::from_secs;
+        let never = deadline(1000, Duration::ZERO, 0);
+        assert!(!past_deadline(never, u64::MAX - 1, Duration::ZERO));
+        assert_eq!(deadline(1000, secs(600), 0), 1600, "the worker's own");
+        assert_eq!(deadline(1000, Duration::ZERO, 60), 1060, "the client's");
     }
 
     /// 100 s of timeout from 1000: a build never frozen has run it out at
