@@ -143,8 +143,7 @@ fn every_cancel_and_assignment_ends_as_the_table_says() -> Result<()> {
                         build_id: "old".into(),
                         dedupe_key: "k".into(),
                     };
-                    let outbox = Outbox::default();
-                    rt.block_on(handle_cancel(c, &mut HashMap::new(), &outbox, &ctx));
+                    rt.block_on(handle_cancel(c, &mut HashMap::new(), &old, &ctx))?;
                     // What it hands off the loop, e.g. an ack, runs by then.
                     thread::sleep(Duration::from_millis(100));
                 }
