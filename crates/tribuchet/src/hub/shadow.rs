@@ -3,9 +3,8 @@
 //! build's clients otherwise than the hub does, or refuses a choice the hub
 //! made, is a warning (target tribuchet::shadow). It decides nothing. A panic
 //! in it turns it off for the hub process. Not fed: a session's end (the core
-//! needs no Down), required features (its Sys is the system alone), and
-//! heartbeat lists (absent may be an assignment in flight; present adds
-//! nothing the run's own messages and Register do not).
+//! needs no Down), and heartbeat lists (absent may be an assignment in
+//! flight; present adds nothing the run's own messages and Register do not).
 
 use std::collections::HashMap;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -13,8 +12,11 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use super::losses::Loss;
 use super::semantics::{self as sem, Answer, Command, Event, Hub, Outcome, Phase};
-use super::state::{HubState, Job};
-use crate::proto::{HeldRun, Register, RunId, attach_event};
+use super::state::{HubState, Job, unserved};
+use crate::proto::{HeldRun, Register, RunId, SystemCaps, attach_event};
+
+/// A request's system and the features it requires.
+pub(super) type Sys<'a> = (&'a str, &'a [String]);
 
 /// The core beside the hub; `None` once it panicked.
 pub(super) struct Shadow(Mutex<Option<Mirror>>);
@@ -30,6 +32,10 @@ pub(super) struct Mirror {
     hub: Hub,
     /// Worker names and systems, as the core's numbers.
     names: HashMap<String, u32>,
+    /// Each core system: a request's system and required features.
+    systems: HashMap<sem::Sys, (String, Vec<String>)>,
+    /// Each worker's capabilities, as it registered them.
+    caps: HashMap<sem::Worker, Vec<SystemCaps>>,
     /// The hub's run -> the core's run it is, or stands for (Resumed).
     runs: HashMap<(u64, u64), sem::Run>,
     /// Runs assigned that no worker answered yet: the answer says whether
@@ -97,10 +103,38 @@ fn today(job: &Job, a: Answer) -> Vec<(sem::Key, Answer)> {
     key(&job.key).map_or(vec![], |k| vec![(k, a); n.min(1)])
 }
 
+/// Whether a worker of `caps` serves `system` with `features` (WorkerCaps::serves).
+fn serves(caps: &[SystemCaps], system: &str, features: &[String]) -> bool {
+    let has = |c: &SystemCaps| features.iter().all(|f| c.features.contains(f));
+    !unserved(features) && caps.iter().any(|c| c.system == system && has(c))
+}
+
 impl Mirror {
     fn name(&mut self, s: &str) -> u32 {
         let n = u32::try_from(self.names.len()).unwrap_or(u32::MAX);
         *self.names.entry(s.to_owned()).or_insert(n)
+    }
+
+    /// The core's system for a request for `system` with `features`; each
+    /// worker known to serve it serves it in the core too.
+    fn system(&mut self, system: &str, features: &[String]) -> sem::Sys {
+        let mut f = features.to_vec();
+        f.sort();
+        let s = self.name(&format!("{system} {f:?}"));
+        if self
+            .systems
+            .insert(s, (system.to_owned(), f.clone()))
+            .is_none()
+        {
+            for (w, caps) in &self.caps {
+                if serves(caps, system, &f)
+                    && let Some(on) = self.hub.workers.get_mut(w)
+                {
+                    on.insert(s);
+                }
+            }
+        }
+        s
     }
 
     fn keys(&self, ev: &Event) -> Vec<sem::Key> {
@@ -226,10 +260,10 @@ impl Shadow {
     }
 
     /// A client asks for `key`; it leaves as the returned Client drops.
-    pub(super) fn submit(self: &Arc<Self>, k: &str, sys: &str, can_local: bool) -> Client {
+    pub(super) fn submit(self: &Arc<Self>, k: &str, sys: Sys, can_local: bool) -> Client {
         let mut c = Client::untracked(can_local);
         self.with(|m| {
-            let (Some(key), sys) = (key(k), m.name(sys)) else {
+            let (Some(key), sys) = (key(k), m.system(sys.0, sys.1)) else {
                 return;
             };
             m.clients += 1;
@@ -250,9 +284,9 @@ impl Shadow {
 
     /// No worker serves `key` and the hub declines the client: the core's
     /// Defer if its Nix can build the key, else its Refuse (policy order).
-    pub(super) fn declined(&self, k: &str, sys: &str, can_local: bool) {
+    pub(super) fn declined(&self, k: &str, sys: Sys, can_local: bool) {
         self.with(|m| {
-            let (Some(key), sys) = (key(k), m.name(sys)) else {
+            let (Some(key), sys) = (key(k), m.system(sys.0, sys.1)) else {
                 return;
             };
             m.clients += 1;
@@ -280,7 +314,11 @@ impl Shadow {
     pub(super) fn register(&self, r: &Register) {
         self.with(|m| {
             let worker = m.name(&r.worker_name);
-            let serves = r.caps.iter().map(|c| m.name(&c.system)).collect();
+            m.caps.insert(worker, r.caps.clone());
+            let on = |(s, (system, f)): (&u32, &(String, Vec<String>))| {
+                serves(&r.caps, system, f).then_some(*s)
+            };
+            let serves = m.systems.iter().filter_map(on).collect();
             let held = (r.held.iter()).filter_map(|h| m.held(h)).collect();
             m.feed(
                 "register",
