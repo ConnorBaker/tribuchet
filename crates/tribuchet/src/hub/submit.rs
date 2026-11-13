@@ -150,7 +150,9 @@ impl AttachSvc {
     ) -> Option<Response<BuildStream>> {
         let decline = || {
             tracing::info!(system, can_local, "no capable worker; declining");
-            self.state.shadow.declined(key, system, can_local);
+            self.state
+                .shadow
+                .declined(key, (system, features), can_local);
             Metrics::inc(&self.state.metrics.declined);
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             let _ = tx.try_send(Ok(AttachEvent {
@@ -240,7 +242,8 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 .cloned();
             if let Some(replay) = existing {
                 tracing::info!(key, "deduplicating build submission");
-                let client = self.state.shadow.submit(&key, &req.system, can_local);
+                let sys = (req.system.as_str(), features.as_slice());
+                let client = self.state.shadow.submit(&key, sys, can_local);
                 break replay.subscribe_as(client).await;
             }
             let id = new_id();
@@ -257,7 +260,8 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 notified.await;
                 continue;
             };
-            let client = self.state.shadow.submit(&key, &req.system, can_local);
+            let sys = (req.system.as_str(), features.as_slice());
+            let client = self.state.shadow.submit(&key, sys, can_local);
             let rx = replay.subscribe_as(client).await;
             let mut job = Job {
                 id,

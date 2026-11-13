@@ -28,7 +28,25 @@ async fn declining_a_client_its_nix_cannot_build_is_a_divergence() {
         while client.message().await.unwrap().is_some() {}
         assert_eq!(log.count("shadow divergence"), usize::from(!can_local));
     }
-    assert!(log.has(&["shadow divergence", "no capable worker", "Refuse"]));
+    assert!(log.has(&["shadow divergence", "no capable worker", "answer: Refuse"]));
+}
+
+/// A worker of the system without a feature the build requires does not
+/// serve it in the core either: the core Refuses the client.
+#[tokio::test]
+async fn a_worker_without_a_required_feature_does_not_serve_the_build() {
+    let log = Captured;
+    let _guard = log.install();
+    let state = Arc::new(HubState::for_test(Duration::ZERO));
+    let _w = connect(&state, "w1", 1, &[]);
+    while state.worker_caps.lock().unwrap().is_empty() {
+        tokio::task::yield_now().await;
+    }
+    let mut req = request("x86_64-linux", Some(false));
+    req.required_features = vec!["kvm".into()];
+    let mut client = submit(&state, req).await;
+    while client.message().await.unwrap().is_some() {}
+    assert!(log.has(&["shadow divergence", "no capable worker", "answer: Refuse"]));
 }
 
 /// A run's own outcome answers its clients, in the core as in the hub.
