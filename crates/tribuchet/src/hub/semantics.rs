@@ -345,12 +345,15 @@ pub fn step(hub: &mut Hub, ev: Event) -> Vec<Command> {
                 hub.answer(key, Answer::Refuse, None, &mut out);
             }
         }
+        // Its runs are forgotten: should it come back, its Register lists
+        // those it still holds, as for any worker.
         Event::Suspect { worker } => {
             for run in hub.runs_on(worker) {
                 if let Some(key) = hub.live(run) {
                     let finished = matches!(hub.runs[&run].phase, Phase::Finished(_));
                     hub.detach(key, !finished);
                 }
+                hub.runs.remove(&run);
             }
         }
         Event::Abort { run } => {

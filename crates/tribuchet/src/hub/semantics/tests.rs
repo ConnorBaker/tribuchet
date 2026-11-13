@@ -361,6 +361,8 @@ impl World {
                 }
                 let worker = w as Worker;
                 self.send(Event::Suspect { worker });
+                let kept = self.hub.runs.values().any(|r| r.worker == worker);
+                assert!(!kept, "a suspected worker's runs are kept");
             }
             Act::Decommission(w) => {
                 self.known.remove(&w);
