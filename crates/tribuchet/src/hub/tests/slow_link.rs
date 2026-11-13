@@ -1,8 +1,59 @@
 //! A worker session's Control and Session, each on a connection of its
 //! own, here over a slow link (crate::slowlink).
 
+use tokio_stream::wrappers::TcpListenerStream;
+
 use super::*;
+use crate::proto::worker_hub_client::WorkerHubClient;
+use crate::proto::worker_hub_server::WorkerHubServer;
 use crate::{chunkio, slowlink};
+
+/// A worker predating Control opens its Session alone, its Register naming
+/// no session: the hub refuses it, FAILED_PRECONDITION, and serves the
+/// next worker, which opens both.
+#[tokio::test]
+async fn a_worker_predating_control_is_refused_and_the_hub_serves_on() {
+    let state = Arc::new(HubState::for_test(Duration::from_secs(30)));
+    let svc = WorkerSvc {
+        state: state.clone(),
+        auth: Arc::new(PeerAuth::Mtls),
+        pending: Default::default(),
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let hub = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(
+        Server::builder()
+            .add_service(WorkerHubServer::new(svc))
+            .serve_with_incoming(TcpListenerStream::new(listener)),
+    );
+    let register = |worker_name: &str, session: &[u8]| {
+        let r = Register {
+            worker_name: worker_name.into(),
+            session: session.to_vec(),
+            ..Register::default()
+        };
+        WorkerMessage {
+            msg: Some(worker_message::Msg::Register(r)),
+        }
+    };
+    let mut client = WorkerHubClient::connect(hub).await.unwrap();
+    let old = client
+        .session(tokio_stream::iter([register("old", &[])]))
+        .await;
+    let code = old.map(|_| ()).map_err(|s| s.code());
+    assert_eq!(code, Err(tonic::Code::FailedPrecondition));
+    let (ctl, ctl_rx) = mpsc::channel(1);
+    let (bulk, bulk_rx) = mpsc::channel(1);
+    ctl.send(register("new", &[1])).await.unwrap();
+    bulk.send(register("", &[1])).await.unwrap();
+    let _ctl = client.control(ReceiverStream::new(ctl_rx)).await.unwrap();
+    let _bulk = client.session(ReceiverStream::new(bulk_rx)).await.unwrap();
+    let served = || (state.worker_caps.lock().unwrap().values()).any(|c| c.name == "new");
+    for _ in (0..100).take_while(|_| !served()) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(served(), "the next worker was not served");
+}
 
 /// worker_loop on one stream each way, which the test reads and writes
 /// as both the session's Control and its Session.
