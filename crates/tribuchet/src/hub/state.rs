@@ -17,6 +17,7 @@ use super::metrics::Metrics;
 use super::placement::{Expected, Placement};
 use super::relay::{DAEMON_ANSWER, DaemonEvidence};
 use super::runs::Runs;
+use super::shadow::Shadow;
 use crate::config::NixConfig;
 use crate::fsutil::write_atomic;
 
@@ -162,6 +163,8 @@ pub(super) struct HubState {
     pub(super) placement: StdMutex<Placement>,
     /// Numbers each dispatch's run.
     pub(super) runs: Runs,
+    /// The semantic core beside the hub, logging where they differ.
+    pub(super) shadow: Arc<Shadow>,
 }
 
 #[derive(Clone)]
@@ -250,6 +253,7 @@ impl HubState {
             chunks,
             placement: StdMutex::default(),
             runs: Runs::default(),
+            shadow: Arc::default(),
         }
     }
 
