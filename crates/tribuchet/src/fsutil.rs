@@ -27,6 +27,17 @@ pub fn io_ctx(step: &'static str, path: &Path) -> impl FnOnce(io::Error) -> io::
     move |e| io::Error::new(e.kind(), format!("{step} {}: {e}", path.display()))
 }
 
+/// Replace `path` with `content` at once: written beside it, synced, renamed.
+pub fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    {
+        let mut f = fs::File::create(&tmp).map_err(io_ctx("creating", &tmp))?;
+        f.write_all(content.as_bytes())?;
+        f.sync_all()?;
+    }
+    fs::rename(&tmp, path).map_err(io_ctx("renaming into", path))
+}
+
 /// Write a secret file atomically with mode 0600: created via a temp
 /// file so it is never world-readable (fs::write + chmod would race)
 /// and a torn write cannot leave a short key behind.

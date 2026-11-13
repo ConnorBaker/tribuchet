@@ -5,6 +5,8 @@
     reason = "tonic-generated code"
 )]
 
+use std::fmt;
+
 tonic::include_proto!("tribuchet.v1");
 
 /// gRPC message size cap. Metadata messages (BuildRequest, BuildAssignment)
@@ -31,6 +33,12 @@ pub const MAX_NAR_BYTES: u64 = 64 * 1024 * 1024 * 1024;
 /// the missing set shrinks each round, so a hub that cannot deliver
 /// fails the build instead of looping.
 pub const MAX_RESEND_ROUNDS: u32 = 3;
+
+impl fmt::Display for RunId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}", self.epoch, self.seq)
+    }
+}
 
 impl TmpDirArchive {
     pub fn chunk(build_id: &str, zstd_chunk: Vec<u8>) -> Self {

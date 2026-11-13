@@ -56,7 +56,7 @@ fn reaped_results_leave_nothing_to_adopt_once_their_keys_are_gone() -> Result<()
     for key in ["k", "k2"] {
         let build = dir.path().join(format!("builds/{key}"));
         fill(&build, "top/build")?;
-        delivery::persist_finished(key, "old", &finished(&build));
+        delivery::persist_finished(key, ("old", None), &finished(&build));
         let fin = Some(finished(&build));
         ResumableBuild::insert(&ctx, key.into(), "old".into(), build.clone(), fin);
         builds.push(build);
@@ -185,7 +185,7 @@ fn an_ended_result_whose_state_stays_keeps_its_key() -> Result<()> {
         let ctx = WorkerCtx::for_test(dir.path(), 4, vec![])?;
         let build = dir.path().join("builds/k");
         fs::create_dir_all(&build)?;
-        delivery::persist_finished("k", "old", &finished(&build));
+        delivery::persist_finished("k", ("old", None), &finished(&build));
         let fin = Some(finished(&build));
         ResumableBuild::insert(&ctx, "k".into(), "old".into(), build.clone(), fin);
         thread::sleep(Duration::from_millis(1));

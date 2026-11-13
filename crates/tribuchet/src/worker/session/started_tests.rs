@@ -9,6 +9,7 @@ use tonic::transport::Server;
 use super::*;
 use crate::hub::msg_name;
 use crate::proto::worker_hub_server::WorkerHubServer;
+use crate::proto::{HeldRun, RunId};
 use crate::slowlink;
 use crate::worker::build::tests::base_assignment;
 use crate::worker::resume::{FinishedBuild, Usage};
@@ -16,11 +17,17 @@ use crate::worker::resume::{FinishedBuild, Usage};
 /// A build staged at once says it started after its Need, and its run
 /// sends nothing before its Started: the loop sends the Need before it
 /// launches the run, on the channel the run sends its Started on first.
+/// Both its Started and its Result name the assignment's run.
 #[tokio::test]
 async fn a_run_says_it_started_after_its_need_and_first() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let ctx = WorkerCtx::for_test(dir.path(), 1, vec![dir.path().join("down.sock")])?;
-    let build = ActiveBuild::new(base_assignment(), ctx.clone(), mpsc::unbounded_channel().0)?;
+    let run = Some(RunId { epoch: 3, seq: 4 });
+    let a = BuildAssignment {
+        run,
+        ..base_assignment()
+    };
+    let build = ActiveBuild::new(a, ctx.clone(), mpsc::unbounded_channel().0)?;
     let id = build.assignment.build_id.clone();
     // Cancelled, so that it ends instead of waiting for its agent, which
     // is down.
@@ -39,20 +46,27 @@ async fn a_run_says_it_started_after_its_need_and_first() -> Result<()> {
     };
     let staged = Ok((Some(need), StagingStatus::Ready));
     advance_staging(&mut active, &mut VecDeque::new(), &id, staged, &env).await?;
-    let mut got = vec![];
+    let (mut got, mut runs) = (vec![], vec![]);
     while got.last() != Some(&"Result") {
         let m = tokio::time::timeout(Duration::from_secs(10), out_rx.recv()).await;
         let m = m.expect("no Result").unwrap();
         got.push(m.msg.as_ref().map_or("", msg_name));
+        match m.msg {
+            Some(worker_message::Msg::Started(s)) => runs.push(s.run),
+            Some(worker_message::Msg::Result(r)) => runs.push(r.run),
+            _ => {}
+        }
     }
     got.retain(|&m| m != "RequestJob");
     assert_eq!(got, ["Need", "Started", "Result"]);
+    assert_eq!(runs, [run, run]);
     Ok(())
 }
 
 /// A session that resumes a finished result tells the hub it is
 /// finished, and the session's end starts the result's reaper clock
-/// (released).
+/// (released). Its Register lists the run it holds, finished, and the run
+/// it lost; its Resumed names the run it holds, not the assignment's.
 #[tokio::test]
 async fn a_session_resuming_a_finished_result_says_so_and_releases_it() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -67,7 +81,10 @@ async fn a_session_resuming_a_finished_result_says_so_and_releases_it() -> Resul
         dir: b1.clone(),
         finished_at: Instant::now(),
     };
-    ResumableBuild::insert(&ctx, "test-key".into(), "old".into(), b1, Some(fin));
+    let [held, lost] = [1, 2].map(|seq| RunId { epoch: 7, seq });
+    let ids = ("old".into(), Some(held));
+    ResumableBuild::insert_run(&ctx, "test-key".into(), ids, b1, Some(fin));
+    ctx.lost.lock().unwrap().push(lost);
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
     let hub = listener.local_addr()?;
     let opts = format!("hub = \"http://{hub}\"\nauth = \"tailscale\"");
@@ -82,6 +99,7 @@ async fn a_session_resuming_a_finished_result_says_so_and_releases_it() -> Resul
             let a = BuildAssignment {
                 build_id: "new".into(),
                 dedupe_key: "test-key".into(),
+                run: Some(RunId { epoch: 7, seq: 3 }),
                 ..Default::default()
             };
             let a = HubMessage {
@@ -111,6 +129,17 @@ async fn a_session_resuming_a_finished_result_says_so_and_releases_it() -> Resul
         panic!("no Resumed");
     };
     assert!(resumed.finished, "unfinished");
+    assert_eq!(resumed.run, Some(held), "not the run it holds");
+    let Some(Some(worker_message::Msg::Register(r))) = read.first().map(|m| &m.msg) else {
+        panic!("no Register");
+    };
+    let finished = HeldRun {
+        run: Some(held),
+        dedupe_key: "test-key".into(),
+        started: true,
+        exit_code: Some(0),
+    };
+    assert_eq!((&r.held[..], &r.lost[..]), (&[finished][..], &[lost][..]));
     let released = ctx.resumable.lock().unwrap()["test-key"].released;
     assert!(released.is_some(), "not released");
     Ok(())

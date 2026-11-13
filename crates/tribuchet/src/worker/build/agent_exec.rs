@@ -182,6 +182,7 @@ impl ActiveBuild {
         let resume = ResumeState {
             dedupe_key: a.dedupe_key.clone(),
             build_id: a.build_id.clone(),
+            run: a.run,
             pid: build.pid,
             spec,
             started_unix,
@@ -324,7 +325,7 @@ pub(in crate::worker) fn supervise_agent(
     // On disk before the agent forgets the build: a worker stopped while
     // Cleanup runs leaves a result to deliver, not a running build no
     // agent has.
-    persist_finished(&st.dedupe_key, &st.build_id, &fin);
+    persist_finished(&st.dedupe_key, (&st.build_id, st.run), &fin);
     // The agent removes its scratch dir and the scratch outputs
     // (packing above already read them) and forgets the build.
     agents::retire(socket, &st.build_id, "agent cleanup");

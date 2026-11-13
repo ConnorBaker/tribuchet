@@ -167,7 +167,7 @@ async fn decided(
     for (n, q) in queued.iter().enumerate() {
         let j = job(100 + n, Arc::new(Replay::default()));
         if *q == Queued::Held {
-            state.hold(0, [j.key.clone()].into(), false);
+            state.hold(0, &[j.key.clone()], false);
         }
         if *q != Queued::Clientless {
             clients.push(j.replay.subscribe().await);

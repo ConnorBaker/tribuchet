@@ -20,6 +20,8 @@ mod build;
 #[cfg(test)]
 pub(crate) use build::chunk_tests;
 mod caps;
+#[cfg(test)]
+mod held_tests;
 mod lease;
 mod logtail;
 mod pins;
@@ -57,7 +59,7 @@ use crate::config::WorkerConfig;
 use crate::errors::{Result, err_ctx, err_msg};
 use crate::fsutil::io_ctx;
 use crate::netpolicy::NetPolicy;
-use crate::proto::{BuildAssignment, LogChunk, WorkerMessage, worker_message};
+use crate::proto::{BuildAssignment, HeldRun, LogChunk, RunId, WorkerMessage, worker_message};
 use crate::{fsutil, rt, sd};
 
 /// Connection to the local nix-daemon; one per active build so its
@@ -83,6 +85,9 @@ struct WorkerCtx {
     /// dedupe_key -> build past staging; survives session loss so a
     /// replacement hub can resume instead of rebuilding.
     resumable: Mutex<HashMap<String, ResumableBuild>>,
+    /// Runs it found gone as it started, which their agents no longer had
+    /// though no hub told it to drop them: told to the hub at each report.
+    lost: Mutex<Vec<RunId>>,
     /// system -> static emulator binary, from the emulate setting.
     emulators: HashMap<String, PathBuf>,
     /// A build with network can get a network of its own, a private
@@ -145,6 +150,26 @@ impl WorkerCtx {
 
     fn resumable_keys(&self) -> Vec<String> {
         self.resumable.lock().unwrap().keys().cloned().collect()
+    }
+
+    /// The runs it holds that no hub told it to drop: neither cancelled
+    /// while running nor ended for a cancel. Unnumbered ones are left out.
+    fn held(&self) -> Vec<HeldRun> {
+        let map = self.resumable.lock().unwrap();
+        let held = map.iter().filter_map(|(key, e)| {
+            let exit_code = e.finished.as_ref().map(|f| f.exit_code);
+            let dropped = match &e.finished {
+                Some(f) => f.error.ends_with(CANCELLED),
+                None => e.cancelled,
+            };
+            (!dropped).then_some(HeldRun {
+                run: Some(e.run?),
+                dedupe_key: key.clone(),
+                started: true,
+                exit_code,
+            })
+        });
+        held.collect()
     }
 
     /// Re-point an already-held build (same dedupe key) at the
@@ -418,6 +443,7 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         cancelled: Mutex::new(HashSet::new()),
         claims: build::Claims::default(),
         resumable: Mutex::new(HashMap::new()),
+        lost: Mutex::default(),
         emulators,
         fod_isolation,
         fod_network: opts.fod_network.clone(),
@@ -502,6 +528,7 @@ mod tests {
                 secret_paths: vec![],
                 sandbox: false,
                 resumable: Mutex::new(HashMap::new()),
+                lost: Mutex::default(),
                 emulators: HashMap::new(),
                 fod_isolation: false,
                 fod_network: NetPolicy::default(),

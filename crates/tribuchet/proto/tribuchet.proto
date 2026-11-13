@@ -47,18 +47,39 @@ message WorkerMessage {
   }
 }
 
+// A run: one assignment of a build to a worker, numbered by the hub
+// after every run an earlier hub process numbered (epoch). Unset from
+// peers predating it.
+message RunId {
+  uint64 epoch = 1;
+  uint64 seq = 2;
+}
+
+// A run a worker holds and was not told to drop: staging, started, or
+// finished with its exit code.
+message HeldRun {
+  RunId run = 1;
+  string dedupe_key = 2;
+  bool started = 3;
+  optional int32 exit_code = 4;
+}
+
 message ResultGone {
   string build_id = 1;
+  RunId run = 2;
 }
 
 message Resumed {
   string build_id = 1;
   // The run has finished: what follows is its result.
   bool finished = 2;
+  // The run the worker holds, which the assignment's run stands for.
+  RunId run = 3;
 }
 
 message Started {
   string build_id = 1;
+  RunId run = 2;
 }
 
 message RequestJob {
@@ -163,6 +184,9 @@ message Register {
   // Random, chosen by the worker per session: names its Control to its
   // Session.
   bytes session = 7;
+  // Every run it holds, and those it found gone as it started.
+  repeated HeldRun held = 8;
+  repeated RunId lost = 9;
 }
 
 message Heartbeat {
@@ -178,6 +202,9 @@ message Heartbeat {
   // with none frozen, and from workers predating the fields.
   repeated string frozen_keys = 5;
   optional string leader_key = 6;
+  // Current Register.held and Register.lost.
+  repeated HeldRun held = 7;
+  repeated RunId lost = 8;
 }
 
 message BuildAssignment {
@@ -205,6 +232,7 @@ message BuildAssignment {
   // own; 0 (none, or from hubs predating the fields) leaves its own.
   uint64 timeout_secs = 15;
   uint64 max_silent_secs = 16;
+  RunId run = 17;
 }
 
 message TmpDirArchive {
@@ -246,6 +274,7 @@ message BuildResult {
   reserved 5;
   // What the build used on the worker; all 0 when unknown.
   BuildUsage usage = 6;
+  RunId run = 7;
 }
 
 message BuildUsage {

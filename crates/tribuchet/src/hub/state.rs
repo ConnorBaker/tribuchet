@@ -3,8 +3,6 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Write};
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic;
@@ -18,8 +16,9 @@ use super::losses::{self, Loss};
 use super::metrics::Metrics;
 use super::placement::{Expected, Placement};
 use super::relay::{DAEMON_ANSWER, DaemonEvidence};
+use super::runs::Runs;
 use crate::config::NixConfig;
-use crate::fsutil::io_ctx;
+use crate::fsutil::write_atomic;
 
 use crate::proto::{AttachEvent, BuildRequest, attach_event};
 
@@ -161,6 +160,8 @@ pub(super) struct HubState {
     pub(super) chunks: Arc<ChunkCache>,
     /// Each worker session's admission (placement.rs).
     pub(super) placement: StdMutex<Placement>,
+    /// Numbers each dispatch's run.
+    pub(super) runs: Runs,
 }
 
 #[derive(Clone)]
@@ -198,16 +199,6 @@ fn render_nix_config(caps: &HashMap<u64, WorkerCaps>, cfg: &NixConfig) -> String
         let _ = writeln!(out, "max-jobs = {jobs}");
     }
     out
-}
-
-fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = fs::File::create(&tmp).map_err(io_ctx("creating", &tmp))?;
-        f.write_all(content.as_bytes())?;
-        f.sync_all()?;
-    }
-    fs::rename(&tmp, path).map_err(io_ctx("renaming into", path))
 }
 
 impl WorkerCaps {
@@ -258,6 +249,7 @@ impl HubState {
             nix_config: nix_config.map(Self::nix_config_writer),
             chunks,
             placement: StdMutex::default(),
+            runs: Runs::default(),
         }
     }
 

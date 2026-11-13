@@ -86,8 +86,11 @@ async fn result_dropped(chunks: usize) {
     };
     w.send(resumed(&build_id, true)).await;
     w.send(worker_message::Msg::Result(result)).await;
-    w.send(worker_message::Msg::ResultGone(ResultGone { build_id }))
-        .await;
+    let gone = ResultGone {
+        build_id,
+        run: None,
+    };
+    w.send(worker_message::Msg::ResultGone(gone)).await;
     let requeued = || state.metrics.requeued.load(Ordering::Relaxed);
     for _ in (0..200).take_while(|_| requeued() == 0) {
         tokio::time::sleep(Duration::from_millis(10)).await;
@@ -120,7 +123,7 @@ async fn a_held_key_is_honoured_once_per_listing() {
         state.take_job_by_key(w.id).await.is_none(),
         "one held build handed out twice"
     );
-    state.hold(w.id, ["k1".to_owned()].into(), true);
+    state.hold(w.id, &["k1".to_owned()], true);
     assert!(
         state.take_job_by_key(w.id).await.is_some(),
         "listed again by a heartbeat, not honoured"

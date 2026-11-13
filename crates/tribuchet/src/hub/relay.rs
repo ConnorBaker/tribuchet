@@ -50,6 +50,8 @@ pub(super) async fn run_job(
     let req = &job.req;
     let mut staging = Staging::new(state, job, &sess);
     let inputs = staging.assignment_inputs().await?;
+    let run = state.runs.next();
+    tracing::debug!(id = job.id, %run, "assigning a run");
     send(
         out_tx,
         hub_message::Msg::Assignment(BuildAssignment {
@@ -69,6 +71,7 @@ pub(super) async fn run_job(
             worker_name: worker.to_owned(),
             timeout_secs: req.timeout_secs,
             max_silent_secs: req.max_silent_secs,
+            run: Some(run),
         }),
     )
     .await?;
@@ -118,7 +121,8 @@ pub(super) async fn run_job(
                 };
                 (dispatch.reached, dispatch.resumed) = (dispatch.reached.max(run), true);
                 resumed_after = Some(state.heartbeats(session));
-                tracing::info!(id = job.id, "worker resumed an in-flight build");
+                let held = r.run.as_ref().map(ToString::to_string);
+                tracing::info!(id = job.id, held, "worker resumed an in-flight build");
             }
             worker_message::Msg::Started(_) => {
                 dispatch.reached = dispatch.reached.max(Run::Started);

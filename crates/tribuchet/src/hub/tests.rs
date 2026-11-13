@@ -155,11 +155,8 @@ fn caps(name: &str) -> WorkerCaps {
 /// A worker session as worker_loop registers it.
 fn register(state: &Arc<HubState>, name: &str, held: &[&str]) -> CapsGuard {
     let guard = CapsGuard::new(state.clone(), caps(name));
-    state.hold(
-        guard.id,
-        held.iter().map(|k| (*k).to_owned()).collect(),
-        false,
-    );
+    let held: Vec<String> = held.iter().map(|k| (*k).to_owned()).collect();
+    state.hold(guard.id, &held, false);
     guard
 }
 
@@ -220,7 +217,11 @@ async fn lose_session(
 /// The worker says it holds a run of build `build_id`, `finished` or not.
 fn resumed(build_id: &str, finished: bool) -> worker_message::Msg {
     let build_id = build_id.into();
-    worker_message::Msg::Resumed(Resumed { build_id, finished })
+    worker_message::Msg::Resumed(Resumed {
+        build_id,
+        finished,
+        run: None,
+    })
 }
 
 #[tokio::test]

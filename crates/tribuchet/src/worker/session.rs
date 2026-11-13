@@ -24,9 +24,9 @@ use crate::chunkio;
 use crate::config::{Auth, WorkerConfig};
 use crate::errors::{Error, Result, chain, err_ctx, err_msg};
 use crate::proto::{
-    BuildAssignment, BuildResult, CancelBuild, Heartbeat, HubMessage, MAX_MSG_SIZE, Need, Register,
-    Resumed, Started, WorkerMessage, hub_message, worker_hub_client::WorkerHubClient,
-    worker_message,
+    BuildAssignment, BuildResult, CancelBuild, Heartbeat, HeldRun, HubMessage, MAX_MSG_SIZE, Need,
+    Register, Resumed, RunId, Started, WorkerMessage, hub_message,
+    worker_hub_client::WorkerHubClient, worker_message,
 };
 use crate::sd;
 
@@ -77,6 +77,8 @@ pub(super) async fn session(opts: &WorkerConfig, ctx: &Arc<WorkerCtx>) -> Result
                 &own_cgroup().unwrap_or_default(),
             ),
             session: session.clone(),
+            held: ctx.held(),
+            lost: ctx.lost.lock().unwrap().clone(),
         })))
         .await?;
     let (bulk_tx, bulk_rx) = mpsc::channel::<WorkerMessage>(64);
@@ -238,11 +240,22 @@ fn beat(active: &HashMap<String, ActiveBuild>, ctx: &WorkerCtx) -> WorkerMessage
     let staging = active.values().filter(|b| b.lease.is_some()).count();
     let room = ctx.agents.room();
     let running = room.leases.saturating_sub(staging);
+    let mut held = ctx.held();
+    // Staging, and so not started.
+    held.extend(active.values().filter_map(|b| {
+        Some(HeldRun {
+            run: Some(b.assignment.run?),
+            dedupe_key: b.assignment.dedupe_key.clone(),
+            ..HeldRun::default()
+        })
+    }));
     msg(worker_message::Msg::Heartbeat(Heartbeat {
         running_jobs: u32::try_from(running).unwrap_or(u32::MAX),
         load1: loadavg1(),
         resumable_keys: ctx.resumable_keys(),
         max_jobs: u32::try_from(room.capacity).ok(),
+        held,
+        lost: ctx.lost.lock().unwrap().clone(),
         ..ctx.arbiter.frozen_by()
     }))
 }
@@ -295,8 +308,9 @@ pub(super) async fn handle_cancel(
 ) -> Result<()> {
     tracing::info!(id = c.build_id, "hub cancelled the build");
     if let Some(build) = active.remove(&c.build_id) {
+        let run = build.assignment.run;
         build.abort().await;
-        fail_build(out_tx, &c.build_id, &err_msg(CANCELLED)).await?;
+        fail_build(out_tx, (&c.build_id, run), &err_msg(CANCELLED)).await?;
     } else {
         // Only flag builds that are still running: a key flagged for
         // an already-finished build would never be consumed and would
@@ -373,10 +387,16 @@ async fn handle_assignment(
         // Told first, off the loop. Read after the adoption: a run
         // finished by then has its result delivered to it.
         tokio::task::spawn_blocking(move || {
-            let finished = (ctx.resumable.lock().unwrap().get(&a.dedupe_key))
-                .is_some_and(|e| e.finished.is_some());
+            let held = (ctx.resumable.lock().unwrap().get(&a.dedupe_key))
+                .map(|e| (e.finished.is_some(), e.run));
+            let (finished, run) = held.unwrap_or_default();
             let build_id = a.build_id.clone();
-            let resumed = msg(worker_message::Msg::Resumed(Resumed { build_id, finished }));
+            let resumed = Resumed {
+                build_id,
+                finished,
+                run,
+            };
+            let resumed = msg(worker_message::Msg::Resumed(resumed));
             if out_tx.blocking_send(resumed).is_ok() {
                 try_deliver(&ctx, &a.dedupe_key, Some(adoption));
             }
@@ -389,7 +409,7 @@ async fn handle_assignment(
         tracing::warn!(id = old.assignment.build_id, "discarding duplicate build");
         old.abort().await;
     }
-    let build_id = a.build_id.clone();
+    let (build_id, run) = (a.build_id.clone(), a.run);
     match validate_assignment(&a).and_then(|()| ActiveBuild::new(a, ctx.clone(), wake.clone())) {
         Ok(mut b) => {
             b.lease = ctx.agents.lease();
@@ -397,7 +417,7 @@ async fn handle_assignment(
             Ok(Some(build_id))
         }
         Err(e) => {
-            fail_build(env.out_tx, &build_id, &e).await?;
+            fail_build(env.out_tx, (&build_id, run), &e).await?;
             Ok(None)
         }
     }
@@ -415,6 +435,7 @@ fn launch_build(build: ActiveBuild, mut lease: Lease, env: &LaunchEnv<'_>) {
         // No log tail: execute() streams the log live itself.
         ResumableBuild {
             build_id: build.assignment.build_id.clone(),
+            run: build.assignment.run,
             out_tx: Some(out_tx.clone()),
             dir: build.dir.clone(),
             worker_name: build.assignment.worker_name.clone(),
@@ -424,8 +445,8 @@ fn launch_build(build: ActiveBuild, mut lease: Lease, env: &LaunchEnv<'_>) {
     // The run's first message, after the build's Needs, which the loop has
     // sent on the same channel, and before its builder spawns. A session
     // gone by then misses it, as one gone just after it would.
-    let build_id = build.assignment.build_id.clone();
-    let started = msg(worker_message::Msg::Started(Started { build_id }));
+    let (build_id, run) = (build.assignment.build_id.clone(), build.assignment.run);
+    let started = msg(worker_message::Msg::Started(Started { build_id, run }));
     tokio::task::spawn_blocking(move || {
         let _ = out_tx.blocking_send(started);
         let fin = execute_to_finished(&build, &mut lease, &out_tx, build_timeout);
@@ -441,16 +462,18 @@ async fn abort_active(
     out_tx: &mpsc::Sender<WorkerMessage>,
     e: &Error,
 ) -> Result<()> {
-    if let Some(build) = active.remove(id) {
+    let build = active.remove(id);
+    let run = build.as_ref().and_then(|b| b.assignment.run);
+    if let Some(build) = build {
         build.abort().await;
     }
-    fail_build(out_tx, id, e).await
+    fail_build(out_tx, (id, run), e).await
 }
 
 /// Report a per-build failure to the hub without tearing the session down.
 async fn fail_build(
     out_tx: &mpsc::Sender<WorkerMessage>,
-    build_id: &str,
+    (build_id, run): (&str, Option<RunId>),
     err: &Error,
 ) -> Result<()> {
     let err = chain(err);
@@ -458,6 +481,7 @@ async fn fail_build(
     out_tx
         .send(msg(worker_message::Msg::Result(BuildResult {
             build_id: build_id.into(),
+            run,
             exit_code: 1,
             outputs: vec![],
             error: err,
