@@ -444,7 +444,7 @@ pub(super) use outputs::pack_outputs;
 mod wait_tests;
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use std::collections::BTreeMap;
     use std::time::Duration;
 
@@ -496,7 +496,7 @@ mod tests {
         Ok(())
     }
 
-    pub(super) fn base_assignment() -> BuildAssignment {
+    pub(in crate::worker) fn base_assignment() -> BuildAssignment {
         BuildAssignment {
             build_id: "0123456789abcdef0123456789abcdef".into(),
             dedupe_key: "test-key".into(),

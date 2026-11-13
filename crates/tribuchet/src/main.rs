@@ -13,6 +13,8 @@ mod netpolicy;
 mod proto;
 mod rt;
 mod sd;
+#[cfg(test)]
+mod slowlink;
 mod sockpath;
 #[cfg(test)]
 mod stalltest;

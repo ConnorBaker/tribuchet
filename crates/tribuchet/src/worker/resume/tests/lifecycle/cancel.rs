@@ -130,7 +130,8 @@ fn every_cancel_and_assignment_ends_as_the_table_says() -> Result<()> {
                         build_id: "old".into(),
                         dedupe_key: "k".into(),
                     };
-                    rt.block_on(handle_cancel(c, &mut HashMap::new(), &old, &ctx))?;
+                    let outbox = Outbox::default();
+                    rt.block_on(handle_cancel(c, &mut HashMap::new(), &outbox, &ctx));
                 }
                 Fail => fail_cancelled(&ctx, "k"),
                 Take => {
@@ -214,12 +215,12 @@ fn a_cancel_taken_as_a_held_builds_kill_is_decided_leaves_no_flag() -> Result<()
     });
     // A call to its agent waits at the gate, so the cancel is taken
     // after the agent answers it.
-    h.cancel("old", &tx)?;
+    h.cancel("old");
     h.allow.store(usize::MAX, SeqCst);
     let flagged = || h.ctx.cancelled.lock().unwrap().contains("k");
     until("the first cancel taken", || !flagged());
     assert_eq!(held(&h.ctx, "k"), Some((true, false)), "not held");
-    h.cancel("old", &tx)?;
+    h.cancel("old");
     assert!(flagged(), "the second cancel was not taken");
     let failed = thread::spawn(move || {
         let mut n = 0;
