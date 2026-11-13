@@ -182,6 +182,54 @@ async fn a_divergence_is_logged_short_and_outside_the_shadows_lock() {
     assert!(line.len() < 4096, "{} bytes", line.len());
 }
 
+/// A run its worker lost (its Register or heartbeat says so) ended with no
+/// known cause, though the hub never heard it start, having heard its Need
+/// or nothing at all: the core runs its key alone (D4). Before, the hub
+/// read neither list, and such a key was never isolated.
+#[tokio::test]
+async fn a_run_its_worker_lost_isolates_its_key() {
+    let sys: (&str, &[String]) = ("x86_64-linux", &[]);
+    let r = Register {
+        worker_name: "w".into(),
+        caps: vec![SystemCaps {
+            system: "x86_64-linux".into(),
+            features: vec![],
+        }],
+        ..Register::default()
+    };
+    for need in [true, false] {
+        let shadow = Arc::new(HubState::for_test(Duration::ZERO)).shadow.clone();
+        let _client = shadow.submit(&key_of(0), sys, false);
+        shadow.register(&r);
+        let run = RunId { epoch: 1, seq: 1 };
+        shadow.assigned(&run, &key_of(0), "w");
+        if need {
+            shadow.need(Some(&run));
+        }
+        let lost = vec![run];
+        shadow.register(&Register { lost, ..r.clone() });
+        assert_eq!(shadow.isolated(&key_of(0)), Some(true), "need: {need}");
+    }
+    let state = Arc::new(HubState::for_test(Duration::from_secs(30)));
+    let mut w = connect(&state, "w1", 1, &[]);
+    let _client = submit(&state, request("x86_64-linux", Some(false))).await;
+    w.to_hub.send(request_job(1, Some(0))).await.unwrap();
+    let a = w.assignment().await.expect("not assigned");
+    let lost = Heartbeat {
+        lost: a.run.into_iter().collect(),
+        ..Heartbeat::default()
+    };
+    w.send(worker_message::Msg::Heartbeat(lost)).await;
+    for _ in (0..200).take_while(|_| state.shadow.isolated(&a.dedupe_key) != Some(true)) {
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        state.shadow.isolated(&a.dedupe_key),
+        Some(true),
+        "by heartbeat"
+    );
+}
+
 /// A panic in the core turns the shadow off; the hub answers on.
 #[tokio::test]
 async fn a_panic_in_the_core_turns_the_shadow_off() {

@@ -62,6 +62,7 @@ pub(super) async fn session(opts: &WorkerConfig, ctx: &Arc<WorkerCtx>) -> Result
     getrandom::fill(&mut session).map_err(|e| err_msg(format!("randomness: {e}")))?;
 
     let (out_tx, out_rx) = mpsc::channel::<WorkerMessage>(64);
+    let lost = ctx.lost.lock().unwrap().clone();
     // Register must be the first message the hub reads; it fits in the
     // channel buffer, so queue it before the stream is consumed.
     out_tx
@@ -78,7 +79,7 @@ pub(super) async fn session(opts: &WorkerConfig, ctx: &Arc<WorkerCtx>) -> Result
             ),
             session: session.clone(),
             held: ctx.held(),
-            lost: ctx.lost.lock().unwrap().clone(),
+            lost: lost.clone(),
         })))
         .await?;
     let (bulk_tx, bulk_rx) = mpsc::channel::<WorkerMessage>(64);
@@ -93,6 +94,9 @@ pub(super) async fn session(opts: &WorkerConfig, ctx: &Arc<WorkerCtx>) -> Result
     // Control first: the hub then expects its Session.
     let mut inbound = (control.control(ReceiverStream::new(out_rx)).await?).into_inner();
     let mut bulk_in = (bulk.session(ReceiverStream::new(bulk_rx)).await?).into_inner();
+    // The hub took the Register, both streams open: it has heard of the
+    // runs lost then. Those lost since go in the heartbeats and the next.
+    ctx.lost.lock().unwrap().retain(|r| !lost.contains(r));
     tracing::info!(hub = opts.hub, systems = ?opts.systems, "connected to hub");
     sd::notify_status(CONNECTED_STATUS);
 

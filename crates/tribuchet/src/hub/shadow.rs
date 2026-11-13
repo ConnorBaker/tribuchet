@@ -3,8 +3,9 @@
 //! build's clients otherwise than the hub does, or refuses a choice the hub
 //! made, is a warning (target tribuchet::shadow). It decides nothing. A panic
 //! in it turns it off for the hub process. Not fed: a session's end (the core
-//! needs no Down), and heartbeat lists (absent may be an assignment in
-//! flight; present adds nothing the run's own messages and Register do not).
+//! needs no Down), and a heartbeat's held runs (absent may be an assignment
+//! in flight; present adds nothing the run's own messages and Register do
+//! not). Its lost runs are fed, as a Register's are.
 
 use std::collections::HashMap;
 use std::mem;
@@ -270,6 +271,14 @@ impl Shadow {
         warnings.into_iter().for_each(|w| w());
     }
 
+    /// Whether the core runs `k` alone (D4), if a build of it waits.
+    #[cfg(test)]
+    pub(super) fn isolated(&self, k: &str) -> Option<bool> {
+        let mut lost = None;
+        self.with(|m| lost = key(k).and_then(|k| m.hub.builds.get(&k)).map(|b| b.lost));
+        lost
+    }
+
     /// Whether its lock is held, for tests.
     #[cfg(test)]
     pub(super) fn busy(&self) -> bool {
@@ -337,16 +346,24 @@ impl Shadow {
             };
             let serves = m.systems.iter().filter_map(on).collect();
             let held = (r.held.iter()).filter_map(|h| m.held(h)).collect();
-            m.feed(
-                "register",
-                &[],
-                vec![Event::Register {
-                    worker,
-                    serves,
-                    held,
-                }],
-            );
+            let mut evs = m.lost(&r.lost);
+            evs.push(Event::Register {
+                worker,
+                serves,
+                held,
+            });
+            m.feed("register", &[], evs);
         });
+    }
+
+    /// A worker's heartbeat lists the runs it `lost` (Mirror::lost).
+    pub(super) fn lost(&self, lost: &[RunId]) {
+        if !lost.is_empty() {
+            self.with(|m| {
+                let evs = m.lost(lost);
+                m.feed("lost", &[], evs);
+            });
+        }
     }
 
     pub(super) fn assigned(&self, run: &RunId, k: &str, worker: &str) {
@@ -506,6 +523,23 @@ impl Shadow {
 }
 
 impl Mirror {
+    /// Runs a worker lost: past staging, so it had started them, though the
+    /// hub may never have heard it (D4 under-detection), and they ended with
+    /// no known cause. One assigned and never answered is placed first.
+    fn lost(&mut self, lost: &[RunId]) -> Vec<Event> {
+        let runs = lost
+            .iter()
+            .filter_map(|r| self.bind("lost", (r.epoch, r.seq)));
+        let started = Some(Phase::Started);
+        let ran = |run| {
+            [
+                Event::Ran { run, now: started },
+                Event::Ran { run, now: None },
+            ]
+        };
+        runs.collect::<Vec<_>>().into_iter().flat_map(ran).collect()
+    }
+
     /// The core's number for the hub's `run`, a new one if unseen.
     fn run(&mut self, run: (u64, u64)) -> sem::Run {
         if let Some(&r) = self.runs.get(&run) {
