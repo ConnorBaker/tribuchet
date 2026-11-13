@@ -41,7 +41,7 @@ pub(in crate::hub) const FLOOR: Duration = Duration::from_secs(14);
 /// A build dispatched to a worker session, as giving it up weighs it.
 pub(in crate::hub) struct Dispatched {
     session: u64,
-    key: String,
+    pub(super) key: String,
     replay: Arc<Replay>,
     /// The job's dedupe listing: given up, a later client starts it anew.
     listing: Arc<StdMutex<Option<Listing>>>,
