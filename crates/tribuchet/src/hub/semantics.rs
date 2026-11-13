@@ -175,6 +175,9 @@ impl Hub {
 
     fn answer(&mut self, key: Key, answer: Answer, run: Option<Run>, out: &mut Vec<Command>) {
         let b = self.builds.remove(&key).expect("a waiting build");
+        if b.clients.is_empty() {
+            return; // A clientless build ends unsaid: no one to answer.
+        }
         let clients = b.clients.into_keys().collect();
         out.push(Command::Answer {
             key,
@@ -187,14 +190,22 @@ impl Hub {
     fn detach(&mut self, key: Key, evidence: bool) {
         let b = self.builds.get_mut(&key).expect("a waiting build");
         (b.live, b.lost) = (None, b.lost || evidence);
+        self.unwanted(key);
     }
 
     fn leave(&mut self, key: Key, client: Client) {
         if let Some(b) = self.builds.get_mut(&key) {
             b.clients.remove(&client);
-            if b.clients.is_empty() {
-                self.builds.remove(&key);
-            }
+            self.unwanted(key);
+        }
+    }
+
+    /// A build is wanted while a client waits on it or its live run goes on
+    /// clientless, which a Submit of its key then joins (L9); else it ends (C27).
+    fn unwanted(&mut self, key: Key) {
+        let b = self.builds.get(&key);
+        if b.is_some_and(|b| b.clients.is_empty() && b.live.is_none()) {
+            self.builds.remove(&key);
         }
     }
 

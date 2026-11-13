@@ -243,6 +243,41 @@ async fn an_unanswered_assignment_is_freed_as_its_build_ends() {
     assert_eq!(shadow.pending(), 0);
 }
 
+/// A client resubmitting a key whose last client left joins the run still
+/// going, in the core as in the hub (L9). Before, the core dropped the build
+/// at the leave, so at the fetch it answered no one: a divergence (nixos-ext,
+/// 2026-11-13, keys 183cc4f5 and 3bf842b2).
+#[tokio::test]
+async fn a_resubmission_joins_the_run_its_left_build_kept() {
+    let log = Captured;
+    let _guard = log.install();
+    let shadow = Arc::new(HubState::for_test(Duration::ZERO)).shadow.clone();
+    let caps = vec![SystemCaps {
+        system: "x86_64-linux".into(),
+        features: vec![],
+    }];
+    let worker_name = "w".to_owned();
+    shadow.register(&Register {
+        worker_name,
+        caps,
+        ..Register::default()
+    });
+    let sys: (&str, &[String]) = ("x86_64-linux", &[]);
+    let run = RunId { epoch: 1, seq: 1 };
+    let first = shadow.submit(&key_of(0), sys, true);
+    shadow.assigned(&run, &key_of(0), "w");
+    shadow.started(Some(&run));
+    drop(first);
+    let mut j = job(0, Arc::new(Replay::default()));
+    j.key = key_of(0);
+    let rerun = shadow.submit(&j.key, sys, true);
+    let _rerun = j.replay.subscribe_as(rerun).await;
+    shadow.result(&j, Some(&run), 0);
+    shadow.fetched(&j, Some(&run));
+    let bad = "shadow divergence";
+    assert_eq!(log.count(bad), 0, "{}", log.line(bad));
+}
+
 /// A panic in the core turns the shadow off; the hub answers on.
 #[tokio::test]
 async fn a_panic_in_the_core_turns_the_shadow_off() {
