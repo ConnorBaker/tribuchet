@@ -44,8 +44,8 @@ and owns transfer, scheduling and execution itself.
   every CPU busy, younger parallel builds are frozen until it no longer
   does, and only while what they pin together fits their memory
   caps and the host's available memory; frozen time counts toward
-  neither `build-timeout-secs` and `max-silent-time-secs` nor a
-  client's `timeout` and `max-silent-time`. There is no setting to
+  neither `build-timeout-secs` and `max-silent-time-secs` (both off by
+  default) nor a client's `timeout` and `max-silent-time`. There is no setting to
   turn it off;
   DESIGN.md (CPU arbitration) says why.
 - NixOS and nix-darwin modules for both services, and an OCI worker
