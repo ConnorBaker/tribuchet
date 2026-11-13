@@ -224,9 +224,10 @@ async fn a_chunk_request_waits_on_a_silent_session_no_longer_than_its_silence() 
     let (bulk, bulk_rx) = tokio::sync::mpsc::channel(1);
     serve_chunks(&ctx, "b".into(), &hash, (ctl, bulk));
     // The chunk fills the Session; its eof waits.
-    while bulk_rx.is_empty() {
+    for _ in (0..10_000).take_while(|_| bulk_rx.is_empty()) {
         thread::sleep(Duration::from_millis(1));
     }
+    assert!(!bulk_rx.is_empty(), "no chunk on the Session");
     thread::sleep(Duration::from_millis(100));
     // A blocking task holds the paused clock still unless it is advanced.
     tokio::time::advance(SILENCE_TIMEOUT + Duration::from_secs(1)).await;
