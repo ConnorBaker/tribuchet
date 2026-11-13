@@ -14,8 +14,8 @@ use testlog::Captured;
 use crate::config::NixConfig;
 use crate::proto::attach_hub_client::AttachHubClient;
 use crate::proto::{
-    AttachEvent, BuildAssignment, BuildMessage, BuildRequest, Heartbeat, SystemCaps, TmpDirChunk,
-    attach_hub_server, build_message,
+    AttachEvent, BuildAssignment, BuildMessage, BuildRequest, Heartbeat, Resumed, SystemCaps,
+    TmpDirChunk, attach_hub_server, build_message,
 };
 
 mod attempts;
@@ -174,7 +174,7 @@ pub(super) fn job(n: usize, replay: Arc<Replay>) -> Job {
         replay,
         listing: Arc::default(),
         attempts: 0,
-        resumed_losses: 0,
+        transport_losses: 0,
         queued_at: Instant::now(),
         loss: None,
         deferred: None,
@@ -189,11 +189,11 @@ async fn lose_session(
     state: &Arc<HubState>,
     job: Job,
     worker: CapsGuard,
-    said: Option<worker_message::Msg>,
+    said: impl IntoIterator<Item = worker_message::Msg>,
 ) {
     let router = Router::default();
     let in_rx = router.register(&job.id);
-    if let Some(m) = said {
+    for m in said {
         let tx = router.builds.lock().unwrap()[&job.id].clone();
         tx.send(m).await.unwrap();
     }
@@ -214,6 +214,12 @@ async fn lose_session(
         admission,
     )
     .await;
+}
+
+/// The worker says it holds a run of build `build_id`, `finished` or not.
+fn resumed(build_id: &str, finished: bool) -> worker_message::Msg {
+    let build_id = build_id.into();
+    worker_message::Msg::Resumed(Resumed { build_id, finished })
 }
 
 #[tokio::test]

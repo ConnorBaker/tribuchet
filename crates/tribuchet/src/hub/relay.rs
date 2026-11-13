@@ -16,7 +16,7 @@ use tokio::sync::mpsc;
 use tonic::Status;
 
 use super::cancel;
-use super::losses::Dispatch;
+use super::losses::{Dispatch, Run};
 use super::metrics::Metrics;
 use super::naming::drv_name;
 use super::record::Rest;
@@ -112,10 +112,18 @@ pub(super) async fn run_job(
         match m {
             // The worker already holds this build (it survived a hub
             // restart). Its result arrives like any other.
-            worker_message::Msg::Resumed(_) => {
-                dispatch.resumed = true;
+            worker_message::Msg::Resumed(r) => {
+                let run = if r.finished {
+                    Run::Finished
+                } else {
+                    Run::Started
+                };
+                (dispatch.reached, dispatch.resumed) = (dispatch.reached.max(run), true);
                 resumed_after = Some(state.heartbeats(session));
                 tracing::info!(id = job.id, "worker resumed an in-flight build");
+            }
+            worker_message::Msg::Started(_) => {
+                dispatch.reached = dispatch.reached.max(Run::Started);
             }
             worker_message::Msg::Log(l) => {
                 job.replay.publish(attach_event::Event::Log(l.data)).await;
@@ -153,6 +161,7 @@ pub(super) async fn run_job(
                 if res.exit_code != 0 {
                     return publish_worker_failure(state, out_tx, job, &res).await;
                 }
+                dispatch.reached = Run::Finished;
                 let outputs = verify_set(res.outputs, &job.req.outputs)?;
                 deliver_outputs(state, job, out_tx, &mut in_rx, outputs).await?;
                 finish_relay(state, out_tx, &job.replay, job).await;
@@ -181,6 +190,7 @@ pub(super) fn msg_name(msg: &worker_message::Msg) -> &'static str {
         worker_message::Msg::Chunk(_) => "ChunkFrame",
         worker_message::Msg::RequestJob(_) => "RequestJob",
         worker_message::Msg::Resumed(_) => "Resumed",
+        worker_message::Msg::Started(_) => "Started",
     }
 }
 

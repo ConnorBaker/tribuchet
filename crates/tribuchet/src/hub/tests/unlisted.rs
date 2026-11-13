@@ -3,7 +3,6 @@
 //! start, answered at last without it (worker/resume.rs).
 
 use super::*;
-use crate::proto::Resumed;
 
 fn listing(keys: &[&str]) -> WorkerMessage {
     WorkerMessage {
@@ -15,10 +14,11 @@ fn listing(keys: &[&str]) -> WorkerMessage {
 }
 
 /// The build is requeued once a heartbeat after its Resumed leaves its
-/// key out, counted as lost on a resume and waited for no longer by its
-/// worker, so that the next dispatch starts it over. Heartbeats that
-/// list it change nothing. The hub does not wait for its result for as
-/// long as its client stays.
+/// key out, and waited for no longer by its worker, so that the next
+/// dispatch starts it over. Its run ended without an outcome: a genuine
+/// loss, counted once, its worker's session gone or not, and nothing in
+/// transport. Heartbeats that list it change nothing. The
+/// hub does not wait for its result for as long as its client stays.
 #[tokio::test(start_paused = true)]
 async fn a_resumed_build_its_worker_stops_listing_is_requeued() {
     let state = Arc::new(HubState::for_test(Duration::from_secs(30)));
@@ -27,8 +27,7 @@ async fn a_resumed_build_its_worker_stops_listing_is_requeued() {
     state.queue.lock().await.push_back(job(0, replay));
     let mut w = connect(&state, "w", 1, &["k0"]);
     let build_id = w.assignment().await.expect("not assigned").build_id;
-    w.send(worker_message::Msg::Resumed(Resumed { build_id }))
-        .await;
+    w.send(resumed(&build_id, false)).await;
     w.to_hub.send(listing(&["k0"])).await.unwrap();
     tokio::time::sleep(Duration::from_secs(10)).await;
     assert_eq!(state.metrics.requeued.load(Ordering::Relaxed), 0);
@@ -37,7 +36,7 @@ async fn a_resumed_build_its_worker_stops_listing_is_requeued() {
     assert_eq!(state.metrics.requeued.load(Ordering::Relaxed), 1);
     let queue = state.queue.lock().await;
     let lost = queue.front().expect("not requeued");
-    assert_eq!(lost.resumed_losses, 1);
+    assert_eq!((lost.attempts, lost.transport_losses), (1, 0));
     assert!(
         lost.loss
             .as_ref()
@@ -45,6 +44,9 @@ async fn a_resumed_build_its_worker_stops_listing_is_requeued() {
     );
     drop(queue);
     w.hub.abort();
+    let _other = register(&state, "w2", &[]);
+    let taken = state.take_job(&caps("w2"), None).await.expect("not taken");
+    assert_eq!((taken.attempts, taken.transport_losses), (1, 0));
 }
 
 /// A key a worker session lists as held is honoured once: no second

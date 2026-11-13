@@ -259,7 +259,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 replay,
                 listing: Arc::new(Mutex::new(Some(listing))),
                 attempts: 0,
-                resumed_losses: 0,
+                transport_losses: 0,
                 queued_at: Instant::now(),
                 loss: None,
                 deferred: None,

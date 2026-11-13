@@ -197,7 +197,7 @@ pub(super) async fn render(state: &HubState) -> String {
         ),
         (
             "tribuchet_builds_declined_total",
-            "Builds declined because no capable worker registered in time.",
+            "Builds declined: no capable worker registered in time, or lost in transport too often.",
             &m.declined,
         ),
         (
@@ -502,7 +502,7 @@ mod tests {
             replay: Arc::new(Replay::default()),
             listing: Arc::default(),
             attempts: 0,
-            resumed_losses: 0,
+            transport_losses: 0,
             queued_at: Instant::now(),
             loss: None,
             deferred: None,

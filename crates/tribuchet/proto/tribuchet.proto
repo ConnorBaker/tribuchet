@@ -31,10 +31,20 @@ message WorkerMessage {
     // store lacks. The first Need answers the assignment and lists
     // every missing input path. May repeat any number of times.
     Need need = 8;
+    // The build is staged and its run starts: sent before its builder is
+    // spawned, so before anything else of the run. A Resumed stands for
+    // it on a resume.
+    Started started = 9;
   }
 }
 
 message Resumed {
+  string build_id = 1;
+  // The run has finished: what follows is its result.
+  bool finished = 2;
+}
+
+message Started {
   string build_id = 1;
 }
 

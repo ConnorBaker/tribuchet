@@ -5,9 +5,10 @@ use std::time::Duration;
 use std::time::Instant as Now;
 
 use super::*;
+use crate::hub::Admission;
+use crate::hub::losses::{self, Loss};
 use crate::hub::placement::Size;
 use crate::hub::tests::job;
-use crate::hub::{Admission, Loss};
 use Queued::{Clientless, Held, Waiting};
 
 /// A worker's size, which the decider here does not read.
@@ -193,6 +194,7 @@ async fn a_resume_keeps_the_run_and_the_absence() {
         worker: "w".into(),
         session: 1,
         until,
+        run: losses::Run::Started,
     });
     let _again = state.list_dispatch(&j, 2);
     let resumed = state.dispatched.lock().unwrap()[&j.id].started;

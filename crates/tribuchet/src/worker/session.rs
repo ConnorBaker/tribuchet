@@ -24,7 +24,8 @@ use crate::config::{Auth, WorkerConfig};
 use crate::errors::{Error, Result, chain, err_ctx, err_msg};
 use crate::proto::{
     BuildAssignment, BuildResult, CancelBuild, Heartbeat, HubMessage, MAX_MSG_SIZE, Need, Register,
-    Resumed, WorkerMessage, hub_message, worker_hub_client::WorkerHubClient, worker_message,
+    Resumed, Started, WorkerMessage, hub_message, worker_hub_client::WorkerHubClient,
+    worker_message,
 };
 use crate::sd;
 
@@ -325,9 +326,14 @@ async fn handle_assignment(
     // instead of building again.
     if let Some(adoption) = ctx.adopt_assignment(&a, out_tx) {
         tracing::info!(id = a.build_id, key = a.dedupe_key, "build resumed");
+        // Read after the adoption: a run finished by then has its result
+        // delivered to it.
+        let finished = (ctx.resumable.lock().unwrap().get(&a.dedupe_key))
+            .is_some_and(|e| e.finished.is_some());
         out_tx
             .send(msg(worker_message::Msg::Resumed(Resumed {
                 build_id: a.build_id.clone(),
+                finished,
             })))
             .await?;
         let ctx = ctx.clone();
@@ -379,7 +385,12 @@ fn launch_build(
             ..ResumableBuild::default()
         },
     );
+    // The run's first message, before its builder spawns. A session gone
+    // by then misses it, as one gone just after it would.
+    let build_id = build.assignment.build_id.clone();
+    let started = msg(worker_message::Msg::Started(Started { build_id }));
     tokio::task::spawn_blocking(move || {
+        let _ = out_tx.blocking_send(started);
         let fin = execute_to_finished(&build, &mut lease, &out_tx, build_timeout);
         drop((build, lease));
         record_finished(&ctx, &key, fin);
