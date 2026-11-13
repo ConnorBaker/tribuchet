@@ -14,7 +14,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tokio_util::sync::PollSender;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
-use super::build::{ActiveBuild, StagingStatus, Wake, validate_assignment};
+use super::build::{ActiveBuild, Negotiation, StagingStatus, Wake, validate_assignment};
 use super::caps::{build_memory, cores, own_cgroup, system_caps};
 use super::lease::Lease;
 use super::resume::{
@@ -117,6 +117,8 @@ async fn session_loop(
     let mut heartbeat = tokio::time::interval(chunkio::HEARTBEAT);
     let mut sender = PollSender::new(out_tx.clone());
     let (wake_tx, mut wake_rx) = mpsc::unbounded_channel::<Wake>();
+    // Negotiations with the daemon, off the loop: it reads the hub meanwhile.
+    let mut negotiations = tokio::task::JoinSet::<Negotiation>::new();
     env.outbox.declare.set(true);
     loop {
         let m = tokio::select! {
@@ -155,6 +157,15 @@ async fn session_loop(
                 }
                 continue;
             }
+            Some(done) = negotiations.join_next() => {
+                let (id, dir, checked) = done?;
+                // Not cancelled, nor its id assigned again, meanwhile.
+                if let Some(build) = active.get_mut(&id).filter(|b| b.dir == dir) {
+                    let res = build.negotiated(checked);
+                    advance_staging(active, &mut ready, &id, res, &env).await;
+                }
+                continue;
+            }
             m = inbound.message() => {
                 m?.ok_or_else(|| err_msg("hub closed the session"))?
             }
@@ -164,8 +175,7 @@ async fn session_loop(
             hub_message::Msg::Assignment(a) => {
                 env.assignments.fetch_add(1, Ordering::Relaxed);
                 if let Some(id) = handle_assignment(a, active, &wake_tx, &env).await {
-                    let res = active.get_mut(&id).unwrap().negotiate().await;
-                    advance_staging(active, &mut ready, &id, res, &env).await;
+                    negotiations.spawn(active[&id].negotiation());
                 }
                 env.outbox.declare.set(true);
             }
@@ -469,6 +479,8 @@ fn fail_build(outbox: &Outbox, build_id: &str, err: &Error) {
     })));
 }
 
+#[cfg(test)]
+mod negotiate_tests;
 #[cfg(test)]
 mod slow_link_tests;
 #[cfg(test)]
