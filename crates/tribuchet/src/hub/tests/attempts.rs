@@ -394,6 +394,94 @@ async fn an_assignment_the_worker_never_got_counts_no_loss() {
     assert_eq!(told(&mut client).await.1, None);
 }
 
+/// A dispatch whose Session cannot take its bulk (the tmp dir, at the
+/// first Need), its Control alive, lost its session: the build is
+/// requeued, one loss in transport, and its client is never failed.
+#[tokio::test]
+async fn a_bulk_send_that_fails_loses_the_session_not_the_build() {
+    let state = Arc::new(HubState::for_test(Duration::ZERO));
+    let mut client = queued_build(&state, (false, true)).await;
+    let w = register(&state, "w1", &[]);
+    let job = state.take_job(&caps("w1"), None).await.unwrap();
+    let router = Router::default();
+    let in_rx = router.register(&job.id);
+    let (out_tx, mut from_hub) = mpsc::channel(64);
+    // The Session's hub-to-worker half is gone; nothing else is.
+    let sess = Arc::new(WorkerSession::new("w".into(), mpsc::channel(1).0));
+    let session = (w.id, w.caps.name.clone());
+    let admission = Arc::new(Mutex::new(Admission::default()));
+    let settled = tokio::spawn(supervise_job(
+        state.clone(),
+        job,
+        router.clone(),
+        out_tx,
+        in_rx,
+        sess,
+        session,
+        admission,
+    ));
+    let Some(Ok(HubMessage {
+        msg: Some(hub_message::Msg::Assignment(a)),
+    })) = from_hub.recv().await
+    else {
+        panic!("no assignment");
+    };
+    let need = Need {
+        build_id: a.build_id,
+        ..Need::default()
+    };
+    router.route(worker_message::Msg::Need(need)).await;
+    settled.await.unwrap();
+    let m = &state.metrics;
+    let counts = [&m.failed, &m.requeued].map(|c| c.load(Ordering::Relaxed));
+    assert_eq!(counts, [0, 1], "failed, requeued");
+    let queued = state.queue.lock().await.front().map(|j| j.transport_losses);
+    assert_eq!(queued, Some(1), "not one loss in transport");
+    assert_eq!(told(&mut client).await.1, None);
+}
+
+/// A session whose Session's hub-to-worker half closes, its Control and
+/// the worker-to-hub half alive, ends; its build is requeued, not failed.
+#[tokio::test]
+async fn a_session_whose_bulk_closes_ends() {
+    let state = Arc::new(HubState::for_test(Duration::from_secs(30)));
+    let client = queued_build(&state, (false, true)).await;
+    let register = Register {
+        worker_name: "w".into(),
+        caps: vec![SystemCaps {
+            system: "x86_64-linux".into(),
+            features: vec![],
+        }],
+        max_jobs: 1,
+        session: vec![1],
+        ..Register::default()
+    };
+    let (out_tx, mut from_hub) = mpsc::channel(256);
+    let (to_hub, in_rx) = mpsc::channel(64);
+    let (bulk_tx, bulk_from_hub) = mpsc::channel(64);
+    let (_to_bulk, bulk_rx) = mpsc::channel::<WorkerMessage>(64);
+    let ctl = (out_tx, in_rx);
+    let hub = tokio::spawn(worker_loop(
+        state.clone(),
+        register,
+        ctl,
+        (bulk_tx, bulk_rx),
+    ));
+    to_hub.send(request_job(1, Some(0))).await.unwrap();
+    while !matches!(
+        from_hub.recv().await,
+        Some(Ok(HubMessage {
+            msg: Some(hub_message::Msg::Assignment(_))
+        }))
+    ) {}
+    drop(bulk_from_hub);
+    let ended = tokio::time::timeout(Duration::from_secs(5), hub).await;
+    assert!(ended.is_ok(), "the session lives on");
+    let failed = state.metrics.failed.load(Ordering::Relaxed);
+    assert_eq!(failed, 0);
+    drop((client, to_hub));
+}
+
 /// A build the hub ends with no verdict from a run of it that may go on
 /// has that run cancelled once its worker is back listing it: declined
 /// at the transport cap, failed at the genuine cap, dropped as its client
