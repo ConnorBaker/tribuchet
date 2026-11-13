@@ -13,9 +13,8 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, mpsc, watch};
 use tonic::Status;
 
-use super::Loss;
 use super::chunkcache::ChunkCache;
-use super::losses;
+use super::losses::{self, Loss};
 use super::metrics::Metrics;
 use super::placement::{Expected, Placement};
 use super::relay::{DAEMON_ANSWER, DaemonEvidence};
@@ -67,17 +66,15 @@ pub(super) struct Job {
     /// Genuine losses (hub/losses.rs): capped so a crash-looping
     /// build cannot bounce forever.
     pub(super) attempts: u32,
-    /// Losses on a resume (hub/losses.rs): capped so a worker that
-    /// loses every resume cannot keep the build forever.
-    pub(super) resumed_losses: u32,
+    /// Losses in transport (hub/losses.rs): capped so a build the farm
+    /// cannot move goes back to its clients.
+    pub(super) transport_losses: u32,
     /// When the job last entered the queue, for the queue-wait histogram.
     pub(super) queued_at: Instant,
     /// The loss of the build with its worker's session, which the next
-    /// dispatch settles: a resume by that worker clears it; a
-    /// start-over, or an assignment the hub could not hand over, counts
-    /// it as genuine; that worker's session dying before either counts
-    /// it as a loss on a resume. Until the loss's grace ends, or the
-    /// worker is back, the build is kept for that worker (Loss::awaited).
+    /// dispatch settles (hub/losses.rs), with how far its run got. Until
+    /// the loss's grace ends, or the worker is back, the build is kept
+    /// for that worker (Loss::awaited).
     pub(super) loss: Option<Loss>,
     /// When it was first passed over for another worker (placement::
     /// Rooms): none since it last entered the queue.
@@ -92,6 +89,16 @@ impl Job {
     /// Stop deduping new submissions onto this job.
     pub(super) fn unlist(&self) {
         drop(self.listing.lock().unwrap().take());
+    }
+
+    /// Tell its clients to drop any half-streamed output NARs: the next
+    /// attempt, or their own build, writes them from the start.
+    pub(super) async fn restart_outputs(&self) {
+        for path in self.req.outputs.values() {
+            let restart = attach_event::Event::OutputRestart(path.clone());
+            self.replay.publish(restart).await;
+        }
+        self.replay.unpin_outputs().await;
     }
 
     /// Whether no fresh take may have it: a worker's key holds it, or its
@@ -347,12 +354,7 @@ impl HubState {
     /// their chunks to the cache while it waits, held or not.
     pub(super) async fn requeue(self: &Arc<Self>, mut job: Job) {
         (job.queued_at, job.deferred) = (Instant::now(), None);
-        for path in job.req.outputs.values() {
-            job.replay
-                .publish(attach_event::Event::OutputRestart(path.clone()))
-                .await;
-        }
-        job.replay.unpin_outputs().await;
+        job.restart_outputs().await;
         self.queue.lock().await.push_back(job);
         self.notify.notify_waiters();
         self.hold_unservable().await;

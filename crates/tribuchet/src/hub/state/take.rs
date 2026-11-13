@@ -4,6 +4,7 @@
 use std::collections::HashSet;
 use std::time::Instant;
 
+use super::losses::{Charge, Run};
 use super::{HubState, Job, WorkerCaps, losses};
 
 /// The builds a worker session holds from before, by dedupe key: the
@@ -108,9 +109,22 @@ impl HubState {
                 self.finish(&job).await;
                 continue;
             }
-            // Its last worker did not resume it: this starts it over.
-            if job.loss.take().is_some() {
-                let Some(j) = losses::count(self, job, true).await else {
+            // Its last worker did not resume it: this starts it over. A
+            // run it started ended without an outcome if that worker is
+            // back without it; one not back may run it still, a loss in
+            // transport. A loss before or after the run was counted as it
+            // happened (losses::lost).
+            if let Some(loss) = job.loss.take().filter(|l| l.run == Run::Started) {
+                let back = {
+                    let holding = self.holding.lock().unwrap();
+                    loss.back(&self.worker_caps.lock().unwrap(), &holding)
+                };
+                let charge = if back {
+                    Charge::Genuine
+                } else {
+                    Charge::Transport
+                };
+                let Some(j) = losses::count(self, job, charge).await else {
                     continue;
                 };
                 job = j;
@@ -131,8 +145,9 @@ impl HubState {
             held.taken.insert(job.key.clone());
             job
         };
-        // Held by a worker other than the one that lost it: that loss
-        // stands. The same worker's resume is settled by run_job.
+        // Held by a worker other than the one that lost it: a run that
+        // one started may go on, a loss in transport. The same worker's
+        // resume is settled by run_job.
         let name = self
             .worker_caps
             .lock()
@@ -144,8 +159,9 @@ impl HubState {
             .as_ref()
             .is_some_and(|r| Some(&r.worker) != name.as_ref())
         {
-            job.loss = None;
-            job = losses::count(self, job, true).await?;
+            if job.loss.take().is_some_and(|l| l.run == Run::Started) {
+                job = losses::count(self, job, Charge::Transport).await?;
+            }
         }
         Some(job)
     }

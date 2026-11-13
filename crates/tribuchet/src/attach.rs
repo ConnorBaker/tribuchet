@@ -6,7 +6,7 @@
 //! performs self-reference rewriting and registration afterwards).
 //! Exits with the builder's exit code.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
@@ -93,8 +93,17 @@ async fn run_async(build: BuildJson, socket: PathBuf) -> Result<i32> {
     // Its dedupe key matches the build still running on the worker,
     // which resumes instead of building twice.
     let mut attempts = 0u32;
+    let mut written = HashSet::new();
     loop {
-        match attempt_build(&req, &tmp_dir_pack, &socket, &expected_outputs).await? {
+        match attempt_build(
+            &req,
+            &tmp_dir_pack,
+            &socket,
+            &expected_outputs,
+            &mut written,
+        )
+        .await?
+        {
             Outcome::Done(code) => return Ok(code),
             Outcome::Retry(e) => {
                 attempts += 1;
@@ -158,6 +167,7 @@ async fn attempt_build(
     tmp_dir_pack: &[u8],
     socket: &Path,
     expected_outputs: &[String],
+    written: &mut HashSet<String>,
 ) -> Result<Outcome> {
     let channel = match connect(socket).await {
         Ok(c) => c,
@@ -210,7 +220,9 @@ async fn attempt_build(
                 io::stderr().write_all(&data)?;
             }
             Some(attach_event::Event::Output(out)) => {
+                let path = out.store_path.clone();
                 handle_output_chunk(&mut unpackers, expected_outputs, out).await?;
+                written.insert(path);
             }
             Some(attach_event::Event::Dispatched(worker)) => {
                 eprintln!("tribuchet: building on {worker}");
@@ -226,6 +238,14 @@ async fn attempt_build(
             Some(attach_event::Event::ExitCode(code)) => {
                 if !unpackers.is_empty() {
                     return Err(err_msg("hub closed build with unfinished output transfers"));
+                }
+                if code == DECLINE_EXIT_CODE {
+                    // Nix now builds it itself, without clearing the
+                    // output paths first: some of its builders write in
+                    // place. Leave nothing there of ours.
+                    for path in written.drain() {
+                        remove_tree(Path::new(&path));
+                    }
                 }
                 return Ok(Outcome::Done(code));
             }
@@ -318,7 +338,8 @@ async fn handle_output_chunk(
 }
 
 /// Stop in-flight unpackers; partial trees stay at the output paths
-/// and are removed before the next unpack of the same path.
+/// and are removed before the next unpack of the same path, or by a
+/// decline.
 async fn cleanup_unpackers(unpackers: &mut HashMap<String, Unpacker>) {
     for (_, (tx, task)) in unpackers.drain() {
         drop(tx);
@@ -328,7 +349,16 @@ async fn cleanup_unpackers(unpackers: &mut HashMap<String, Unpacker>) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+    use std::vec::IntoIter;
+
+    use tokio_stream::wrappers::UnixListenerStream;
+    use tonic::transport::Server;
+    use tonic::{Request, Response, Status, Streaming};
+
     use super::*;
+    use crate::proto::AttachEvent;
+    use crate::proto::attach_hub_server::{AttachHub, AttachHubServer};
 
     /// zstd-compressed NAR of a single regular file, as the hub streams it.
     fn zstd_nar_of_file(dir: &Path, body: &[u8]) -> Vec<u8> {
@@ -382,5 +412,87 @@ mod tests {
 
         assert!(unpackers.is_empty());
         assert_eq!(fs::read(&out).unwrap(), b"fresh");
+    }
+
+    /// A hub answering each build with the next of its scripts of events,
+    /// and all after the last with the last.
+    struct Scripted(Mutex<Vec<Vec<attach_event::Event>>>);
+
+    #[tonic::async_trait]
+    impl AttachHub for Scripted {
+        type BuildStream = tokio_stream::Iter<IntoIter<Result<AttachEvent, Status>>>;
+
+        async fn build(
+            &self,
+            request: Request<Streaming<BuildMessage>>,
+        ) -> Result<Response<Self::BuildStream>, Status> {
+            let mut submission = request.into_inner();
+            while let Ok(Some(_)) = submission.message().await {}
+            let event = |e| Ok(AttachEvent { event: Some(e) });
+            let mut scripts = self.0.lock().unwrap();
+            let script = if scripts.len() > 1 {
+                scripts.remove(0)
+            } else {
+                scripts[0].clone()
+            };
+            let events: Vec<_> = script.into_iter().map(event).collect();
+            Ok(Response::new(tokio_stream::iter(events)))
+        }
+    }
+
+    /// The socket of a hub in `dir` answering its builds with `scripts`.
+    fn hub(dir: &Path, scripts: Vec<Vec<attach_event::Event>>) -> PathBuf {
+        let socket = dir.join("hub.sock");
+        let incoming = UnixListenerStream::new(tokio::net::UnixListener::bind(&socket).unwrap());
+        let scripted = Scripted(Mutex::new(scripts));
+        tokio::spawn(
+            Server::builder()
+                .add_service(AttachHubServer::new(scripted))
+                .serve_with_incoming(incoming),
+        );
+        socket
+    }
+
+    /// A build declined after one output was delivered and another in
+    /// part (OutputRestart for both, then exit 222) leaves neither tree,
+    /// nor one written in part to a hub gone before: Nix builds it next,
+    /// in place on Darwin or without a sandbox. The hub goes away once,
+    /// and run_async connects again.
+    #[tokio::test]
+    async fn a_decline_leaves_no_output_tree_attach_wrote() {
+        let dir = tempfile::tempdir().unwrap();
+        let outs = ["earlier", "whole", "part"].map(|o| dir.path().join(o));
+        let [earlier, whole, part] = outs.map(|o| o.to_string_lossy().into_owned());
+        let chunk = zstd_nar_of_file(dir.path(), b"output");
+        let output = |path: &str, chunk: &[u8], eof| {
+            attach_event::Event::Output(OutputNar {
+                store_path: path.to_owned(),
+                zstd_nar_chunk: chunk.to_vec(),
+                eof,
+            })
+        };
+        let gone = vec![output(&earlier, &chunk, false)];
+        let declining = vec![
+            output(&whole, &chunk, false),
+            output(&whole, &[], true),
+            output(&part, &chunk, false),
+            attach_event::Event::OutputRestart(whole.clone()),
+            attach_event::Event::OutputRestart(part.clone()),
+            attach_event::Event::ExitCode(DECLINE_EXIT_CODE),
+        ];
+        let socket = hub(dir.path(), vec![gone, declining]);
+        let top = dir.path().join("top");
+        fs::create_dir_all(top.join("build")).unwrap();
+        let build = serde_json::json!({
+            "version": 1, "builder": "", "args": [], "env": {}, "inputPaths": [],
+            "topTmpDir": top, "tmpDirInSandbox": "/build", "storeDir": "/nix/store",
+            "system": "x86_64-linux",
+            "outputs": {"earlier": earlier, "whole": whole, "part": part},
+        });
+        let build = serde_json::from_value(build).unwrap();
+        let code = run_async(build, socket).await.unwrap();
+        assert_eq!(code, DECLINE_EXIT_CODE);
+        let left = [earlier, whole, part].map(|p| fs::symlink_metadata(&p).map(|_| p).ok());
+        assert_eq!(left, [None, None, None], "trees left");
     }
 }
