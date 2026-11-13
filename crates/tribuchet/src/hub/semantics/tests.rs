@@ -137,6 +137,7 @@ impl World {
             .filter(|((k, _), (_, hub))| *k == key && *hub == self.hubs)
             .map(|((_, c), _)| *c)
             .collect();
+        assert!(!clients.is_empty(), "an answer reaches a client");
         for c in clients {
             let can_local = self.open.remove(&(key, *c)).map(|o| o.0);
             assert!(can_local.is_some(), "L2: one answer per waiting client");
@@ -244,7 +245,10 @@ impl World {
             }
             Act::Leave(key, client) => {
                 self.open.remove(&(key, client));
+                let live = |h: &Hub| h.builds.get(&key).and_then(|b| b.live);
+                let before = live(&self.hub);
                 self.send(Event::Leave { key, client });
+                assert_eq!(live(&self.hub), before, "L9: a leave keeps the live run");
             }
             Act::Connect(w) => {
                 let wk = &mut self.wk[w];
@@ -402,6 +406,8 @@ impl World {
             }
         }
         for (k, b) in &self.hub.builds {
+            let wanted = !b.clients.is_empty() || b.live.is_some();
+            assert!(wanted, "C27: a build no client or run wants ends");
             let evidence = self.evidence.contains(k);
             assert!(
                 !b.lost || evidence,
