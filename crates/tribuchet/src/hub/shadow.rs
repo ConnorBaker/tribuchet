@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::mem;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::atomic::{AtomicU32, Ordering::Relaxed};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use super::losses::Loss;
@@ -54,18 +55,20 @@ pub(super) struct Mirror {
     /// The last number given a run first heard of from a worker: down from
     /// the top, the core's own count up.
     held: sem::Run,
-    clients: sem::Client,
     /// Each waiting build's events, for the warnings; freed as it ends.
     seen: HashMap<sem::Key, Vec<String>>,
     /// Divergences, logged once the lock is let go (Shadow::with).
     warnings: Vec<Warning>,
 }
 
+/// The last number given a client (0: untracked), in the hub's log as in the core.
+static CLIENTS: AtomicU32 = AtomicU32::new(0);
+
 /// A client reading a build; dropped once it stops (the core's Leave).
 pub(super) struct Client {
     shadow: Option<Arc<Shadow>>,
     key: sem::Key,
-    id: sem::Client,
+    pub(super) id: sem::Client,
     /// Whether its own Nix can build the key (canLocal).
     pub(super) can_local: bool,
 }
@@ -73,6 +76,9 @@ pub(super) struct Client {
 impl Drop for Client {
     fn drop(&mut self) {
         let (key, client) = (self.key, self.id);
+        if client != 0 {
+            tracing::info!(key = format_args!("{key:08x}"), client, "client left");
+        }
         if let Some(s) = self.shadow.take() {
             s.with(|m| _ = m.feed("leave", &[], vec![Event::Leave { key, client }]));
         }
@@ -287,12 +293,11 @@ impl Shadow {
     /// A client asks for `key`; it leaves as the returned Client drops.
     pub(super) fn submit(self: &Arc<Self>, k: &str, sys: Sys, can_local: bool) -> Client {
         let mut c = Client::untracked(can_local);
+        let Some(key) = key(k) else { return c };
+        (c.key, c.id) = (key, CLIENTS.fetch_add(1, Relaxed) + 1);
         self.with(|m| {
-            let (Some(key), sys) = (key(k), m.system(sys.0, sys.1)) else {
-                return;
-            };
-            m.clients += 1;
-            (c.shadow, c.key, c.id) = (Some(self.clone()), key, m.clients);
+            let sys = m.system(sys.0, sys.1);
+            c.shadow = Some(self.clone());
             m.feed(
                 "submit",
                 &[],
@@ -314,8 +319,7 @@ impl Shadow {
             let (Some(key), sys) = (key(k), m.system(sys.0, sys.1)) else {
                 return;
             };
-            m.clients += 1;
-            let client = m.clients;
+            let client = CLIENTS.fetch_add(1, Relaxed) + 1;
             let choice = if can_local {
                 Event::Defer { key, client }
             } else {
