@@ -442,7 +442,8 @@ async fn lose_bulk(bulk: mpsc::Sender<Result<HubMessage, Status>>) {
         ..Need::default()
     };
     router.route(worker_message::Msg::Need(need)).await;
-    settled.await.unwrap();
+    let settled = tokio::time::timeout(2 * SILENCE_TIMEOUT, settled).await;
+    settled.expect("still sending").unwrap();
     let m = &state.metrics;
     let counts = [&m.failed, &m.requeued].map(|c| c.load(Ordering::Relaxed));
     assert_eq!(counts, [0, 1], "failed, requeued");
