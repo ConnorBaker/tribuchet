@@ -22,6 +22,7 @@
 #![allow(clippy::too_many_lines, clippy::struct_field_names)]
 
 mod arbiter;
+mod canlocal;
 mod daemon;
 mod fod_ipv6;
 mod harness;
@@ -201,28 +202,6 @@ fn build_impure() {
          -f /etc/tt/impure.nix --no-link --print-out-paths",
     );
     succeed(Node::Hub, &format!("grep -q impure-ok {}", out.trim()));
-}
-
-#[test]
-fn build_kvm() {
-    if run(Node::Worker, "test -e /dev/kvm").code == 0 {
-        build_grep("/etc/tt/kvm.nix", "kvm-ok");
-    } else {
-        // No worker serves the kvm feature and the hub cannot build it
-        // locally, so the declined build (exit 222) fails.
-        let err = fail(Node::Hub, "nix-build /etc/tt/kvm.nix --no-out-link 2>&1");
-        assert!(err.contains("exit code 222"), "{err}");
-    }
-}
-
-#[test]
-fn build_kvm_emulated() {
-    // An emulated system must not inherit the host's kvm feature.
-    let err = fail(
-        Node::Hub,
-        "nix-build /etc/tt/kvm-emulated.nix --no-out-link 2>&1",
-    );
-    assert!(err.contains("exit code 222"), "{err}");
 }
 
 /// build-memory-max-bytes OOM-kills the builder, exit code 137, and
@@ -574,6 +553,7 @@ fn lifecycle() {
         &format!("grep -q 'fallback-payload built-locally' {}", out.trim()),
     );
     assert_journal(Node::Hub, "tribuchet-hub", "no capable worker; declining");
+    canlocal::declined("tt-fallback-build", "x86_64-linux", true);
 
     // --- the restarted worker re-adopts and delivers the stopped build ----
     succeed(Node::Worker, "systemctl start tribuchet-worker");

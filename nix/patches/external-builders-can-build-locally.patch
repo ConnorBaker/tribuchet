@@ -1,0 +1,304 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Connor Baker <ConnorBaker01@gmail.com>
+Date: Fri, 13 Nov 2026 08:40:19 -0800
+Subject: [PATCH] libstore: tell an external builder whether Nix would build
+ locally
+
+Carried for Tribuchet. An external builder may decline a build by
+exiting with status 222, and Nix then builds the derivation itself if
+it can: the platform is this system's (or an extra platform, or the
+derivation is builtin), the store has every required system feature,
+and max-jobs is nonzero. Tribuchet must only decline a build that Nix
+will then build, but its attach shim could only approximate that test
+from `nix config show`, which cannot see a trusted client's settings
+for one daemon connection.
+
+Compute the test once per local build, in a single function, and use
+that one value both for the fallback after a decline and for a new
+`canBuildLocally` boolean in build.json, so the two cannot disagree.
+The settings it reads are the ones the decline fallback already read;
+in a daemon they include the client's settings for that connection,
+because each connection runs in its own worker process.
+
+An external build takes a local build slot, so with max-jobs 0 the
+external builder never runs at all; the new test pins that down too.
+
+Assisted-by: Claude Code (Claude Opus 5.5)
+---
+ .../build/derivation-building-goal.cc         | 46 ++++++-----
+ .../nix/store/build/derivation-builder.hh     |  6 +-
+ .../store/build/derivation-building-goal.hh   | 10 +++
+ .../unix/build/external-derivation-builder.cc | 15 +++-
+ tests/functional/external-builders-decline.sh | 82 +++++++++++++++++++
+ tests/functional/meson.build                  |  1 +
+ 6 files changed, 136 insertions(+), 24 deletions(-)
+ create mode 100644 tests/functional/external-builders-decline.sh
+
+diff --git a/src/libstore/build/derivation-building-goal.cc b/src/libstore/build/derivation-building-goal.cc
+index 8aab043..709e828 100644
+--- a/src/libstore/build/derivation-building-goal.cc
++++ b/src/libstore/build/derivation-building-goal.cc
+@@ -861,6 +861,16 @@ Goal::Co DerivationBuildingGoal::buildWithHook(
+ #endif
+ }
+ 
++bool DerivationBuildingGoal::canBuildLocally(const DerivationOptions<StorePath> & drvOptions)
++{
++    bool platformOk = drv->platform == settings.thisSystem.get() || settings.extraPlatforms.get().count(drv->platform)
++                      || drv->isBuiltin();
++    auto required = drvOptions.getRequiredSystemFeatures(*drv);
++    auto & available = worker.store.config.systemFeatures.get();
++    bool featuresOk = std::ranges::all_of(required, [&](const std::string & f) { return available.count(f); });
++    return worker.settings.maxBuildJobs.get() != 0 && platformOk && featuresOk;
++}
++
+ Goal::Co DerivationBuildingGoal::buildLocally(
+     LocalBuildCapability localBuildCap,
+     StorePathSet inputPaths,
+@@ -870,6 +880,10 @@ Goal::Co DerivationBuildingGoal::buildLocally(
+ {
+     co_await yield();
+ 
++    /* Computed once, so an external builder is told exactly what Nix
++       will do if it declines. */
++    const bool canBuildHere = canBuildLocally(drvOptions);
++
+ #ifdef _WIN32 // TODO enable `DerivationBuilder` on Windows
+     throw UnimplementedError("building derivations is not yet implemented on Windows");
+ #else
+@@ -995,7 +1009,8 @@ Goal::Co DerivationBuildingGoal::buildLocally(
+                                 localBuildCap.localStore,
+                                 std::make_shared<DerivationBuildingGoalCallbacks>(*this, openLogFile, closeLogFile),
+                                 std::move(params),
+-                                *localBuildCap.externalBuilder)
++                                *localBuildCap.externalBuilder,
++                                canBuildHere)
+                           : makeDerivationBuilder(
+                                 localBuildCap.localStore,
+                                 std::make_shared<DerivationBuildingGoalCallbacks>(*this, openLogFile, closeLogFile),
+@@ -1060,25 +1075,16 @@ Goal::Co DerivationBuildingGoal::buildLocally(
+ 
+         /* External builder declined; build locally if this host can. */
+         if (localBuildCap.externalBuilder && WIFEXITED(e.builderStatus)
+-            && WEXITSTATUS(e.builderStatus) == externalBuilderDeclinedExitCode) {
+-            bool platformOk = drv->platform == settings.thisSystem.get()
+-                              || settings.extraPlatforms.get().count(drv->platform) || drv->isBuiltin();
+-            auto required = drvOptions.getRequiredSystemFeatures(*drv);
+-            auto & available = worker.store.config.systemFeatures.get();
+-            bool featuresOk =
+-                std::ranges::all_of(required, [&](const std::string & f) { return available.count(f); });
+-            if (worker.settings.maxBuildJobs.get() != 0 && platformOk && featuresOk) {
+-                debug(
+-                    "external builder declined '%s'; falling back to a local build",
+-                    worker.store.printStorePath(drvPath));
+-                localBuildCap.externalBuilder = nullptr;
+-                co_return buildLocally(
+-                    std::move(localBuildCap),
+-                    std::move(inputPaths),
+-                    std::move(initialOutputs),
+-                    std::move(drvOptions),
+-                    std::move(outputLocks));
+-            }
++            && WEXITSTATUS(e.builderStatus) == externalBuilderDeclinedExitCode && canBuildHere) {
++            debug(
++                "external builder declined '%s'; falling back to a local build", worker.store.printStorePath(drvPath));
++            localBuildCap.externalBuilder = nullptr;
++            co_return buildLocally(
++                std::move(localBuildCap),
++                std::move(inputPaths),
++                std::move(initialOutputs),
++                std::move(drvOptions),
++                std::move(outputLocks));
+         }
+ 
+         outputLocks.unlock();
+diff --git a/src/libstore/include/nix/store/build/derivation-builder.hh b/src/libstore/include/nix/store/build/derivation-builder.hh
+index fef384d..b9803b6 100644
+--- a/src/libstore/include/nix/store/build/derivation-builder.hh
++++ b/src/libstore/include/nix/store/build/derivation-builder.hh
+@@ -246,12 +246,16 @@ DerivationBuilderUnique makeDerivationBuilder(
+ /**
+  * @param handler Must be chosen such that it supports the given
+  * derivation.
++ *
++ * @param canBuildLocally Whether Nix builds the derivation itself if
++ * the external builder declines it; written to build.json.
+  */
+ DerivationBuilderUnique makeExternalDerivationBuilder(
+     LocalStore & store,
+     std::shared_ptr<DerivationBuilderCallbacks> miscMethods,
+     DerivationBuilderParams params,
+-    const ExternalBuilder & handler);
++    const ExternalBuilder & handler,
++    bool canBuildLocally);
+ #endif
+ 
+ } // namespace nix
+diff --git a/src/libstore/include/nix/store/build/derivation-building-goal.hh b/src/libstore/include/nix/store/build/derivation-building-goal.hh
+index 6a17f73..1fa056e 100644
+--- a/src/libstore/include/nix/store/build/derivation-building-goal.hh
++++ b/src/libstore/include/nix/store/build/derivation-building-goal.hh
+@@ -93,6 +93,16 @@ private:
+         DerivationOptions<StorePath> drvOptions,
+         PathLocks outputLocks);
+ 
++    /**
++     * Would this Nix build the derivation itself? Its platform must be
++     * this system's (or an extra platform, or builtin), this store must
++     * have every system feature it requires, and max-jobs must be
++     * nonzero. Nix falls back to a local build when an external builder
++     * declines exactly when this holds, and tells the external builder
++     * its value in build.json.
++     */
++    bool canBuildLocally(const DerivationOptions<StorePath> & drvOptions);
++
+     /**
+      * Is the build hook willing to perform the build?
+      */
+diff --git a/src/libstore/unix/build/external-derivation-builder.cc b/src/libstore/unix/build/external-derivation-builder.cc
+index 7241c83..86e665b 100644
+--- a/src/libstore/unix/build/external-derivation-builder.cc
++++ b/src/libstore/unix/build/external-derivation-builder.cc
+@@ -9,13 +9,17 @@ struct ExternalDerivationBuilder : DerivationBuilderImpl
+ {
+     ExternalBuilder externalBuilder;
+ 
++    bool canBuildLocally;
++
+     ExternalDerivationBuilder(
+         LocalStore & store,
+         std::shared_ptr<DerivationBuilderCallbacks> miscMethods,
+         DerivationBuilderParams params,
+-        ExternalBuilder externalBuilder)
++        ExternalBuilder externalBuilder,
++        bool canBuildLocally)
+         : DerivationBuilderImpl(store, miscMethods, std::move(params))
+         , externalBuilder(std::move(externalBuilder))
++        , canBuildLocally(canBuildLocally)
+     {
+         experimentalFeatureSettings.require(Xp::ExternalBuilders);
+     }
+@@ -69,6 +73,9 @@ struct ExternalDerivationBuilder : DerivationBuilderImpl
+         json.emplace("system", drv.platform);
+         json.emplace("timeout", settings.getWorkerSettings().buildTimeout.get());
+         json.emplace("maxSilentTime", settings.getWorkerSettings().maxSilentTime.get());
++        /* Whether Nix builds the derivation itself if this builder
++           declines it (exits with `externalBuilderDeclinedExitCode`). */
++        json.emplace("canBuildLocally", canBuildLocally);
+         {
+             auto l = nlohmann::json::array();
+             for (auto & i : inputPaths)
+@@ -126,9 +133,11 @@ DerivationBuilderUnique makeExternalDerivationBuilder(
+     LocalStore & store,
+     std::shared_ptr<DerivationBuilderCallbacks> miscMethods,
+     DerivationBuilderParams params,
+-    const ExternalBuilder & handler)
++    const ExternalBuilder & handler,
++    bool canBuildLocally)
+ {
+-    return DerivationBuilderUnique(new ExternalDerivationBuilder(store, miscMethods, std::move(params), handler));
++    return DerivationBuilderUnique(
++        new ExternalDerivationBuilder(store, miscMethods, std::move(params), handler, canBuildLocally));
+ }
+ 
+ } // namespace nix
+diff --git a/tests/functional/external-builders-decline.sh b/tests/functional/external-builders-decline.sh
+new file mode 100644
+index 0000000..d2a5396
+--- /dev/null
++++ b/tests/functional/external-builders-decline.sh
+@@ -0,0 +1,82 @@
++#!/usr/bin/env bash
++
++# An external builder may decline a build (exit 222). Nix then builds the
++# derivation itself if it can, and build.json's `canBuildLocally` says in
++# advance whether it will.
++
++source common.sh
++
++TODO_NixOS
++
++needLocalStore "starts its own daemon"
++
++expr="$TEST_ROOT/expr.nix"
++cat > "$expr" <<EOF
++{ name, system ? null, features ? [] }:
++with import ${config_nix};
++mkDerivation ({
++  inherit name;
++  requiredSystemFeatures = features;
++  buildCommand = "echo local > \$out";
++} // (if system == null then {} else { inherit system; }))
++EOF
++
++# Records `canBuildLocally` per derivation name, then declines.
++external_builder="$TEST_ROOT/external-builder.sh"
++cat > "$external_builder" <<EOF
++#! $SHELL -e
++PATH=${PATH@Q}
++jq -r .canBuildLocally < "\$1" > "$TEST_ROOT/can-\$(jq -r .env.name < "\$1")"
++printf "\2\n"
++exit 222
++EOF
++chmod +x "$external_builder"
++
++foreign=x68_46-xunil
++builders="[{\"systems\": [\"$system\", \"$foreign\"], \"args\": [], \"program\": \"$external_builder\"}]"
++
++# Build derivation NAME (further arguments go to `nix build`), check that
++# build.json said EXPECTED, and that the fallback agreed: the build
++# succeeds locally exactly when `canBuildLocally` is true.
++check() {
++    local name=$1 expected=$2
++    shift 2
++    local out
++    if [[ $expected = true ]]; then
++        out=$(nix build --no-link --print-out-paths --file "$expr" --argstr name "$name" "$@")
++        [[ $(cat "$out") = local ]]
++    else
++        expectStderr 1 nix build --no-link --file "$expr" --argstr name "$name" "$@" \
++            | grepQuiet "exit code 222"
++    fi
++    [[ $(cat "$TEST_ROOT/can-$name") = "$expected" ]]
++}
++
++ext=(--extra-experimental-features external-builders --external-builders "$builders")
++
++# This system, nothing required: Nix builds it.
++check local-ok true "${ext[@]}"
++
++# A required system feature this store lacks: Nix does not.
++check local-feature false "${ext[@]}" --arg features '["canlocal-missing-feature"]'
++
++# A foreign system: Nix does not, unless it is an extra platform.
++check local-foreign false "${ext[@]}" --argstr system "$foreign"
++check local-foreign-extra true "${ext[@]}" --argstr system "$foreign" --extra-platforms "$foreign"
++
++# Through the daemon, the trusted client's per-connection settings count.
++cat >> "$test_nix_conf" <<EOF
++extra-experimental-features = external-builders
++external-builders = $builders
++EOF
++startDaemon
++
++check daemon-ok true
++check daemon-foreign false --argstr system "$foreign"
++check daemon-foreign-extra true --argstr system "$foreign" --extra-platforms "$foreign"
++
++# An external build takes a local build slot, so with max-jobs 0 the
++# external builder never runs and never sees `canBuildLocally` false.
++expectStderr 1 nix build --no-link --file "$expr" --argstr name daemon-no-jobs --max-jobs 0 \
++    | grepQuiet "Unable to start any build"
++[[ ! -e "$TEST_ROOT/can-daemon-no-jobs" ]]
+diff --git a/tests/functional/meson.build b/tests/functional/meson.build
+index 8fdaf4f..c235d02 100644
+--- a/tests/functional/meson.build
++++ b/tests/functional/meson.build
+@@ -91,6 +91,7 @@ suites = [
+       'export-graph.sh',
+       'export.sh',
+       'external-builders.sh',
++      'external-builders-decline.sh',
+       'extra-sandbox-profile.sh',
+       'fetchClosure.sh',
+       'fetchGit.sh',

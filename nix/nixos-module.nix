@@ -147,10 +147,12 @@ in
           so a declined build (no worker for the system) falls back to a
           local build instead of failing, and so a build's `timeout` and
           `max-silent-time` reach the worker, which counts only running
-          time toward them. Set false, `nixPackage` must carry all three
-          patches (nix/patches) itself: without the timeouts one, Nix
-          counts a build's timeouts by the wall clock from its start, and
-          so kills builds the CPU arbiter froze for time they did not run.
+          time toward them, and so build.json says whether Nix would
+          build a declined build itself (`canBuildLocally`). Set false,
+          `nixPackage` must carry all four patches (nix/patches) itself:
+          without the timeouts one, Nix counts a build's timeouts by the
+          wall clock from its start, and so kills builds the CPU arbiter
+          froze for time they did not run.
         '';
       };
     };
@@ -232,6 +234,7 @@ in
             ./patches/external-builders-uid-range.patch
             ./patches/external-builders-decline-fallback.patch
             ./patches/external-builders-timeouts.patch
+            ./patches/external-builders-can-build-locally.patch
           ];
         in
         if patches == [ ] then
