@@ -179,17 +179,13 @@ fn delivery_flaps() -> Vec<(Take, Said)> {
     flaps
 }
 
-/// The loss policy, each row a sequence of losses:
-/// a build survives MAX_JOB_ATTEMPTS genuine losses and the next fails
-/// it, and MAX_TRANSPORT_LOSSES losses in transport, the next declining it.
-/// The caps are pinned by number, so that changing one is a decision.
+/// The loss policy, each row a sequence of losses: a build survives
+/// MAX_JOB_ATTEMPTS genuine losses and MAX_TRANSPORT_LOSSES losses in
+/// transport, the next declining it to its client, whose Nix builds it;
+/// a lost run never fails it (SEMANTICS-7 L12). The caps are pinned by
+/// number, so that changing one is a decision.
 #[tokio::test]
 async fn each_sequence_of_losses_counts_as_decided() {
-    let genuine = |n| {
-        Err(Failed(format!(
-            "build lost {n} times without a worker resuming it; giving up"
-        )))
-    };
     let rows = [
         // Each worker dies with the build staged and another takes it:
         // no run of it was lost, but its transfer, and the 13th such loss
@@ -203,12 +199,13 @@ async fn each_sequence_of_losses_counts_as_decided() {
         // So does the 13th session dying before its worker answered.
         (vec![(Fresh("w"), Nothing); 13], Fresh("w"), Err(Declined)),
         // A run that started, its worker back without it, is a genuine
-        // loss: one that kills its worker every time fails at the fourth.
+        // loss: one that kills its worker every time is declined at the
+        // fourth.
         (vec![(Fresh("w"), Started)], Fresh("w"), Ok((1, 0, false))),
         // Its worker not back within the grace may run it still: a loss
         // in transport.
         (vec![(Fresh("w1"), Started)], Fresh("w2"), Ok((0, 1, false))),
-        (vec![(Fresh("w"), Started); 4], Fresh("w"), genuine(4)),
+        (vec![(Fresh("w"), Started); 4], Fresh("w"), Err(Declined)),
         // A finished run whose delivery dies with the session every time
         // is lost in transport, never failed: the 13th declines it.
         (delivery_flaps(), Back("w1"), Err(Declined)),
@@ -272,28 +269,66 @@ async fn each_sequence_of_losses_counts_as_decided() {
     assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
-/// A build with network the farm keeps losing in transport is never
-/// declined, which would build it in the client host's own network: it
-/// keeps waiting for a worker. So does one its client's Nix would not
-/// build (canLocal false), which declining would fail.
+/// A build with network the farm keeps losing, in transport or with its
+/// runs, is never declined, which would build it in the client host's
+/// own network, and never failed (SEMANTICS-7 L12): it keeps waiting
+/// for a worker. So does one its client's Nix would not build (canLocal
+/// false), which declining would fail.
 #[tokio::test]
 async fn a_build_with_network_lost_in_transport_keeps_waiting() {
     let rows = [
-        (vec![(Fresh("w"), Staged); 13], Fresh("w"), false),
-        (vec![(Fresh("w"), Nothing); 13], Fresh("w"), false),
-        (delivery_flaps(), Back("w1"), true),
-        (vec![(Back("w1"), Resumed); 13], Back("w1"), true),
+        (vec![(Fresh("w"), Staged); 13], Fresh("w"), (0, 13, false)),
+        (vec![(Fresh("w"), Nothing); 13], Fresh("w"), (0, 13, false)),
+        (delivery_flaps(), Back("w1"), (0, 13, true)),
+        (vec![(Back("w1"), Resumed); 13], Back("w1"), (0, 13, true)),
+        (vec![(Fresh("w"), Started); 5], Fresh("w"), (5, 0, false)),
     ];
     let mut wrong = Vec::new();
     for kind in [(true, true), (false, false)] {
-        for (n, (lost, take, pending)) in rows.clone().into_iter().enumerate() {
+        for (n, (lost, take, counted)) in rows.clone().into_iter().enumerate() {
             let after = after_losses(kind, &lost, take).await;
-            if after != Ok((0, 13, pending)) {
+            if after != Ok(counted) {
                 wrong.push(format!("{kind:?} row {n}: {after:?}"));
             }
         }
     }
     assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// At a loss cap each client is answered on its own (SEMANTICS-7 L12):
+/// one whose Nix builds the key is declined, while one whose Nix cannot
+/// keeps waiting, the build still handed out, whichever came first.
+#[tokio::test]
+async fn at_a_loss_cap_only_clients_whose_nix_builds_it_are_declined() {
+    for first_local in [true, false] {
+        let state = Arc::new(HubState::for_test(Duration::ZERO));
+        let mut first = queued_build(&state, (false, first_local)).await;
+        let replay = state.queue.lock().await[0].replay.clone();
+        let mut second = (replay.subscribe_as(shadow::Client::untracked(!first_local))).await;
+        for _ in 0..=MAX_JOB_ATTEMPTS {
+            let (j, w) = taken(&state, Fresh("w")).await.expect("not handed out");
+            let msgs = said(&j, Started);
+            lose_session(&state, j, w, msgs).await;
+        }
+        // The take after the last loss counts it, past the cap.
+        let again = taken(&state, Fresh("w")).await.map(|(j, _)| j.attempts);
+        assert_eq!(again, Some(MAX_JOB_ATTEMPTS + 1), "{first_local}");
+        let (local, waits) = if first_local {
+            (&mut first, &mut second)
+        } else {
+            (&mut second, &mut first)
+        };
+        assert_eq!(verdict(local).await, Some(Declined), "{first_local}");
+        while let Ok(Ok(AttachEvent { event })) = waits.try_recv() {
+            let verdict = matches!(
+                event,
+                Some(attach_event::Event::ExitCode(_) | attach_event::Event::Error(_))
+            );
+            assert!(!verdict, "{first_local}: {event:?}");
+        }
+        assert_eq!(state.metrics.failed.load(Ordering::Relaxed), 0);
+        assert_eq!(replay.can_local(), [false], "{first_local}");
+    }
 }
 
 /// A worker whose session drops comes back holding the build and is

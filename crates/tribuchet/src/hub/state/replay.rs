@@ -4,7 +4,7 @@ use std::collections::{HashMap, VecDeque};
 use std::mem;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
 use tokio::sync::{Mutex, Notify, mpsc};
@@ -22,7 +22,8 @@ use crate::chunker::Recipe;
 use crate::chunkstore::{Hash, PinGuard};
 use crate::hub::chunkcache::ChunkCache;
 use crate::hub::shadow::Client;
-use crate::proto::{AttachEvent, OutputNar, attach_event};
+use crate::proto::{AttachEvent, DECLINE_EXIT_CODE, OutputNar, attach_event};
+use listener::Listener;
 
 /// Said to a client that missed log lines, before what follows them.
 const TRUNCATED: &str =
@@ -54,7 +55,7 @@ pub(in crate::hub) struct Replay {
     hold: StdMutex<Hold>,
     /// Each client, and whether its own Nix can build the key (canLocal):
     /// a client's, not the build's, since clients sharing a key may differ.
-    clients: StdMutex<Vec<(mpsc::WeakSender<Result<AttachEvent, Status>>, bool)>>,
+    clients: StdMutex<Vec<Listener>>,
 }
 
 #[derive(Default)]
@@ -186,15 +187,26 @@ enum Next {
     Resubmit,
     /// Behind what the log keeps, the build still on.
     Exhausted,
+    /// Declined, and sent all the log before its decline but for the
+    /// restarts of these outputs, which it is sent now.
+    Declined(Vec<String>),
     Wait,
 }
 
 impl ReplayInner {
-    /// The step after `c`.
-    fn next(&self, c: &mut Cursor) -> Next {
+    /// The step after `c`, for a client declined at `declined` if it was.
+    fn next(&self, c: &mut Cursor, declined: Option<usize>) -> Next {
         loop {
+            if declined.is_some_and(|d| c.at >= d) {
+                return Next::Declined(Vec::new());
+            }
             let (held, gone) = if c.at < self.base {
                 if c.at < self.forgot {
+                    // Declined, it needs none of the log, only to drop
+                    // every output it may have part of.
+                    if declined.is_some() {
+                        return Next::Declined(self.paths.keys().cloned().collect());
+                    }
                     return match self.ended {
                         Some(_) => Next::Resubmit,
                         None => Next::Exhausted,
@@ -219,6 +231,11 @@ impl ReplayInner {
                 }
             };
             let i = held.seq;
+            // What a trimmed log kept next may come after the decline.
+            if let Some(d) = declined.filter(|&d| i >= d) {
+                c.at = d;
+                continue;
+            }
             c.at = i + 1;
             match held.event.event.as_ref() {
                 Some(attach_event::Event::Log(_)) => {
@@ -303,8 +320,9 @@ impl ReplayInner {
 /// verdict. Its stream ends without one once the build ended without one,
 /// or a chunk it needs left the cache: attach then resubmits (attach.rs).
 /// Behind what the log keeps while the build runs, it is refused
-/// (EXHAUSTED), which attach does not retry. The client leaves as it ends.
-async fn read(replay: Arc<Replay>, tx: EventTx, _client: Client) {
+/// (EXHAUSTED), which attach does not retry. Declined, it is sent the log
+/// before its decline, then exit 222. The client leaves as it ends.
+async fn read(replay: Arc<Replay>, tx: EventTx, _client: Client, declined: Arc<OnceLock<usize>>) {
     let id = &replay.id;
     let mut c = Cursor {
         behind: replay.inner.lock().await.ended.is_some(),
@@ -314,7 +332,11 @@ async fn read(replay: Arc<Replay>, tx: EventTx, _client: Client) {
         let grew = replay.grew.notified();
         tokio::pin!(grew);
         grew.as_mut().enable();
-        let next = replay.inner.lock().await.next(&mut c);
+        let next = replay
+            .inner
+            .lock()
+            .await
+            .next(&mut c, declined.get().copied());
         let ev = match next {
             Next::Send(ev) => ev,
             Next::Read(kept, path, hash, size) => {
@@ -346,6 +368,15 @@ async fn read(replay: Arc<Replay>, tx: EventTx, _client: Client) {
                 break;
             }
             Next::Resubmit => break,
+            Next::Declined(restarts) => {
+                let restarts = restarts.into_iter().map(attach_event::Event::OutputRestart);
+                for ev in restarts.chain([attach_event::Event::ExitCode(DECLINE_EXIT_CODE)]) {
+                    if tx.send(Ok(event(ev))).await.is_err() {
+                        break;
+                    }
+                }
+                break;
+            }
             Next::Exhausted => {
                 let _ = tx.send(Err(Status::resource_exhausted(EXHAUSTED))).await;
                 break;
@@ -439,10 +470,11 @@ impl Replay {
     ) -> mpsc::Receiver<Result<AttachEvent, Status>> {
         self.hold.lock().unwrap().clientless = None;
         let (tx, rx) = mpsc::channel(SUB_CHANNEL_SLACK);
-        (self.clients.lock().unwrap()).push((tx.downgrade(), client.can_local));
+        let (listener, declined) = Listener::new(&tx, &client);
+        self.clients.lock().unwrap().push(listener);
         // Before the reader, which takes it out when it ends.
         self.inner.lock().await.subs.push(tx.clone());
-        tokio::spawn(read(self.clone(), tx, client));
+        tokio::spawn(read(self.clone(), tx, client, declined));
         rx
     }
 
@@ -510,17 +542,6 @@ impl Replay {
         self.grew.notify_waiters();
     }
 
-    /// Whether each client still listening can build the key itself.
-    pub(in crate::hub) fn can_local(&self) -> Vec<bool> {
-        let open = |(c, l): &(mpsc::WeakSender<_>, _)| (!c.upgrade()?.is_closed()).then_some(*l);
-        self.clients
-            .lock()
-            .unwrap()
-            .iter()
-            .filter_map(open)
-            .collect()
-    }
-
     /// Any attach client still listening? Subscribers whose stream was
     /// dropped count as gone even before their readers prune them.
     pub(in crate::hub) async fn has_subscribers(&self) -> bool {
@@ -528,6 +549,9 @@ impl Replay {
         inner.subs.iter().any(|tx| !tx.is_closed())
     }
 }
+
+#[path = "replay/listener.rs"]
+mod listener;
 
 #[cfg(test)]
 #[path = "replay/tests.rs"]

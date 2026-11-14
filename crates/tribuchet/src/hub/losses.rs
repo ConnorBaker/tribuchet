@@ -20,9 +20,9 @@ use std::time::{Duration, Instant};
 
 use super::metrics::Metrics;
 use super::state::{Holding, HubState, Job, WorkerCaps};
-use crate::proto::{DECLINE_EXIT_CODE, RunId, attach_event};
+use crate::proto::RunId;
 
-/// Genuine losses a build survives; the next fails it.
+/// Genuine losses a build survives; the next declines it.
 pub(super) const MAX_JOB_ATTEMPTS: u32 = 3;
 /// Losses in transport a build survives, counted per build across
 /// workers; the next declines it. In 12 days of one deployed hub's
@@ -110,7 +110,7 @@ impl Loss {
 /// What a loss counts against.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum Charge {
-    /// Run evidence: MAX_JOB_ATTEMPTS, then the build fails.
+    /// Run evidence: MAX_JOB_ATTEMPTS, then the build is deferred.
     Genuine,
     /// Transport evidence: MAX_TRANSPORT_LOSSES, then the build is deferred.
     Transport,
@@ -180,44 +180,69 @@ pub(super) async fn count(state: &HubState, mut job: Job, charge: Charge) -> Opt
     if losses <= cap {
         return Some(job);
     }
-    if charge == Charge::Transport {
-        return defer(state, job, losses).await;
-    }
-    let err = format!("build lost {losses} times without a worker resuming it; giving up");
-    after_too_many_losses(state, job, err).await;
-    None
+    defer(state, job, (losses, lost)).await
 }
 
-/// The policy for a build whose run was lost more than MAX_JOB_ATTEMPTS
-/// times (a build that kills its worker, e.g. OOM, or workers that die
-/// under it). This is the only place it lives. It fails the build.
-async fn after_too_many_losses(state: &HubState, job: Job, err: String) {
-    tracing::warn!(id = job.id, "build failed: {err}");
-    Metrics::inc(&state.metrics.failed);
-    job.fail(state, "genuine-loss cap", None, err).await;
-    state.finish(&job).await;
-}
-
-/// A build the farm lost in transport too often goes back to its
-/// clients' Nix to build itself (DECLINE_EXIT_CODE), as one no worker
-/// serves does: their output transfers dropped first. Not one with
-/// network, which would run in the client host's own network, outside
-/// every fod-network policy: it keeps waiting for a worker. So does one a
-/// client's Nix would not build (canLocal false), which would fail it.
-async fn defer(state: &HubState, job: Job, losses: u32) -> Option<Job> {
-    if job.req.fixed_output || job.replay.can_local().contains(&false) {
+/// A build lost too often goes back to each client whose Nix builds it
+/// (exit 222), its output transfers dropped first. A lost run is no
+/// outcome (SEMANTICS-7 L12), so it never fails the build: the other
+/// clients, and all of a build with network (which would run in the
+/// client host's network, outside every fod-network policy), wait on.
+async fn defer(state: &HubState, job: Job, (losses, lost): (u32, &str)) -> Option<Job> {
+    if job.req.fixed_output || !job.replay.can_local().contains(&true) {
         return Some(job);
     }
-    state.shadow.deferred(&job);
+    job.restart_outputs().await;
+    let (declined, waiting) = job.replay.decline_local().await;
+    state.shadow.deferred(&job, &declined);
     tracing::warn!(
         id = job.id,
         losses,
-        "build lost in transport too often; declining it"
+        declined = declined.len(),
+        waiting,
+        "build lost {lost} too often; declining it to the clients whose Nix builds it"
     );
-    Metrics::inc(&state.metrics.declined);
-    job.restart_outputs().await;
-    let decline = attach_event::Event::ExitCode(DECLINE_EXIT_CODE);
-    job.replay.publish(decline).await;
+    if !declined.is_empty() {
+        Metrics::inc(&state.metrics.declined);
+    }
+    if waiting > 0 {
+        return Some(job);
+    }
     state.finish(&job).await;
     None
+}
+
+/// The hub cannot carry `job` at `point`: `err`, its own verdict, a fact
+/// about the hub (relay/daemon.rs), not an outcome of the build's
+/// (SEMANTICS-7 L12). Each client whose own Nix builds it is declined,
+/// which needs nothing of the hub's; the others fail with `err`.
+pub(super) async fn hub_cannot(
+    state: &HubState,
+    job: Job,
+    (point, run): (&str, Option<&RunId>),
+    err: String,
+) {
+    if !job.req.fixed_output && job.replay.can_local().contains(&true) {
+        job.restart_outputs().await;
+        let (declined, _) = job.replay.decline_local().await;
+        state.shadow.deferred(&job, &declined);
+        let n = declined.len();
+        tracing::warn!(
+            id = job.id,
+            point,
+            declined = n,
+            "hub cannot build it; declining: {err}"
+        );
+        if n > 0 {
+            Metrics::inc(&state.metrics.declined);
+        }
+    }
+    if job.replay.can_local().is_empty() {
+        state.shadow.abort(point, run);
+    } else {
+        tracing::warn!(id = job.id, point, "build failed: {err}");
+        Metrics::inc(&state.metrics.failed);
+        job.fail(state, point, run, err).await;
+    }
+    state.finish(&job).await;
 }

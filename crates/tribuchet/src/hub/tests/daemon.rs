@@ -7,13 +7,13 @@
 use super::fake_daemon::{Daemon, cached_input, error_of, hub_scripted, hub_with, told, worker};
 use super::*;
 use At::{After, Before};
-use Comes::{Dropped, Fails, GivenUp, Kept, Waits};
+use Comes::{Declined, Dropped, Fails, GivenUp, Kept, Waits};
 use relay::{DAEMON_ANSWER, DaemonEvidence};
 use state::{FLOOR, Inflight, Wait};
 
 use std::sync::atomic::AtomicU64;
 
-use crate::proto::Need;
+use crate::proto::{DECLINE_EXIT_CODE, Need};
 
 /// The worker lacks an input of the build it was assigned and asks
 /// for it, so the hub must look the path up in its daemon.
@@ -87,8 +87,12 @@ enum At {
 /// What a row's build comes to.
 #[derive(Clone, Copy)]
 enum Comes {
-    /// It fails, its client told this, and its worker told to cancel.
+    /// It fails, its client, whose Nix cannot build it, told this, and
+    /// its worker told to cancel.
     Fails(&'static str),
+    /// Where it would fail, its client, whose Nix builds it, is declined
+    /// instead (SEMANTICS-7 L12), and its worker told to cancel.
+    Declined,
     /// It waits through three failed attempts, its client told once.
     Waits,
     /// Its client left once the daemon took this many connections, and
@@ -107,13 +111,12 @@ enum Comes {
 const CRASHES: &str = "daemon worker 41 crashed\ndaemon worker 42 crashed\n\
     daemon worker 43 crashed\n";
 
-/// A failure of the daemon's fails the build, naming the cause, once its
-/// run reaches θ; any other keeps it waiting, before its assignment goes
-/// out and after, its client told once and no loss counted; a path the
-/// daemon lacks fails it; and a build whose client left is given up
-/// while its attempt waits on the daemon or backs off, but kept if the
-/// client is back within FLOOR. The first failed attempt with no client
-/// attached does not give the build up.
+/// A daemon failure whose run reaches θ, or a path the daemon lacks,
+/// fails the build naming the cause, but declines a client whose Nix
+/// builds it; any other waits, before the assignment and after, told
+/// once, no loss counted. A build whose client left is given up while it
+/// waits or backs off, kept if the client is back within FLOOR, and not
+/// given up at its first failed attempt with no client.
 #[test]
 fn a_staging_build_keeps_to_its_daemons_verdict() {
     let interrupted = Daemon::Says("interrupted by the user");
@@ -130,6 +133,9 @@ fn a_staging_build_keeps_to_its_daemons_verdict() {
         (Daemon::Foreign, None, After, Fails("wrong magic")),
         (Daemon::Lacks, None, After, Fails("is not a valid path")),
         (Daemon::Lacks, None, Before, Fails("is not a valid path")),
+        (Daemon::Lacks, None, Before, Declined),
+        (Daemon::Lacks, None, After, Declined),
+        (refusal, None, After, Declined),
         (interrupted, None, After, Waits),
         (interrupted, None, Before, Waits),
         (Daemon::Silent, None, After, Waits),
@@ -164,7 +170,8 @@ async fn comes_to(n: usize, daemon: Daemon, journal: Option<&str>, at: At, comes
     };
     *j.listing.lock().unwrap() = Inflight::list(&state.inflight, &j.key, Vec::new(), &j.replay);
     let replay = j.replay.clone();
-    let mut client = replay.subscribe().await;
+    let can_local = !matches!(comes, Fails(_));
+    let mut client = (replay.subscribe_as(shadow::Client::untracked(can_local))).await;
     let Worker {
         to_hub,
         mut from_hub,
@@ -191,7 +198,7 @@ async fn comes_to(n: usize, daemon: Daemon, journal: Option<&str>, at: At, comes
     let leaves = match comes {
         Comes::GivenUp(k) => Some(k),
         Comes::Dropped | Comes::Kept => Some(1),
-        Comes::Fails(_) | Comes::Waits => None,
+        Comes::Fails(_) | Comes::Declined | Comes::Waits => None,
     };
     let (_quiet, quiet) = mpsc::channel(1);
     let mut _wanting = None;
@@ -202,9 +209,14 @@ async fn comes_to(n: usize, daemon: Daemon, journal: Option<&str>, at: At, comes
     }
     let listed = || state.inflight.lock().unwrap().by_key.contains_key("k0");
     match comes {
-        Comes::Fails(says) => {
-            let error = error_of(&mut client).await;
-            assert!(error.contains(says), "row {n}: {error}");
+        Comes::Fails(_) | Comes::Declined => {
+            if let Comes::Fails(says) = comes {
+                let error = error_of(&mut client).await;
+                assert!(error.contains(says), "row {n}: {error}");
+            } else {
+                let code = exit_of(&mut client).await;
+                assert_eq!(code, Some(DECLINE_EXIT_CODE), "row {n}");
+            }
             let (_quiet, mut none) = mpsc::channel(1);
             let cancel = verdict_within(Duration::from_secs(1), &mut from_hub, &mut none).await;
             assert_eq!(cancel.as_deref(), Some("worker told to cancel"), "row {n}");
@@ -239,13 +251,27 @@ async fn comes_to(n: usize, daemon: Daemon, journal: Option<&str>, at: At, comes
         }
     }
     let failed = u64::from(matches!(comes, Comes::Fails(_)));
+    let declined = u64::from(matches!(comes, Comes::Declined));
     let count = |c: &AtomicU64| c.load(Ordering::Relaxed);
     let m = &state.metrics;
     assert_eq!(
-        (count(&m.failed), count(&m.requeued)),
-        (failed, 0),
+        (count(&m.failed), count(&m.declined), count(&m.requeued)),
+        (failed, declined, 0),
         "row {n}"
     );
+}
+
+/// The exit code `client` gets, within an hour; none if its stream ends.
+async fn exit_of(client: &mut mpsc::Receiver<Result<AttachEvent, Status>>) -> Option<i32> {
+    let code = tokio::time::timeout(Duration::from_hours(1), async {
+        while let Some(Ok(AttachEvent { event })) = client.recv().await {
+            if let Some(attach_event::Event::ExitCode(code)) = event {
+                return Some(code);
+            }
+        }
+        None
+    });
+    code.await.expect("no exit code within an hour")
 }
 
 /// A build backing off holds no connection to the daemon, so the other
