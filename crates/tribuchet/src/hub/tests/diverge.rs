@@ -16,23 +16,28 @@ fn request(system: &str, can_local: Option<bool>) -> BuildRequest {
     }
 }
 
-/// With no worker for its system the hub declines a client, and the core
-/// Defers it too if its Nix can build the key; if not, the core Refuses it.
+/// With no worker ever known for its system (L11), the hub declines a client
+/// whose Nix can build the key and refuses one whose Nix cannot, as the
+/// core Defers the one and Refuses the other.
 #[tokio::test]
-async fn declining_a_client_its_nix_cannot_build_is_a_divergence() {
+async fn no_known_worker_defers_or_refuses_each_client_as_the_core_does() {
     let log = Captured;
     let _guard = log.install();
     let state = Arc::new(HubState::for_test(Duration::ZERO));
-    for can_local in [true, false] {
-        let mut client = submit(&state, request("aarch64-linux", Some(can_local))).await;
-        while client.message().await.unwrap().is_some() {}
-        assert_eq!(log.count("shadow divergence"), usize::from(!can_local));
-    }
-    assert!(log.has(&["shadow divergence", "no capable worker", "answer: Refuse"]));
+    let mut client = submit(&state, request("aarch64-linux", Some(true))).await;
+    while client.message().await.unwrap().is_some() {}
+    let refused = try_submit(&state, request("aarch64-linux", Some(false))).await;
+    assert_eq!(
+        refused.err().map(|s| s.code()),
+        Some(tonic::Code::FailedPrecondition)
+    );
+    assert!(log.has(&["no known worker; refusing"]));
+    assert_eq!(log.count("shadow divergence"), 0);
 }
 
 /// A worker of the system without a feature the build requires does not
-/// serve it in the core either: the core Refuses the client.
+/// serve it in the core either: the hub refuses the client, and the core
+/// agrees (it takes a Refuse only while no worker serves the key).
 #[tokio::test]
 async fn a_worker_without_a_required_feature_does_not_serve_the_build() {
     let log = Captured;
@@ -44,9 +49,33 @@ async fn a_worker_without_a_required_feature_does_not_serve_the_build() {
     }
     let mut req = request("x86_64-linux", Some(false));
     req.required_features = vec!["kvm".into()];
-    let mut client = submit(&state, req).await;
-    while client.message().await.unwrap().is_some() {}
-    assert!(log.has(&["shadow divergence", "no capable worker", "answer: Refuse"]));
+    assert!(try_submit(&state, req).await.is_err(), "not refused");
+    assert!(log.has(&["no known worker; refusing"]));
+    assert_eq!(log.count("shadow divergence"), 0);
+}
+
+/// A worker that registered and left is still known (L11): a client whose
+/// Nix cannot build its system waits for it, told why, and is not refused.
+#[tokio::test]
+async fn a_client_whose_nix_cannot_build_waits_for_a_worker_gone() {
+    let log = Captured;
+    let _guard = log.install();
+    let state = Arc::new(HubState::for_test(Duration::ZERO));
+    let w = connect(&state, "w1", 1, &[]);
+    while state.worker_caps.lock().unwrap().is_empty() {
+        tokio::task::yield_now().await;
+    }
+    drop(w);
+    while !state.worker_caps.lock().unwrap().is_empty() {
+        tokio::task::yield_now().await;
+    }
+    let mut client = submit(&state, request("x86_64-linux", Some(false))).await;
+    let told = client.message().await.unwrap().and_then(|e| e.event);
+    let Some(attach_event::Event::Log(told)) = told else {
+        panic!("not told it waits: {told:?}");
+    };
+    assert!(String::from_utf8_lossy(&told).contains("waiting for one"));
+    assert!(!log.has(&["no known worker; refusing"]));
 }
 
 /// A run's own outcome answers its clients, in the core as in the hub.
@@ -285,7 +314,7 @@ async fn a_panic_in_the_core_turns_the_shadow_off() {
     let _guard = log.install();
     let state = Arc::new(HubState::for_test(Duration::ZERO));
     state.shadow.with(|_| panic!("planted"));
-    let mut client = submit(&state, request("aarch64-linux", Some(false))).await;
+    let mut client = submit(&state, request("aarch64-linux", Some(true))).await;
     let declined = client.message().await.unwrap().and_then(|e| e.event);
     assert_eq!(
         declined,
