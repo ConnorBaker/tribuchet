@@ -105,7 +105,26 @@ impl World {
             let done = held.iter().filter(|h| matches!(h.2, Phase::Finished(_)));
             self.told.extend(done.map(|h| h.0));
         }
-        for c in step(&mut self.hub, ev) {
+        let (marked, abort) = (self.hub.lost.clone(), matches!(ev, Event::Abort { .. }));
+        let live: BTreeMap<Run, Key> = (self.hub.builds.iter())
+            .filter_map(|(k, b)| Some((b.live?, *k)))
+            .collect();
+        let cmds = step(&mut self.hub, ev);
+        // An outcome taken: a Give, or (to no client) the run's release.
+        let took: BTreeSet<Key> = (cmds.iter())
+            .filter_map(|c| match c {
+                Command::Answer { key, answer, .. } => {
+                    matches!(answer, Answer::Give(_)).then_some(*key)
+                }
+                Command::Drop { run, .. } if !abort => live.get(run).copied(),
+                _ => None,
+            })
+            .collect();
+        for k in marked.difference(&self.hub.lost) {
+            assert!(took.contains(k), "L10: the lost mark lasts to an outcome");
+        }
+        assert!(took.is_disjoint(&self.hub.lost), "L10: an outcome lifts it");
+        for c in cmds {
             match c {
                 Command::Assign { worker, run, key } => {
                     let serving = serves(worker as usize).contains(&(key % 3));
@@ -204,13 +223,12 @@ impl World {
         live.filter_map(on).filter_map(ends).collect()
     }
 
-    /// D4, complete: a run lost with no known cause isolates its key.
+    /// D4, complete: a run lost with no known cause isolates its key, though
+    /// its build ends (L10).
     fn isolates(&self, keys: &[Key]) {
-        for b in keys.iter().filter_map(|k| self.hub.builds.get(k)) {
-            assert!(
-                b.lost,
-                "D4: a run lost with no known cause isolates its key"
-            );
+        for k in keys {
+            let lost = self.hub.lost.contains(k);
+            assert!(lost, "D4: a run lost with no known cause isolates its key");
         }
     }
 
@@ -408,13 +426,13 @@ impl World {
         for (k, b) in &self.hub.builds {
             let wanted = !b.clients.is_empty() || b.live.is_some();
             assert!(wanted, "C27: a build no client or run wants ends");
-            let evidence = self.evidence.contains(k);
-            assert!(
-                !b.lost || evidence,
-                "D4: isolation only after a loss of no known cause"
-            );
-            self.answers[4] = self.answers[4].max(usize::from(b.lost));
+            let lost = self.hub.lost.contains(k);
+            self.answers[4] = self.answers[4].max(usize::from(lost));
         }
+        assert!(
+            self.hub.lost.is_subset(&self.evidence),
+            "D4: isolation only after a loss of no known cause"
+        );
         for (run, r) in &self.hub.runs {
             if let Phase::Finished(o) = r.phase {
                 let first = *self.finals.entry(*run).or_insert(o);
@@ -487,6 +505,33 @@ fn act() -> impl Strategy<Value = Act> {
         1 => w.clone().prop_map(Act::Suspect),
         1 => w.prop_map(Act::Decommission),
     ]
+}
+
+/// L10: a clientless build whose run is lost ends, but its key stays lost,
+/// so a resubmission runs alone; the next outcome, read by no one, lifts it.
+#[test]
+fn a_lost_mark_outlasts_its_build_until_an_outcome() {
+    let mut w = World::default();
+    let go = |w: &mut World, acts: &[Act]| acts.iter().for_each(|a| w.act(a.clone()));
+    go(&mut w, &[Act::Connect(0)]);
+    for client in 0..2 {
+        go(&mut w, &[Act::Submit(0, client, false), Act::Place(0, 0)]);
+        let lost = w.hub.lost.contains(&0);
+        assert_eq!(lost, client == 1, "a resubmission after a loss starts lost");
+        go(&mut w, &[Act::Deliver(0), Act::Start(0, 0)]);
+        w.act(Act::Leave(0, client));
+        let live = w.hub.builds.get(&0).and_then(|b| b.live);
+        assert!(live.is_some(), "L9: a clientless run goes on");
+        if client == 0 {
+            // Its worker restarts without it: lost, with no known cause.
+            go(&mut w, &[Act::Crash(0), Act::Connect(0)]);
+            assert!(w.hub.builds.is_empty(), "C27: no one wants it");
+            assert!(w.hub.lost.contains(&0), "L10: its key stays lost");
+        }
+    }
+    go(&mut w, &[Act::Finish(0, 0, true), Act::Fetched(0)]);
+    let (ended, lifted) = (w.hub.builds.is_empty(), w.hub.lost.is_empty());
+    assert!(ended && lifted, "C27; L10: an unread outcome lifts it");
 }
 
 /// Every law after every step of any history under any policy; progress (a
