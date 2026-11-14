@@ -138,16 +138,17 @@ pub(super) struct AttachSvc {
 type BuildStream = ReceiverStream<Result<AttachEvent, Status>>;
 
 impl AttachSvc {
-    /// Block until a worker can serve `system`+`features`, or return a
-    /// decline stream (single exit-code event, so a patched Nix falls
-    /// back to a local build). `None` means a worker is now available.
-    /// Platforms we never expect to see decline without any wait.
+    /// Block until a worker can serve `system`+`features` (`None`), unless
+    /// none is connected or expected back (L11). Then a client whose Nix
+    /// can build the request is declined (a single exit-code event, so a
+    /// patched Nix builds it locally). One whose Nix cannot is refused if
+    /// no known worker serves it, and else waits for one, queued (`None`).
     async fn await_capable_worker(
         &self,
         (key, system): (&str, &str),
         features: &[String],
         can_local: bool,
-    ) -> Option<Response<BuildStream>> {
+    ) -> Option<Result<Response<BuildStream>, Status>> {
         let decline = || {
             tracing::info!(system, can_local, "no capable worker; declining");
             self.state
@@ -160,6 +161,14 @@ impl AttachSvc {
             }));
             Response::new(ReceiverStream::new(rx))
         };
+        let refuse = || {
+            tracing::info!(system, "no known worker; refusing");
+            self.state.shadow.declined(key, (system, features), false);
+            Status::failed_precondition(format!(
+                "no worker this hub knows builds {system} [{}], and the client's Nix cannot",
+                features.join(",")
+            ))
+        };
         loop {
             // Arm the wakeup before checking, else a worker registering
             // in the gap would be missed.
@@ -167,8 +176,11 @@ impl AttachSvc {
             tokio::pin!(notified);
             notified.as_mut().enable();
             let deadline = match self.state.servability(system, features) {
-                Servability::Now => return None,
-                Servability::Never => return Some(decline()),
+                Servability::Never if can_local => return Some(Ok(decline())),
+                Servability::Never if !self.state.known.serves(system, features) => {
+                    return Some(Err(refuse()));
+                }
+                Servability::Now | Servability::Never => return None,
                 Servability::ExpectedBy(at) => at,
             };
             tracing::info!(system, "no capable worker yet; waiting");
@@ -204,8 +216,10 @@ impl attach_hub_server::AttachHub for AttachSvc {
         let tmp_dir_pack = Arc::new(tmp_dir_pack);
         let key = dedupe_key(&req, &tmp_dir_pack);
         // Unsaid (a Nix or attach predating canLocal): today's rule, a
-        // build without network.
-        let can_local = req.can_local.unwrap_or(!req.fixed_output);
+        // build without network. Never one with: declined, it would run on
+        // this host's own daemon, in its network, outside every
+        // fod-network policy (§1).
+        let can_local = !req.fixed_output && req.can_local.unwrap_or(true);
 
         // A build with network goes only to a worker that gives it a
         // network of its own; one that does not would refuse it.
@@ -213,14 +227,10 @@ impl attach_hub_server::AttachHub for AttachSvc {
         if req.fixed_output {
             features.push(NETWORK.to_owned());
         }
-        // Declined, a build with network would run on this host's own
-        // daemon, in its network, outside every fod-network policy: it
-        // waits for a worker, queued and its clients told (hold_unservable).
-        if !req.fixed_output
-            && let Some(declined) =
-                (self.await_capable_worker((&key, &req.system), &features, can_local)).await
+        if let Some(answer) =
+            (self.await_capable_worker((&key, &req.system), &features, can_local)).await
         {
-            return Ok(declined);
+            return answer;
         }
 
         let paths: Vec<String> = req.outputs.values().cloned().collect();
@@ -458,11 +468,12 @@ mod tests {
         assert_eq!(replay.can_local(), [false, true]);
     }
 
-    /// With no worker for its system, a build with network is not declined,
-    /// which would have Nix run it on the hub's host: it is queued, its
-    /// client told why it waits. Any other build is declined.
+    /// With no worker for its system connected (L11), a client whose Nix
+    /// can build the request is declined. One whose Nix cannot (a build
+    /// with network, or one that says so) is never declined: refused while
+    /// no known worker serves it, else queued, told why it waits.
     #[tokio::test]
-    async fn only_a_build_without_network_is_declined() {
+    async fn with_no_worker_only_a_client_whose_nix_builds_it_is_declined() {
         let state = Arc::new(HubState::for_test(Duration::ZERO));
         let first = |mut events: tonic::Streaming<AttachEvent>| async move {
             let ev = tokio::time::timeout(Duration::from_secs(10), events.message()).await;
@@ -470,16 +481,37 @@ mod tests {
         };
         let declined = first(submit(&state, base_request()).await).await;
         assert_eq!(declined, attach_event::Event::ExitCode(DECLINE_EXIT_CODE));
-        let fod = BuildRequest {
-            fixed_output: true,
-            ..base_request()
-        };
-        let attach_event::Event::Log(told) = first(submit(&state, fod).await).await else {
-            panic!("a fixed-output build was not told it waits");
-        };
-        let told = String::from_utf8(told).unwrap();
-        assert!(told.contains("waiting for one"), "{told}");
-        assert_eq!(state.queue.lock().await.len(), 1);
+        let cannot = [
+            BuildRequest {
+                fixed_output: true,
+                ..base_request()
+            },
+            BuildRequest {
+                can_local: Some(false),
+                ..base_request()
+            },
+        ];
+        // A hub each: both requests have one output path.
+        for req in cannot {
+            let state = Arc::new(HubState::for_test(Duration::ZERO));
+            let Err(refused) = try_submit(&state, req.clone()).await else {
+                panic!("not refused");
+            };
+            assert_eq!(refused.code(), tonic::Code::FailedPrecondition);
+            assert!(refused.message().contains("x86_64-linux"), "{refused}");
+            state.known.learn(&WorkerCaps {
+                name: "away".into(),
+                connected_at: Instant::now(),
+                systems: [("x86_64-linux".to_owned(), [NETWORK.to_owned()].into())].into(),
+                max_jobs: 1,
+            });
+            let attach_event::Event::Log(told) = first(submit(&state, req).await).await else {
+                panic!("not told it waits");
+            };
+            let told = String::from_utf8(told).unwrap();
+            assert!(told.contains("waiting for one"), "{told}");
+            assert_eq!(state.queue.lock().await.len(), 1);
+        }
     }
 
     /// A build with network goes only to a worker that gives it a network
@@ -488,20 +520,22 @@ mod tests {
     #[tokio::test]
     async fn a_build_with_network_goes_only_to_a_worker_that_gives_it_one() {
         let state = hub();
+        let without = state.worker_caps.lock().unwrap()[&1].clone();
+        let with = WorkerCaps {
+            systems: [("x86_64-linux".to_owned(), [NETWORK.to_owned()].into())].into(),
+            ..without.clone()
+        };
+        // Known, so the build waits for it (L11).
+        state.known.learn(&with);
         let fod = BuildRequest {
             fixed_output: true,
             ..base_request()
         };
         let _events = submit(&state, fod).await;
-        let without = state.worker_caps.lock().unwrap()[&1].clone();
         assert!(
             state.take_job(&without, None).await.is_none(),
             "handed to a worker without network"
         );
-        let with = WorkerCaps {
-            systems: [("x86_64-linux".to_owned(), [NETWORK.to_owned()].into())].into(),
-            ..without
-        };
         assert!(
             state.take_job(&with, None).await.is_some(),
             "not handed to one with"

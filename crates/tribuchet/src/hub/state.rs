@@ -12,6 +12,7 @@ use tokio::sync::{Mutex, Notify, mpsc, watch};
 use tonic::Status;
 
 use super::chunkcache::ChunkCache;
+use super::known::Known;
 use super::losses::{self, Loss};
 use super::metrics::Metrics;
 use super::placement::{Expected, Placement};
@@ -165,6 +166,8 @@ pub(super) struct HubState {
     pub(super) runs: Runs,
     /// The semantic core beside the hub, logging where they differ.
     pub(super) shadow: Arc<Shadow>,
+    /// Every worker that registered, across restarts (L11).
+    pub(super) known: Known,
 }
 
 #[derive(Clone)]
@@ -254,6 +257,7 @@ impl HubState {
             placement: StdMutex::default(),
             runs: Runs::default(),
             shadow: Arc::default(),
+            known: Known::default(),
         }
     }
 

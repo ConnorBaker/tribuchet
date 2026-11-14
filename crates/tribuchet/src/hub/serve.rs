@@ -18,6 +18,7 @@ use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 
 use super::chunkcache::ChunkCache;
+use super::known::Known;
 use super::metrics;
 use super::record;
 use super::runs::Runs;
@@ -147,9 +148,10 @@ async fn run_async(cfg: HubConfig) -> Result<()> {
         chunks,
     );
     // The record is folded into the history before the hub serves. The run
-    // epoch is kept beside it: both are the hub's state.
+    // epoch and the known workers are kept beside it: all are the hub's state.
     let path = cfg.placement.record.clone().unwrap_or_else(default_record);
     state.runs = Runs::open(&path.with_file_name("run-epoch"));
+    state.known = Known::open(&path.with_file_name("known-workers"));
     let state = Arc::new(state);
     let opened = tokio::task::spawn_blocking(move || record::open(&path))
         .await

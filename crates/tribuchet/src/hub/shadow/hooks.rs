@@ -32,18 +32,18 @@ impl Shadow {
         c
     }
 
-    /// No worker serves `key` and the hub declines the client: the core's
-    /// Defer if its Nix can build the key, else its Refuse (policy order).
+    /// No worker serves `key`, and the hub defers the client if its Nix can
+    /// build the key, else refuses it (L11): the core's Defer or Refuse.
     pub(in crate::hub) fn declined(&self, k: &str, sys: Sys, can_local: bool) {
         self.with(|m| {
             let (Some(key), sys) = (key(k), m.system(sys.0, sys.1)) else {
                 return;
             };
             let client = CLIENTS.fetch_add(1, Relaxed) + 1;
-            let choice = if can_local {
-                Event::Defer { key, client }
+            let (choice, answer) = if can_local {
+                (Event::Defer { key, client }, Answer::Defer)
             } else {
-                Event::Refuse { key }
+                (Event::Refuse { key }, Answer::Refuse)
             };
             let evs = vec![
                 Event::Submit {
@@ -55,7 +55,7 @@ impl Shadow {
                 choice,
                 Event::Leave { key, client },
             ];
-            m.feed("no capable worker", &[(key, Answer::Defer)], evs);
+            m.feed("no capable worker", &[(key, answer)], evs);
         });
     }
 
