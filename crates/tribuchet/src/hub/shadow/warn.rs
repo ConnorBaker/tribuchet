@@ -12,7 +12,13 @@ impl Shadow {
     /// Whether the core runs `k` alone (D4), if a build of it waits.
     pub(in crate::hub) fn isolated(&self, k: &str) -> Option<bool> {
         let mut lost = None;
-        self.with(|m| lost = key(k).and_then(|k| m.hub.builds.get(&k)).map(|b| b.lost));
+        let of = |m: &Mirror, k| {
+            m.hub
+                .builds
+                .contains_key(&k)
+                .then(|| m.hub.lost.contains(&k))
+        };
+        self.with(|m| lost = key(k).and_then(|k| of(m, k)));
         lost
     }
 
@@ -62,6 +68,7 @@ impl Mirror {
         keys.dedup();
         for k in keys {
             let build = self.hub.builds.get(&k).cloned();
+            let lost = self.hub.lost.contains(&k);
             let run = build.as_ref().and_then(|b| b.live);
             let hub_run = run.and_then(|r| self.hub_runs.get(&r).cloned());
             let seen = self.seen.get(&k).cloned();
@@ -69,7 +76,7 @@ impl Mirror {
             self.warnings.push(Box::new(move || {
                 let key = format!("{k:08x}");
                 tracing::warn!(target: "tribuchet::shadow", point, key, what, ?live, ?core,
-                    ?build, ?hub_run, ?seen, "shadow divergence");
+                    ?build, lost, ?hub_run, ?seen, "shadow divergence");
             }));
         }
     }

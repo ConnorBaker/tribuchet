@@ -135,8 +135,6 @@ pub struct Build {
     pub clients: BTreeMap<Client, bool>,
     /// The run whose outcome will answer it.
     pub live: Option<Run>,
-    /// A run of it ended with no known cause: run it alone (D4).
-    pub lost: bool,
 }
 
 /// A run a worker holds, as far as the hub knows.
@@ -153,6 +151,9 @@ pub struct Hub {
     pub runs: BTreeMap<Run, RunOf>,
     /// Known, not decommissioned, workers and the systems they serve.
     pub workers: BTreeMap<Worker, BTreeSet<Sys>>,
+    /// Keys a run of which ended with no known cause and that have had no
+    /// outcome since: run them alone (D4), a build of them waiting or not (L10).
+    pub lost: BTreeSet<Key>,
     next_run: Run,
 }
 
@@ -175,6 +176,9 @@ impl Hub {
 
     fn answer(&mut self, key: Key, answer: Answer, run: Option<Run>, out: &mut Vec<Command>) {
         let b = self.builds.remove(&key).expect("a waiting build");
+        if let Answer::Give(_) = answer {
+            self.lost.remove(&key); // Only an outcome lifts the mark (L10).
+        }
         if b.clients.is_empty() {
             return; // A clientless build ends unsaid: no one to answer.
         }
@@ -188,8 +192,10 @@ impl Hub {
     }
 
     fn detach(&mut self, key: Key, evidence: bool) {
-        let b = self.builds.get_mut(&key).expect("a waiting build");
-        (b.live, b.lost) = (None, b.lost || evidence);
+        self.builds.get_mut(&key).expect("a waiting build").live = None;
+        if evidence {
+            self.lost.insert(key);
+        }
         self.unwanted(key);
     }
 
@@ -277,7 +283,6 @@ pub fn step(hub: &mut Hub, ev: Event) -> Vec<Command> {
                 sys,
                 clients: BTreeMap::new(),
                 live: None,
-                lost: false,
             });
             b.clients.insert(client, can_local);
         }
