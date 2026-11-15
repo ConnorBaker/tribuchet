@@ -17,6 +17,9 @@ use super::*;
 enum Act {
     Submit(Key, Client, bool),
     Leave(Key, Client),
+    /// Worker 2 loses `key`'s runs with no known cause; the key is resubmitted
+    /// and placed again, every client leaves, and the run ends (L10's corner).
+    Unread(Key, bool),
     Connect(usize),
     Down(usize),
     Crash(usize),
@@ -71,8 +74,9 @@ struct World {
     /// Workers registered and not decommissioned since, with what they serve.
     known: BTreeMap<usize, BTreeSet<Sys>>,
     said: Vec<(Run, Option<Phase>)>,
-    /// Answers seen: Give Failed, Give Built, Defer, Refuse; then isolation.
-    answers: [usize; 5],
+    /// Answers seen: Give Failed, Give Built, Defer, Refuse; then isolation,
+    /// and a lost key's outcome that no client read (L10).
+    answers: [usize; 6],
     /// The outcome the hub first knew each run finished with.
     finals: BTreeMap<Run, Outcome>,
 }
@@ -123,6 +127,10 @@ impl World {
         for k in marked.difference(&self.hub.lost) {
             assert!(took.contains(k), "L10: the lost mark lasts to an outcome");
         }
+        let read =
+            |k: &Key| (cmds.iter()).any(|c| matches!(c, Command::Answer { key, .. } if key == k));
+        let unread = took.iter().filter(|k| marked.contains(k) && !read(k));
+        self.answers[5] += unread.count();
         assert!(took.is_disjoint(&self.hub.lost), "L10: an outcome lifts it");
         for c in cmds {
             match c {
@@ -267,6 +275,29 @@ impl World {
                 let before = live(&self.hub);
                 self.send(Event::Leave { key, client });
                 assert_eq!(live(&self.hub), before, "L9: a leave keeps the live run");
+            }
+            Act::Unread(key, ok) => {
+                let run = |w: &mut World| {
+                    w.act(Act::Submit(key, 3, false));
+                    w.act(Act::Place(key, 2));
+                    for _ in 0..8 {
+                        w.act(Act::Deliver(2));
+                        w.act(Act::Start(2, 0));
+                    }
+                };
+                if !self.wk[2].up {
+                    self.act(Act::Connect(2));
+                }
+                run(self);
+                self.act(Act::Crash(2));
+                self.act(Act::Connect(2));
+                run(self);
+                let open: Vec<(Key, Client)> = self.open.keys().copied().collect();
+                for (k, c) in open.into_iter().filter(|o| o.0 == key) {
+                    self.act(Act::Leave(k, c));
+                }
+                (0..8).for_each(|_| self.act(Act::Finish(2, 0, ok)));
+                self.act(Act::Fetched(2));
             }
             Act::Connect(w) => {
                 let wk = &mut self.wk[w];
@@ -485,6 +516,7 @@ fn act() -> impl Strategy<Value = Act> {
     prop_oneof![
         3 => (0..4u32, 0..3u32, any::<bool>()).prop_map(|(k, c, l)| Act::Submit(k, c, l)),
         1 => (0..4u32, 0..3u32).prop_map(|(k, c)| Act::Leave(k, c)),
+        1 => (0..4u32, any::<bool>()).prop_map(|(k, ok)| Act::Unread(k, ok)),
         2 => w.clone().prop_map(Act::Connect),
         1 => w.clone().prop_map(Act::Down),
         2 => w.clone().prop_map(Act::Crash),
@@ -536,15 +568,16 @@ fn a_lost_mark_outlasts_its_build_until_an_outcome() {
 
 /// Every law after every step of any history under any policy; progress (a
 /// fair end answers every client still waiting); and the histories reach
-/// every answer and an isolation, so no law holds vacuously.
+/// every answer, an isolation and a lost key's unread outcome, so no law holds
+/// vacuously.
 #[test]
 fn every_history_refines_local_building() {
-    let seen = RefCell::new([0; 5]);
+    let seen = RefCell::new([0; 6]);
     let mut runner = TestRunner::new(Config::with_cases(4000));
     let result = runner.run(&vec(act(), 0..80), |acts| {
         let world = World::run(&acts);
         let mut seen = seen.borrow_mut();
-        (0..5).for_each(|i| seen[i] += usize::from(world.answers[i] > 0));
+        (0..6).for_each(|i| seen[i] += usize::from(world.answers[i] > 0));
         prop_assert!(
             world.open.is_empty(),
             "progress: unanswered {:?}",
@@ -554,6 +587,8 @@ fn every_history_refines_local_building() {
     });
     result.unwrap();
     let seen = seen.into_inner();
-    eprintln!("histories with Give Failed, Give Built, Defer, Refuse, isolation: {seen:?}");
+    eprintln!(
+        "histories with Give Failed, Give Built, Defer, Refuse, isolation, unread lift: {seen:?}"
+    );
     assert!(seen.iter().all(|n| *n > 40), "a case no history reaches");
 }
