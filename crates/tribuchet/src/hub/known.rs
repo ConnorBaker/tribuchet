@@ -15,6 +15,15 @@ use crate::fsutil::write_atomic;
 /// System -> the features a worker honors for it.
 type Systems = BTreeMap<String, BTreeSet<String>>;
 
+/// What a client whose Nix cannot build the request is told when no known
+/// worker builds `system` with `features` (L11).
+pub(super) fn refusal(system: &str, features: &[String]) -> String {
+    format!(
+        "no worker this hub knows builds {system} [{}], and the client's Nix cannot",
+        features.join(",")
+    )
+}
+
 #[derive(Default)]
 pub(super) struct Known {
     /// Where they are stored; none in tests.

@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
+use super::known::refusal;
 use super::metrics::Metrics;
 use super::naming::drv_name;
 use super::placement::Expected;
@@ -164,10 +165,7 @@ impl AttachSvc {
         let refuse = || {
             tracing::info!(system, "no known worker; refusing");
             self.state.shadow.declined(key, (system, features), false);
-            Status::failed_precondition(format!(
-                "no worker this hub knows builds {system} [{}], and the client's Nix cannot",
-                features.join(",")
-            ))
+            Status::failed_precondition(refusal(system, features))
         };
         loop {
             // Arm the wakeup before checking, else a worker registering

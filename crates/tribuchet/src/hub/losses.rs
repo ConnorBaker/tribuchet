@@ -202,7 +202,7 @@ async fn defer(state: &HubState, job: Job, (losses, lost): (u32, &str)) -> Optio
     }
     job.restart_outputs().await;
     let (declined, waiting) = job.replay.decline_local().await;
-    state.shadow.deferred(&job, &declined);
+    state.shadow.deferred("loss cap", &job, &declined);
     tracing::warn!(
         id = job.id,
         losses,
@@ -233,7 +233,7 @@ pub(super) async fn hub_cannot(
     if !job.req.fixed_output && job.replay.can_local().contains(&true) {
         job.restart_outputs().await;
         let (declined, _) = job.replay.decline_local().await;
-        state.shadow.deferred(&job, &declined);
+        state.shadow.deferred(point, &job, &declined);
         let n = declined.len();
         tracing::warn!(
             id = job.id,

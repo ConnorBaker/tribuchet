@@ -224,14 +224,24 @@ impl Shadow {
         });
     }
 
-    /// The hub sends the `clients` of `job` back to their own Nix (exit 222),
-    /// at a loss cap or as it cannot carry the build.
-    pub(in crate::hub) fn deferred(&self, job: &Job, clients: &[sem::Client]) {
+    /// The hub sends the `clients` of `job` back to their own Nix (exit 222)
+    /// at `point`: a loss cap, its own verdict, or no capable worker.
+    pub(in crate::hub) fn deferred(&self, point: &str, job: &Job, clients: &[sem::Client]) {
         self.with(|m| {
             let Some(key) = key(&job.key) else { return };
             let defer = |&client| Event::Defer { key, client };
             let today = vec![(key, Answer::Defer); clients.len()];
-            m.feed("loss cap", &today, clients.iter().map(defer).collect());
+            m.feed(point, &today, clients.iter().map(defer).collect());
+        });
+    }
+
+    /// No known worker serves queued `job`: the hub refuses its clients
+    /// still waiting (L11′).
+    pub(in crate::hub) fn refused(&self, job: &Job) {
+        let today = today(job, Answer::Refuse);
+        self.with(|m| {
+            let Some(key) = key(&job.key) else { return };
+            m.feed("no known worker", &today, vec![Event::Refuse { key }]);
         });
     }
 
