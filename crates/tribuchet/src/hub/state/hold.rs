@@ -11,14 +11,13 @@ use crate::hub::known::refusal;
 use crate::hub::metrics::Metrics;
 use crate::proto::attach_event;
 
-/// A queued build no connected worker serves, none expected back.
+/// A queued build no connected worker serves, none expected back, that a
+/// known worker serves: it may yet come back.
 struct Unservable {
     id: String,
     replay: Arc<Replay>,
     system: String,
     features: String,
-    /// A known worker serves it: it may yet come back.
-    known: bool,
 }
 
 impl HubState {
@@ -42,28 +41,47 @@ impl HubState {
 
     /// Returns the latest deadline a queued job is still waiting for. A
     /// job a known worker serves stays queued, its clients told why they
-    /// wait. One with no client, or that no known worker serves, leaves
-    /// the queue and ends, its clients answered (L11′).
+    /// wait; one with no client leaves the queue and ends. One that no
+    /// known worker serves is taken out and unlisted at the instant that
+    /// is decided, so no client joins it after, and ends in a task of its
+    /// own, its clients answered (L11′, cut-over 7).
     async fn hold_unservable_now(self: &Arc<Self>) -> Option<Instant> {
         let mut due: Option<Instant> = None;
         let mut unservable = Vec::new();
-        for j in self.queue.lock().await.iter() {
-            match self.servability(&j.req.system, &j.features) {
-                Servability::Now => {}
-                Servability::ExpectedBy(at) => due = Some(due.map_or(at, |d| d.max(at))),
-                Servability::Never => unservable.push(Unservable {
-                    id: j.id.clone(),
-                    replay: j.replay.clone(),
-                    system: j.req.system.clone(),
-                    features: j.features.join(","),
-                    known: self.known.serves(&j.req.system, &j.features),
-                }),
+        let unserved: Vec<Job> = {
+            let mut queue = self.queue.lock().await;
+            let (unserved, kept) = (queue.drain(..)).partition::<VecDeque<Job>, _>(|j| {
+                match self.servability(&j.req.system, &j.features) {
+                    Servability::Now => {}
+                    Servability::ExpectedBy(at) => due = Some(due.map_or(at, |d| d.max(at))),
+                    Servability::Never if !self.known.serves(&j.req.system, &j.features) => {
+                        j.unlist();
+                        return true;
+                    }
+                    Servability::Never => unservable.push(Unservable {
+                        id: j.id.clone(),
+                        replay: j.replay.clone(),
+                        system: j.req.system.clone(),
+                        features: j.features.join(","),
+                    }),
+                }
+                false
+            });
+            *queue = kept;
+            unserved.into()
+        };
+        // Before any await: out of the queue, each must end even if the
+        // caller is dropped.
+        let state = self.clone();
+        let ended = tokio::spawn(async move {
+            for job in unserved {
+                state.end_unservable(job).await;
             }
-        }
+        });
         // Outside the queue lock: both wait on the job's replay.
         let mut ending = HashSet::new();
         for u in unservable {
-            if !u.known || !u.replay.has_subscribers().await {
+            if !u.replay.has_subscribers().await {
                 ending.insert(u.id);
                 continue;
             }
@@ -81,24 +99,19 @@ impl HubState {
                 );
             }
         }
-        if ending.is_empty() {
-            return due;
-        }
-        let gone: Vec<Job> = {
-            let mut queue = self.queue.lock().await;
-            let (gone, kept) =
-                (queue.drain(..)).partition::<VecDeque<Job>, _>(|j| ending.contains(&j.id));
-            *queue = kept;
-            gone.into()
-        };
-        // Its own task: out of the queue, each must end even if the caller
-        // is dropped.
-        let state = self.clone();
-        let ended = tokio::spawn(async move {
+        if !ending.is_empty() {
+            let gone: Vec<Job> = {
+                let mut queue = self.queue.lock().await;
+                let (gone, kept) =
+                    (queue.drain(..)).partition::<VecDeque<Job>, _>(|j| ending.contains(&j.id));
+                *queue = kept;
+                gone.into()
+            };
             for job in gone {
-                state.end_unservable(job).await;
+                tracing::info!(id = job.id, "dropping queued build: no client attached");
+                self.finish(&job).await;
             }
-        });
+        }
         if let Err(e) = ended.await {
             tracing::error!("ending unservable builds: {e}");
         }

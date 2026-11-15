@@ -15,6 +15,7 @@ use Step::{
     Wait,
 };
 
+mod hold;
 mod laws;
 mod schedules;
 
@@ -29,39 +30,6 @@ impl Replay {
     /// The build's id, for the warnings.
     pub(in crate::hub) fn id(&self) -> &str {
         &self.id
-    }
-}
-
-/// A hold pass dropped midway, as hyper drops a Build handler whose client
-/// went, loses no build: one a known worker serves stays queued, and one
-/// no known worker serves is still answered once out of the queue (L11′).
-#[tokio::test]
-async fn a_dropped_hold_pass_loses_no_build() {
-    for known in [true, false] {
-        let state = hub_knowing(known);
-        let (r1, r2) = (Arc::new(Replay::default()), Arc::new(Replay::default()));
-        let mut first = r1.subscribe_as(Client::untracked(false)).await;
-        let _second = r2.subscribe_as(Client::untracked(false)).await;
-        state
-            .queue
-            .lock()
-            .await
-            .extend([job(1, r1.clone()), job(2, r2)]);
-        // The pass stops at the first build's log, busy, and is dropped.
-        let busy = r1.inner.lock().await;
-        let mut pass = Box::pin(state.hold_unservable());
-        let wait = tokio::time::timeout(Duration::from_millis(100), &mut pass).await;
-        assert!(wait.is_err(), "known {known}: the pass did not stop");
-        drop((pass, busy));
-        let queued = state.queue.lock().await.len();
-        assert_eq!(queued, if known { 2 } else { 0 }, "known {known}");
-        let mut refused = false;
-        while let Ok(Some(Ok(ev))) =
-            tokio::time::timeout(Duration::from_secs(1), first.recv()).await
-        {
-            refused |= matches!(ev.event, Some(attach_event::Event::Error(_)));
-        }
-        assert_eq!(refused, !known, "known {known}: the first client's answer");
     }
 }
 

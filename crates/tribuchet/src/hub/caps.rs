@@ -16,8 +16,9 @@ pub(super) struct CapsGuard {
 impl CapsGuard {
     pub(super) fn new(state: Arc<HubState>, caps: WorkerCaps) -> Self {
         let id = state.next_worker_id.fetch_add(1, Ordering::Relaxed);
-        state.worker_caps.lock().unwrap().insert(id, caps.clone());
-        state.known.learn(&caps);
+        // Known before it is connected, under the known set's lock.
+        let connect = || _ = state.worker_caps.lock().unwrap().insert(id, caps.clone());
+        state.known.join(&caps, connect);
         // Wake submissions waiting for a capable worker to appear.
         state.caps_changed.notify_waiters();
         state.regen_nix_config();

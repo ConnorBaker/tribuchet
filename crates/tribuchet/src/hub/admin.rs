@@ -6,6 +6,7 @@ use std::sync::Arc;
 
 use tonic::{Request, Response, Status};
 
+use super::known::Forget;
 use super::state::HubState;
 use crate::errors::{Result, err_ctx};
 use crate::proto::hub_admin_client::HubAdminClient;
@@ -20,29 +21,25 @@ pub(super) struct AdminSvc {
 #[tonic::async_trait]
 impl HubAdmin for AdminSvc {
     /// The worker leaves the known set and is no longer awaited; the queue
-    /// is answered anew (L11′). Forgotten before the check that it is not
-    /// connected, and learnt again if it is, so a worker registering
-    /// meanwhile is known after either way.
+    /// is answered anew (L11′). Whether it is connected is asked under the
+    /// known set's lock, which a registration holds to connect, so a
+    /// connected worker is never forgotten.
     async fn decommission(
         &self,
         request: Request<DecommissionRequest>,
     ) -> Result<Response<DecommissionReply>, Status> {
         let name = request.into_inner().worker_name;
         let state = &self.state;
-        if !state.known.forget(&name) {
-            return Err(Status::not_found(format!("no worker {name} is known")));
-        }
-        let caps = state
-            .worker_caps
-            .lock()
-            .unwrap()
-            .values()
-            .find(|c| c.name == name)
-            .cloned();
-        if let Some(caps) = caps {
-            state.known.learn(&caps);
-            let err = format!("worker {name} is connected; stop it first");
-            return Err(Status::failed_precondition(err));
+        let connected = || (state.worker_caps.lock().unwrap().values()).any(|c| c.name == name);
+        match state.known.forget(&name, connected) {
+            Ok(()) => {}
+            Err(Forget::Unknown) => {
+                return Err(Status::not_found(format!("no worker {name} is known")));
+            }
+            Err(Forget::Connected) => {
+                let err = format!("worker {name} is connected; stop it first");
+                return Err(Status::failed_precondition(err));
+            }
         }
         state
             .departed
