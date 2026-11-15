@@ -173,6 +173,11 @@ impl World {
                 !defer || can_local == Some(true),
                 "D2: Defer only to canLocal"
             );
+            let refuse = answer == Answer::Refuse;
+            assert!(
+                !refuse || can_local == Some(false),
+                "§2: Refuse only to ¬canLocal"
+            );
         }
         match answer {
             Answer::Give(o) => {
@@ -473,8 +478,9 @@ impl World {
     }
 
     /// A fair end: workers 0 and 1 back, worker 2 (if down) suspected and
-    /// gone for good, and a policy that refuses, adopts or places each
-    /// waiting build while every run goes through (worker 1's fail).
+    /// gone for good, and a policy that refuses (deferring first the
+    /// clients whose Nix builds the key), adopts or places each waiting
+    /// build while every run goes through (worker 1's fail).
     fn drain(&mut self) {
         (0..2).for_each(|w| self.act(Act::Connect(w)));
         if !self.wk[2].up {
@@ -483,6 +489,13 @@ impl World {
         for _ in 0..8 {
             let keys: BTreeSet<Key> = self.open.keys().map(|(k, _)| *k).collect();
             for key in keys {
+                if !self.known.values().any(|s| s.contains(&(key % 3))) {
+                    let local = self.open.iter().filter(|(o, l)| o.0 == key && l.0);
+                    let defer: Vec<Act> = local.map(|(o, _)| Act::Defer(o.0, o.1)).collect();
+                    for a in defer {
+                        self.act(a);
+                    }
+                }
                 self.act(Act::Refuse(key));
                 for run in self.held().into_iter().filter(|h| h.1 == key) {
                     let run = run.0;
@@ -539,32 +552,7 @@ fn act() -> impl Strategy<Value = Act> {
     ]
 }
 
-/// L10: a clientless build whose run is lost ends, but its key stays lost,
-/// so a resubmission runs alone; the next outcome, read by no one, lifts it.
-#[test]
-fn a_lost_mark_outlasts_its_build_until_an_outcome() {
-    let mut w = World::default();
-    let go = |w: &mut World, acts: &[Act]| acts.iter().for_each(|a| w.act(a.clone()));
-    go(&mut w, &[Act::Connect(0)]);
-    for client in 0..2 {
-        go(&mut w, &[Act::Submit(0, client, false), Act::Place(0, 0)]);
-        let lost = w.hub.lost.contains(&0);
-        assert_eq!(lost, client == 1, "a resubmission after a loss starts lost");
-        go(&mut w, &[Act::Deliver(0), Act::Start(0, 0)]);
-        w.act(Act::Leave(0, client));
-        let live = w.hub.builds.get(&0).and_then(|b| b.live);
-        assert!(live.is_some(), "L9: a clientless run goes on");
-        if client == 0 {
-            // Its worker restarts without it: lost, with no known cause.
-            go(&mut w, &[Act::Crash(0), Act::Connect(0)]);
-            assert!(w.hub.builds.is_empty(), "C27: no one wants it");
-            assert!(w.hub.lost.contains(&0), "L10: its key stays lost");
-        }
-    }
-    go(&mut w, &[Act::Finish(0, 0, true), Act::Fetched(0)]);
-    let (ended, lifted) = (w.hub.builds.is_empty(), w.hub.lost.is_empty());
-    assert!(ended && lifted, "C27; L10: an unread outcome lifts it");
-}
+mod lost_mark;
 
 /// Every law after every step of any history under any policy; progress (a
 /// fair end answers every client still waiting); and the histories reach
