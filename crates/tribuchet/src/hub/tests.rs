@@ -144,7 +144,7 @@ async fn heartbeat_updates_the_advertised_capacity() {
     assert!(written(3).await, "{}", conf());
 }
 
-fn caps(name: &str) -> WorkerCaps {
+pub(super) fn caps(name: &str) -> WorkerCaps {
     WorkerCaps {
         name: name.into(),
         connected_at: Instant::now(),
@@ -154,7 +154,7 @@ fn caps(name: &str) -> WorkerCaps {
 }
 
 /// A worker session as worker_loop registers it.
-fn register(state: &Arc<HubState>, name: &str, held: &[&str]) -> CapsGuard {
+pub(super) fn register(state: &Arc<HubState>, name: &str, held: &[&str]) -> CapsGuard {
     let guard = CapsGuard::new(state.clone(), caps(name));
     let held: Vec<String> = held.iter().map(|k| (*k).to_owned()).collect();
     state.hold(guard.id, &held, false);

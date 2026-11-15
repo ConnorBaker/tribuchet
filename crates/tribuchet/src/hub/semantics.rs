@@ -95,8 +95,6 @@ pub enum Event {
         run: Run,
     },
     /// The operator retires `worker` (U4); suspecting it is the policy's.
-    /// The hub has no such command yet.
-    #[cfg(test)]
     Decommission {
         worker: Worker,
     },
@@ -380,7 +378,6 @@ pub fn step(hub: &mut Hub, ev: Event) -> Vec<Command> {
                 hub.drop_run(run, &mut out);
             }
         }
-        #[cfg(test)]
         Event::Decommission { worker } => _ = hub.workers.remove(&worker),
     }
     out

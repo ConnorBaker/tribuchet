@@ -245,6 +245,14 @@ impl Shadow {
         });
     }
 
+    /// The operator retires `worker` (U4).
+    pub(in crate::hub) fn decommissioned(&self, worker: &str) {
+        self.with(|m| {
+            let worker = m.name(worker);
+            m.feed("decommission", &[], vec![Event::Decommission { worker }]);
+        });
+    }
+
     pub(in crate::hub) fn suspect(&self, worker: &str) {
         self.with(|m| {
             let worker = m.name(worker);
