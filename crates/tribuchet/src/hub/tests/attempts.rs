@@ -212,6 +212,16 @@ async fn each_sequence_of_losses_counts_as_decided() {
         // Another worker holding the build takes it by key: the run the
         // first started may go on, a loss in transport.
         (vec![(Fresh("w1"), Started)], Back("w2"), Ok((0, 1, false))),
+        // A resumed run's session, counted as it ended, counts no more
+        // when another worker takes the build over, by key or afresh:
+        // each session's end counts once.
+        (vec![(Back("w1"), Resumed)], Back("w2"), Ok((0, 1, false))),
+        (vec![(Back("w1"), Resumed)], Fresh("w2"), Ok((0, 1, false))),
+        (
+            vec![(Fresh("w1"), Started), (Back("w1"), Nothing)],
+            Back("w2"),
+            Ok((0, 1, false)),
+        ),
         // A worker staging afresh the run it resumed no longer had it: a
         // genuine loss, and the session's a loss in transport.
         (
@@ -247,12 +257,13 @@ async fn each_sequence_of_losses_counts_as_decided() {
         ),
         // Losses in transport count per build, across the workers it
         // moves between: seven on w1, its run taken over by w2 (w1 not
-        // back), a start-over on w2, and the 13th on w2 declines it.
+        // back; the seventh already counted), a start-over on w2, and
+        // the 13th on w2 declines it.
         (
             [
                 vec![(Back("w1"), Resumed); 7],
                 vec![(Fresh("w2"), Staged)],
-                vec![(Back("w2"), Resumed); 4],
+                vec![(Back("w2"), Resumed); 5],
             ]
             .concat(),
             Back("w2"),

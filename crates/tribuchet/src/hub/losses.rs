@@ -13,7 +13,7 @@
 //!   dropped the result (ResultGone); or the run's worker, not back
 //!   within its grace or with another worker holding the build, may
 //!   still run it. That says how the farm moves the build, not what the
-//!   build does, so it never fails it.
+//!   build does, so it never fails it. Each session's end counts once.
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -81,6 +81,9 @@ pub(super) struct Loss {
     pub(super) until: Instant,
     /// How far the build's run got, by what the dispatches so far said.
     pub(super) run: Run,
+    /// This session's end was counted in transport as it happened: the
+    /// build taken over later counts it no more (each drop counts once).
+    pub(super) charged: bool,
 }
 
 impl Loss {
@@ -133,17 +136,21 @@ pub(super) async fn lost(
         job = count(state, job, Charge::Genuine).await?;
     }
     let run = dispatch.run(before);
-    let mut job = match run {
+    let charge = match run {
         // Its worker says it no longer has the run (Unlisted).
-        Run::Started if gone => count(state, job, Charge::Genuine).await,
+        Run::Started if gone => Some(Charge::Genuine),
         // Its worker likely runs it still; the next dispatch settles that.
-        Run::Started if dispatch.resumed => count(state, job, Charge::Transport).await,
+        Run::Started if dispatch.resumed => Some(Charge::Transport),
         // The run may go on, or ended without an outcome: the next
         // dispatch settles it (take_job).
-        Run::Started if dispatch.reached == Run::Started => Some(job),
+        Run::Started if dispatch.reached == Run::Started => None,
         // Staged, the assignment unanswered, or the result's delivery cut.
-        _ => count(state, job, Charge::Transport).await,
-    }?;
+        _ => Some(Charge::Transport),
+    };
+    let mut job = match charge {
+        Some(charge) => count(state, job, charge).await?,
+        None => job,
+    };
     // A worker restart drops the session but not the build: keep
     // it for that worker until it re-registers, or the grace ends,
     // instead of running it a second time elsewhere. One that said
@@ -159,6 +166,7 @@ pub(super) async fn lost(
         session,
         until: Instant::now() + grace,
         run,
+        charged: charge == Some(Charge::Transport),
     });
     Some(job)
 }

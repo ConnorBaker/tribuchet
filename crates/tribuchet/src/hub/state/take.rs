@@ -170,14 +170,16 @@ impl HubState {
                     loss.back(&self.worker_caps.lock().unwrap(), &holding)
                 };
                 let charge = if back {
-                    Charge::Genuine
+                    Some(Charge::Genuine)
                 } else {
-                    Charge::Transport
+                    (!loss.charged).then_some(Charge::Transport)
                 };
-                let Some(j) = losses::count(self, job, charge).await else {
-                    continue;
-                };
-                job = j;
+                if let Some(charge) = charge {
+                    let Some(j) = losses::count(self, job, charge).await else {
+                        continue;
+                    };
+                    job = j;
+                }
             }
             return Some(job);
         }
@@ -196,8 +198,8 @@ impl HubState {
             job
         };
         // Held by a worker other than the one that lost it: a run that
-        // one started may go on, a loss in transport. The same worker's
-        // resume is settled by run_job.
+        // one started may go on, a loss in transport unless counted as
+        // the session ended. The same worker's resume is settled by run_job.
         let name = self
             .worker_caps
             .lock()
@@ -206,7 +208,8 @@ impl HubState {
             .map(|c| c.name.clone());
         if let Some(loss) = (job.loss.as_ref()).filter(|r| Some(&r.worker) != name.as_ref()) {
             self.given_up_on(loss);
-            if job.loss.take().is_some_and(|l| l.run == Run::Started) {
+            let taken = job.loss.take();
+            if taken.is_some_and(|l| l.run == Run::Started && !l.charged) {
                 job = losses::count(self, job, Charge::Transport).await?;
             }
         }
