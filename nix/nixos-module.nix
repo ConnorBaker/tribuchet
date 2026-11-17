@@ -92,11 +92,12 @@ in
     externalBuilders = {
       enable = lib.mkEnableOption "routing this machine's nix-daemon builds through the hub (experimental external-builders feature)";
       dynamic = lib.mkEnableOption ''
-        deriving external-builders and max-jobs from the workers
-        currently connected to the hub instead of the static `systems`
-        list. The hub writes a nix.conf fragment on every worker
-        register/deregister; a path unit restarts nix-daemon to apply
-        it (in-flight build children survive the restart)
+        deriving external-builders from the workers the hub knows, and
+        max-jobs from those connected, instead of the static `systems`
+        list. The hub writes a nix.conf fragment as it starts and on every
+        worker register, deregister, capacity change or decommission; a
+        path unit restarts nix-daemon to apply a changed one (in-flight
+        build children survive the restart)
       '';
       systems = lib.mkOption {
         type = lib.types.listOf lib.types.str;

@@ -46,6 +46,7 @@ impl HubAdmin for AdminSvc {
             .lock()
             .unwrap()
             .retain(|(c, _)| c.name != name);
+        state.regen_nix_config();
         state.shadow.decommissioned(&name);
         tracing::warn!(worker = name, "decommissioned");
         state.hold_unservable().await;

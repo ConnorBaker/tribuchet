@@ -484,10 +484,13 @@ reported at start, and nothing is frozen there.
   checks the NAR hash the hub declared, but both come from the hub: the
   worker trusts the mTLS-authenticated hub for input content.
 * With `externalBuilders.dynamic`, the hub's nix.conf fragment lists
-  only the systems a connected worker serves, and nix.conf lists none
-  of its own: with no connected worker for a system, Nix never asks the
+  only the systems a known worker serves, and nix.conf lists none of
+  its own: for a system no known worker serves, Nix never asks the
   hub, and the hub host's own nix-daemon builds a fixed-output build
-  for it, in the host's network.
+  for it, in the host's network. A known system stays listed while its
+  workers are away, so its builds go to the hub, where a fixed-output
+  one waits for a worker. No VM test runs a hub in dynamic mode: only
+  unit tests cover the fragment's rendering, writing and startup.
 
 ## Deployment
 

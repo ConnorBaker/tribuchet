@@ -162,8 +162,11 @@ fn a_stuck_nix_conf_write_holds_neither_its_caller_nor_worker_caps() {
     });
     let returned = rx.recv_timeout(Duration::from_secs(10)).is_ok();
     let caps_free = state.worker_caps.try_lock().is_ok();
-    // Let the read go: a writer opens the FIFO and closes it.
-    drop(fs::OpenOptions::new().write(true).open(&path).unwrap());
+    // Let the read go: a writer opens the FIFO and closes it. Its open waits
+    // for a reader, so it waits apart: a write that reads nothing first
+    // replaces the FIFO, and the open would wait for ever.
+    let fifo = path.clone();
+    thread::spawn(move || fs::OpenOptions::new().write(true).open(fifo));
     assert!(returned, "regen_nix_config waited on the fragment's file");
     assert!(
         caps_free,
