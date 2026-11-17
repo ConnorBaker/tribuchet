@@ -179,6 +179,13 @@ pub(super) async fn run_job(
                         "build usage"
                     );
                 }
+                if !state.outcome_in(&job.id) {
+                    // Given up before its result came: no longer ours.
+                    state
+                        .shadow
+                        .abort("clientless give-up", dispatch.run.as_ref());
+                    return Err(Error::GivenUp);
+                }
                 state.shadow.result(job, res.run.as_ref(), res.exit_code);
                 if res.exit_code != 0 {
                     return publish_worker_failure(state, out_tx, job, &res).await;

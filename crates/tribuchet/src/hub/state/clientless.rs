@@ -120,6 +120,18 @@ impl HubState {
             .is_some_and(|d| d.superseded)
     }
 
+    /// The run of dispatched build `id` has its outcome: it holds no slot
+    /// and has no work left to give up, so it is weighed no more and stays
+    /// listed for a later client (SEMANTICS-7 L9). False if given up first.
+    pub(in crate::hub) fn outcome_in(&self, id: &str) -> bool {
+        let mut map = self.dispatched.lock().unwrap();
+        if map.get(id).is_some_and(|d| d.given_up.is_cancelled()) {
+            return false;
+        }
+        map.remove(id);
+        true
+    }
+
     /// The dispatched builds that may be given up now.
     pub(in crate::hub) fn open_clientless(&self) -> HashSet<String> {
         let (now, map) = (Instant::now(), self.dispatched.lock().unwrap());
