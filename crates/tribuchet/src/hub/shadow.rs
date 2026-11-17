@@ -176,6 +176,7 @@ impl Mirror {
             Event::Adopt { key, .. } | Event::Defer { key, .. } | Event::Refuse { key } => {
                 keys.push(key);
             }
+            Event::Cannot { key } => keys.push(key),
             _ => {}
         }
         (keys, runs)

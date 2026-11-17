@@ -45,6 +45,59 @@ async fn a_refusal_while_a_client_could_build_it_diverges() {
     assert_eq!(log.count("shadow divergence"), 1);
 }
 
+/// The hub's verdict (L12), before dispatch and after: it declines the
+/// client whose Nix builds the key and refuses the other, as the core Defers
+/// and then takes Cannot. Before, the core was fed Give Failed and diverged.
+#[tokio::test]
+async fn the_hubs_verdict_is_the_cores_cannot() {
+    let log = Captured;
+    let _guard = log.install();
+    let sys: (&str, &[String]) = ("x86_64-linux", &[]);
+    let caps = vec![SystemCaps {
+        system: "x86_64-linux".into(),
+        features: vec![],
+    }];
+    for run in [None, Some(RunId { epoch: 1, seq: 1 })] {
+        let state = Arc::new(HubState::for_test(Duration::ZERO));
+        let worker_name = "w".to_owned();
+        let caps = caps.clone();
+        state.shadow.register(&Register {
+            worker_name,
+            caps,
+            ..Register::default()
+        });
+        let mut j = job(0, Arc::new(Replay::default()));
+        j.key = key_of(0);
+        let mut clients = Vec::new();
+        for can_local in [true, false] {
+            let c = state.shadow.submit(&j.key, sys, can_local);
+            clients.push(j.replay.subscribe_as(c).await);
+        }
+        if let Some(r) = &run {
+            state.shadow.assigned(r, &j.key, "w");
+            state.shadow.started(Some(r));
+        }
+        losses::hub_cannot(&state, j, "hub-side error", "no".into()).await;
+        let bad = "shadow divergence";
+        assert_eq!(log.count(bad), 0, "{run:?}: {}", log.line(bad));
+    }
+}
+
+/// The hub's verdict while a client whose Nix builds the key still waits
+/// gives it an answer §2 forbids: the core takes no such Cannot.
+#[tokio::test]
+async fn a_verdict_while_a_client_could_build_it_diverges() {
+    let log = Captured;
+    let _guard = log.install();
+    let state = Arc::new(HubState::for_test(Duration::ZERO));
+    let mut j = job(0, Arc::new(Replay::default()));
+    j.key = key_of(0);
+    let c = state.shadow.submit(&j.key, ("aarch64-linux", &[]), true);
+    let _client = j.replay.subscribe_as(c).await;
+    state.shadow.cannot(&j, "hub-side error");
+    assert_eq!(log.count("shadow divergence"), 1);
+}
+
 /// A worker of the system without a feature the build requires does not
 /// serve it in the core either: the core Refuses the client.
 #[tokio::test]

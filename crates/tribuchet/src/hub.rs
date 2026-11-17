@@ -550,7 +550,7 @@ async fn supervise_job(
         // key runs it already: cancel that.
         let _ = cancel(&out_tx, &job).await;
         if job.replay.has_subscribers().await {
-            losses::hub_cannot(&state, job, ("before dispatch", None), err).await;
+            losses::hub_cannot(&state, job, "before dispatch", err).await;
         } else {
             tracing::info!(id = job.id, "dropping build before dispatch: {err}");
             state.finish(&job).await;
@@ -571,8 +571,7 @@ async fn supervise_job(
         // The session is still up and may hold a half-staged or
         // running build for this id. Cancel frees that slot.
         let _ = cancel(&out_tx, &job).await;
-        let at = ("hub-side error", dispatch.run.as_ref());
-        losses::hub_cannot(&state, job, at, err).await;
+        losses::hub_cannot(&state, job, "hub-side error", err).await;
     }
 }
 
