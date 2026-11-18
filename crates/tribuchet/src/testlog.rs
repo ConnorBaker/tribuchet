@@ -39,7 +39,7 @@ impl io::Write for Writer {
 }
 
 #[derive(Default)]
-pub(super) struct Captured;
+pub(crate) struct Captured;
 
 /// The subscriber that writes to each thread's SINK, registered.
 fn capture() -> Dispatch {
@@ -58,7 +58,7 @@ fn go_global(d: Dispatch) {
 }
 
 /// Clears the thread's captured lines when the capture ends.
-pub(super) struct Guard;
+pub(crate) struct Guard;
 
 impl Drop for Guard {
     fn drop(&mut self) {
@@ -68,7 +68,7 @@ impl Drop for Guard {
 
 impl Captured {
     /// Capture this thread's events from now until the guard drops.
-    pub(super) fn install(&self) -> Guard {
+    pub(crate) fn install(&self) -> Guard {
         static GLOBAL: Once = Once::new();
         GLOBAL.call_once(|| go_global(capture()));
         // See the module doc: a "never" stored after go_global's rebuild.
@@ -78,19 +78,19 @@ impl Captured {
     }
 
     /// Whether a captured line contains each of `needles`.
-    pub(super) fn has(&self, needles: &[&str]) -> bool {
+    pub(crate) fn has(&self, needles: &[&str]) -> bool {
         let log = SINK.with(|s| String::from_utf8(s.borrow().clone()).unwrap());
         log.lines().any(|l| needles.iter().all(|n| l.contains(n)))
     }
 
     /// How many captured lines contain `needle`.
-    pub(super) fn count(&self, needle: &str) -> usize {
+    pub(crate) fn count(&self, needle: &str) -> usize {
         let log = SINK.with(|s| String::from_utf8(s.borrow().clone()).unwrap());
         log.lines().filter(|l| l.contains(needle)).count()
     }
 
     /// The first captured line containing `needle`.
-    pub(super) fn line(&self, needle: &str) -> String {
+    pub(crate) fn line(&self, needle: &str) -> String {
         let log = SINK.with(|s| String::from_utf8(s.borrow().clone()).unwrap());
         log.lines()
             .find(|l| l.contains(needle))
@@ -148,7 +148,7 @@ mod tests {
     /// Run the ignored test `name` alone in a process of its own: it passes.
     fn passes_alone(name: &str) {
         let out = Command::new(env::current_exe().unwrap())
-            .args(["--exact", &format!("hub::testlog::tests::{name}")])
+            .args(["--exact", &format!("testlog::tests::{name}")])
             .args(["--ignored", "--test-threads=1"])
             .output()
             .unwrap();

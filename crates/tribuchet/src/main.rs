@@ -11,6 +11,7 @@ mod hub;
 mod nar;
 mod netpolicy;
 mod proto;
+mod report;
 mod rt;
 mod sd;
 #[cfg(test)]
@@ -20,6 +21,8 @@ mod sockpath;
 mod stalltest;
 mod store;
 mod tailscale;
+#[cfg(test)]
+mod testlog;
 mod tmpdir;
 mod worker;
 

@@ -27,6 +27,7 @@ use crate::errors::chain;
 use crate::errors::{Result, err_ctx, err_msg};
 use crate::fsutil::io_ctx;
 use crate::proto::{BuildAssignment, MAX_RESEND_ROUNDS, Need, TmpDirArchive};
+use crate::report::Ticker;
 use crate::tmpdir::unpack_tmp_dir;
 
 /// Where staging of one build stands after a hub message.
@@ -75,6 +76,8 @@ pub(super) struct ActiveBuild {
     pool: Option<ImportPool>,
     chunks: ChunkStaging,
     tmp_unpacker: Option<Unpacker>,
+    /// When its staging says where it stands.
+    report: Ticker,
 }
 
 fn store_base(store_path: &str) -> &str {
@@ -127,6 +130,7 @@ impl ActiveBuild {
             pool: None,
             chunks,
             tmp_unpacker: None,
+            report: Ticker::default(),
         })
     }
 
@@ -343,7 +347,8 @@ impl ActiveBuild {
                 }
                 _ => {
                     if self.claim(path) {
-                        tracing::info!(path, "taking over input another build gave up on");
+                        let id = &self.assignment.build_id;
+                        tracing::info!(id, path, "taking over input another build gave up on");
                         need = self.need(vec![path.to_string()], Vec::new());
                     }
                 }
@@ -401,6 +406,7 @@ impl ActiveBuild {
             }
             self.resend_rounds += 1;
             tracing::warn!(
+                id = self.assignment.build_id,
                 path,
                 bad_chunks = bad.len(),
                 "staging failed import again: {e}"
@@ -475,6 +481,8 @@ pub(super) use validate::validate_assignment;
 #[path = "build/import_pool.rs"]
 mod import_pool;
 mod outputs;
+#[path = "build/report.rs"]
+mod report;
 pub(super) use agent_exec::supervise_agent;
 pub(super) use outputs::pack_outputs;
 

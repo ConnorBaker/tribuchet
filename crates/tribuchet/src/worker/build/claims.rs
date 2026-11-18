@@ -87,7 +87,12 @@ impl Wait {
 
 #[cfg(test)]
 mod tests {
+    use super::super::ActiveBuild;
+    use super::super::tests::base_assignment;
     use super::*;
+    use crate::errors::Result;
+    use crate::testlog::Captured;
+    use crate::worker::WorkerCtx;
 
     #[tokio::test]
     async fn second_build_waits_and_is_woken() {
@@ -117,5 +122,24 @@ mod tests {
         claims.settle("p", ClaimState::Failed);
         rx.recv().await.unwrap();
         assert_eq!(wait.settled(), Some(ClaimState::Failed));
+    }
+
+    /// A build taking over an input another gave up on names itself: the
+    /// worker's journal holds many builds' staging at once.
+    #[tokio::test]
+    async fn a_takeover_names_its_build() -> Result<()> {
+        let log = Captured;
+        let _guard = log.install();
+        let dir = tempfile::tempdir()?;
+        let ctx = WorkerCtx::for_test(dir.path(), 1, vec![])?;
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut build = ActiveBuild::new(base_assignment(), ctx.clone(), tx.clone())?;
+        let _theirs = ctx.claims.claim_or_wait("p", "other", &tx);
+        assert!(!build.claim("p"));
+        ctx.claims.settle("p", ClaimState::Failed);
+        build.woken("p")?;
+        let id = format!(r#"id="{}""#, build.assignment.build_id);
+        assert!(log.line("taking over input").contains(&id));
+        Ok(())
     }
 }

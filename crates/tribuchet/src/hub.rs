@@ -54,8 +54,6 @@ mod serve;
 mod shadow;
 mod state;
 mod submit;
-#[cfg(test)]
-mod testlog;
 pub use serve::run;
 
 use crate::errors::{Error, Result, chain};

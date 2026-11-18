@@ -3,7 +3,7 @@
 use futures_util::FutureExt;
 
 use super::*;
-use crate::hub::testlog::Captured;
+use crate::testlog::Captured;
 
 /// A client that attaches 5 minutes after its build ended is caught up;
 /// the line names the build and counts from its end.

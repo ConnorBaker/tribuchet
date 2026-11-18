@@ -6,11 +6,11 @@ use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering::Relaxed};
 use std::sync::{Arc, LazyLock};
 use std::thread;
-use std::time::Instant;
 
 use futures_util::StreamExt as _;
 use tokio::sync::{Semaphore, mpsc};
 use tokio::task::spawn_blocking;
+use tokio::time::Instant;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::Status;
 use zstd::bulk::compress;
@@ -25,20 +25,34 @@ use crate::hub::state::Job;
 use crate::proto::{ChunkFrame, HubMessage, hub_message};
 
 /// What the hub served a build, summed over its Needs as they are
-/// served; chunks = cached + repacked. serve_ms includes the frames of
-/// the session's other Needs sent meanwhile. A Need cut off (the staging
-/// dropped mid-Need): plain_bytes and repacked count the chunks planned
-/// for the manifests it reached, cached only those of a finished cache
-/// pass, wire_bytes each frame handed to a send; needs and serve_ms
-/// leave it out.
+/// served; chunks = cached + repacked. Times in µs: a Need's serve_us is
+/// its permit_us and send_us, and the hub's work and its wait for frames
+/// from the cache reader or the packer between them. A Need cut off (the
+/// staging dropped mid-Need) counts in every sum but needs and serve_us,
+/// as far as it got.
 #[derive(Debug, Default)]
 pub(super) struct Served {
     needs: AtomicU64,
+    /// Of manifests whose needed chunks the cache held all of: one it lacks
+    /// sends the manifest to the packer, its cached ones counted repacked.
     cached: AtomicU64,
+    /// Planned, as plain_bytes, not sent.
     repacked: AtomicU64,
     plain_bytes: AtomicU64,
+    /// Handed to a send, before its wait for the permit.
     wire_bytes: AtomicU64,
-    serve_ms: AtomicU64,
+    serve_us: AtomicU64,
+    /// Waited for the session's send permit: the other Needs' frames, and
+    /// what their sends waited.
+    permit_us: AtomicU64,
+    /// Its own frames' sends waited for room in the session's stream: the
+    /// link's backpressure.
+    send_us: AtomicU64,
+}
+
+/// Microseconds since `t0`.
+fn us(t0: Instant) -> u64 {
+    u64::try_from(t0.elapsed().as_micros()).unwrap_or(u64::MAX)
 }
 
 /// Each needed chunk ships once, from the first manifest holding it,
@@ -67,20 +81,19 @@ pub(super) async fn serve_need(
             continue;
         }
         let n = todo.len();
-        let rest = serve_cached(cache, &job.id, todo, out_tx, sess, &total.wire_bytes).await?;
+        let rest = serve_cached(cache, &job.id, todo, out_tx, sess, total).await?;
         total.cached.fetch_add((n - rest.len()) as u64, Relaxed);
         if rest.is_empty() {
             continue;
         }
         total.repacked.fetch_add(rest.len() as u64, Relaxed);
         let path = &info.store_path;
-        stream_path_chunks(cache, job, path, rest, out_tx, sess, &total.wire_bytes).await?;
+        stream_path_chunks(cache, job, path, rest, out_tx, sess, total).await?;
     }
     if served.len() != needed.len() {
         return Err(err_msg("worker needs chunks outside every manifest"));
     }
-    let ms = u64::try_from(t0.elapsed().as_millis()).unwrap_or(u64::MAX);
-    total.serve_ms.fetch_add(ms, Relaxed);
+    total.serve_us.fetch_add(us(t0), Relaxed);
     total.needs.fetch_add(1, Relaxed);
     // The build's sums so far: a Need's own are the step from the last.
     tracing::debug!(id = job.id, worker = sess.worker, ?total, "need served");
@@ -129,13 +142,17 @@ pub(super) async fn compute_recipe(
 
 async fn send_frame(
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
-    sess: &WorkerSession,
+    (sess, total): (&WorkerSession, &Served),
     build_id: &str,
     hash: &Hash,
     zstd: Vec<u8>,
 ) -> Result<()> {
+    total.wire_bytes.fetch_add(zstd.len() as u64, Relaxed);
+    let t0 = Instant::now();
     let _permit = sess.send_permit().await;
-    send(
+    total.permit_us.fetch_add(us(t0), Relaxed);
+    let t0 = Instant::now();
+    let sent = send(
         out_tx,
         hub_message::Msg::Chunk(ChunkFrame {
             build_id: build_id.to_string(),
@@ -144,19 +161,20 @@ async fn send_frame(
             eof: false,
         }),
     )
-    .await
+    .await;
+    total.send_us.fetch_add(us(t0), Relaxed);
+    sent
 }
 
 /// Serve needed chunks from the cache, returning what still needs a
-/// repack. Adds the frame bytes sent to `wire`. A blocking thread reads
-/// the frames, one ahead of the sends.
+/// repack. A blocking thread reads the frames, one ahead of the sends.
 async fn serve_cached(
     cache: &ChunkCache,
     build_id: &str,
     todo: HashSet<Hash>,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
     sess: &WorkerSession,
-    wire: &AtomicU64,
+    total: &Served,
 ) -> Result<HashSet<Hash>> {
     let Some(frames) = cache.locate_all(&todo) else {
         return Ok(todo);
@@ -175,8 +193,7 @@ async fn serve_cached(
     });
     let mut rest = todo;
     while let Some((hash, frame)) = rx.recv().await {
-        wire.fetch_add(frame.len() as u64, Relaxed);
-        send_frame(out_tx, sess, build_id, &hash, frame).await?;
+        send_frame(out_tx, (sess, total), build_id, &hash, frame).await?;
         rest.remove(&hash);
     }
     reader.await.map_err(err_ctx("cache read task panicked"))?;
@@ -184,8 +201,7 @@ async fn serve_cached(
 }
 
 /// Re-pack the path and send its needed chunks in recipe order,
-/// compressing up to one chunk per core in parallel. Adds the frame
-/// bytes sent to `wire`.
+/// compressing up to one chunk per core in parallel.
 async fn stream_path_chunks(
     cache: &Arc<ChunkCache>,
     job: &Job,
@@ -193,7 +209,7 @@ async fn stream_path_chunks(
     todo: HashSet<Hash>,
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
     sess: &WorkerSession,
-    wire: &AtomicU64,
+    total: &Served,
 ) -> Result<()> {
     let (tx, rx) = mpsc::channel::<Chunk>(cores());
     let path = store_path.to_string();
@@ -213,8 +229,7 @@ async fn stream_path_chunks(
         .buffered(cores());
     while let Some(frame) = frames.next().await {
         let (hash, frame) = frame.map_err(err_ctx("compress task panicked"))??;
-        wire.fetch_add(frame.len() as u64, Relaxed);
-        send_frame(out_tx, sess, &job.id, &hash, frame).await?;
+        send_frame(out_tx, (sess, total), &job.id, &hash, frame).await?;
     }
     packer.await.map_err(err_ctx("pack task panicked"))?
 }
@@ -257,7 +272,7 @@ mod tests {
         let sess = WorkerSession::new("w".into(), tx.clone());
 
         let todo: HashSet<Hash> = [a, b].into();
-        let wire = AtomicU64::default();
+        let wire = Served::default();
         let rest = serve_cached(&cache, "b1", todo.clone(), &tx, &sess, &wire)
             .await
             .unwrap();
