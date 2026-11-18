@@ -98,7 +98,7 @@ async fn a_verdict_while_a_client_could_build_it_diverges() {
     j.key = key_of(0);
     let c = state.shadow.submit(&j.key, ("aarch64-linux", &[]), true);
     let _client = j.replay.subscribe_as(c).await;
-    state.shadow.cannot(&j, "hub-side error");
+    state.shadow.cannot(&j, "hub-side error", 1);
     assert_eq!(log.count("shadow divergence"), 1);
 }
 

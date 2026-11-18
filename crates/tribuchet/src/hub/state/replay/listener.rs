@@ -1,6 +1,7 @@
 //! A build's clients as the hub answers them: whether each one's own Nix
 //! can build the key, and where in the log it was declined (SEMANTICS-7 L12).
 
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, OnceLock};
 
 use tokio::sync::mpsc;
@@ -64,16 +65,42 @@ impl Replay {
             let inner = self.inner.lock().await;
             inner.base + inner.events.len()
         };
-        let (mut declined, mut waiting) = (Vec::new(), 0);
-        for l in self.clients.lock().unwrap().iter().filter(|l| l.waits()) {
-            if l.can_local {
-                l.declined.get_or_init(|| at);
-                declined.push(l.id);
-            } else {
-                waiting += 1;
-            }
-        }
+        let answered = decline(&self.clients.lock().unwrap(), true, at);
         self.grew.notify_waiters();
+        answered
+    }
+
+    /// Decide the build's answer at this instant (SEMANTICS-7 cut-over 10):
+    /// no client joins after it; each still waiting whose own Nix can build
+    /// the key is declined after all the log holds now, if `local`; and
+    /// `decided` is told those declined and how many others wait, all under
+    /// the clients' lock, so that none joins between.
+    pub(in crate::hub) fn close(
+        &self,
+        local: bool,
+        decided: impl FnOnce(&[sem::Client], usize),
+    ) -> (Vec<sem::Client>, usize) {
+        let at = self.published.load(Ordering::Acquire);
+        let clients = self.clients.lock().unwrap();
+        self.closed.store(true, Ordering::Relaxed);
+        let (declined, waiting) = decline(&clients, local, at);
+        self.grew.notify_waiters();
+        decided(&declined, waiting);
         (declined, waiting)
     }
+}
+
+/// Decline at `at` each of `clients` still waiting whose own Nix can build
+/// the key, if `local`: their numbers, and how many others still wait.
+fn decline(clients: &[Listener], local: bool, at: usize) -> (Vec<sem::Client>, usize) {
+    let (mut declined, mut waiting) = (Vec::new(), 0);
+    for l in clients.iter().filter(|l| l.waits()) {
+        if local && l.can_local {
+            l.declined.get_or_init(|| at);
+            declined.push(l.id);
+        } else {
+            waiting += 1;
+        }
+    }
+    (declined, waiting)
 }

@@ -18,6 +18,7 @@ use Step::{
 mod hold;
 mod laws;
 mod schedules;
+mod verdict;
 
 impl Replay {
     /// Whether the latest delivery's outputs are pinned in the cache.
