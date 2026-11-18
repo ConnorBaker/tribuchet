@@ -262,10 +262,12 @@ than the waiting builds can use, counted hub-wide
 (`hub/state/clientless.rs`). None that a worker holds from before a hub
 restart is given up: it runs to completion.
 
-The hub's own nix-daemon fails a build, naming the cause, once a
-failure of class c has repeated θ(c) times in a row on the same
-request, as that build counts them; otherwise the build waits and its
-clients are told once (`hub/relay/daemon.rs`):
+Each failure of the hub's own nix-daemon is counted by class c and
+request, as the build counts them; short of θ(c) the build waits, its
+clients told once (`hub/relay/daemon.rs`). At θ(c) each client whose
+Nix builds it is declined. The others fail, naming the cause, if c is a
+fact about the hub (θ 1, the hub's verdict, `hub/losses.rs`); otherwise
+they wait on, as below θ:
 
 | class | θ |
 |---|---|
@@ -273,6 +275,11 @@ clients are told once (`hub/relay/daemon.rs`):
 | a message the hub cannot read | 2 |
 | a request the daemon drops as its journal says a worker crashed | 3 |
 | anything else: a drop or close with no such word in the journal, no answer within a minute, a silent daemon's included | ∞ |
+
+An input the hub's store lacks (its daemon knows no such path) is no
+verdict either: the clients whose Nix builds it are declined, and the
+build is held for the others until a client of its key joins, whose
+Nix had that input as it submitted (`hub/state/hold.rs`).
 
 ## Placement
 
