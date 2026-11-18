@@ -11,8 +11,8 @@ use harmonia_store_content_address::{
     ContentAddress, ContentAddressMethod, make_store_path_from_ca,
 };
 use harmonia_store_path::{StoreDir, StorePath};
-use harmonia_utils_hash::Hash;
 use harmonia_utils_hash::fmt::Any;
+use harmonia_utils_hash::{Algorithm, Hash};
 use serde::Deserialize;
 
 #[derive(Debug, thiserror::Error)]
@@ -129,16 +129,22 @@ pub fn fixed_output<'a>(
             attr("outputHash")?,
             attr("outputHashAlgo").unwrap_or_default(),
         );
-        let hash = hash
-            .parse::<Any<Hash>>()
-            .or_else(|_| format!("{algo}:{hash}").parse());
+        // An empty hash is the zero hash of outputHashAlgo, as Nix takes it
+        // (newHashAllowEmpty), as in buildGoModule's `vendorHash = ""`.
+        let hash = match hash.as_str() {
+            "" => Ok(Hash::new(algo.parse::<Algorithm>().ok()?, &[0; 64])),
+            _ => hash
+                .parse::<Any<Hash>>()
+                .or_else(|_| format!("{algo}:{hash}").parse())
+                .map(Any::into_hash),
+        };
         let method = match attr("outputHashMode").as_deref() {
             None | Some("" | "flat") => ContentAddressMethod::Flat,
             Some("recursive" | "nar") => ContentAddressMethod::NixArchive,
             Some("text") => ContentAddressMethod::Text,
             Some(_) => return None,
         };
-        let ca = ContentAddress::from_hash(method, hash.ok()?.into_hash()).ok()?;
+        let ca = ContentAddress::from_hash(method, hash.ok()?).ok()?;
         Some(make_store_path_from_ca(&store, out.name().clone(), ca) == out)
     };
     name == "out" && fixed() == Some(true)
@@ -227,6 +233,9 @@ pub(crate) mod tests {
     const NAR: &str = "/nix/store/gsk17yzsgr98iadxvr4nq89nzyy81x8f-src";
     pub(crate) const INPUT_ADDRESSED: &str = "/nix/store/3am3whmm9lr7m3mi4w3ahdh4q12iyzk0-src";
     pub(crate) const HASH: &str = "sha256-2ex2y+NNuY7sNTn+LImdJrDIN8s+tGalsPEJyr9mWPc=";
+    /// An empty sha256 outputHash, flat for `x` and recursive for `e`.
+    const EMPTY_FLAT: &str = "/nix/store/yplc6kklcg6k8aln037jq8jxq5v92wln-x";
+    const EMPTY_NAR: &str = "/nix/store/lzvy3q0z642kia65iz3h8yzb10dqv03y-e";
 
     /// Whether `env` gives a build whose output is `out` network.
     fn network(env: &serde_json::Value, out: &str) -> bool {
@@ -249,6 +258,11 @@ pub(crate) mod tests {
         let nar = serde_json::json!({"outputHash": HASH, "outputHashMode": "recursive"});
         assert!(net(nar.clone(), NAR));
         assert!(!net(nar, SRI), "flat path, recursive claim");
+        let empty = serde_json::json!({"outputHash": "", "outputHashAlgo": "sha256"});
+        assert!(net(empty.clone(), EMPTY_FLAT));
+        let mut empty_nar = empty;
+        empty_nar["outputHashMode"] = "recursive".into();
+        assert!(net(empty_nar, EMPTY_NAR));
         // An input-addressed derivation that sets what Nix sets for a
         // fixed-output one, and a hash, gets none.
         let spoof = serde_json::json!({"NIX_OUTPUT_CHECKED": "1", "outputHash": HASH});
