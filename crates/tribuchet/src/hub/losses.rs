@@ -197,27 +197,37 @@ pub(super) async fn count(state: &HubState, mut job: Job, charge: Charge) -> Opt
 /// clients, and all of a build with network (which would run in the
 /// client host's network, outside every fod-network policy), wait on.
 async fn defer(state: &HubState, job: Job, (losses, lost): (u32, &str)) -> Option<Job> {
-    if job.req.fixed_output || !job.replay.can_local().contains(&true) {
+    let Some((declined, waiting)) = decline(state, &job, "loss cap").await else {
         return Some(job);
-    }
-    job.restart_outputs().await;
-    let (declined, waiting) = job.replay.decline_local().await;
-    state.shadow.deferred("loss cap", &job, &declined);
+    };
     tracing::warn!(
         id = job.id,
         losses,
-        declined = declined.len(),
+        declined,
         waiting,
         "build lost {lost} too often; declining it to the clients whose Nix builds it"
     );
-    if !declined.is_empty() {
-        Metrics::inc(&state.metrics.declined);
-    }
     if waiting > 0 {
         return Some(job);
     }
     state.finish(&job).await;
     None
+}
+
+/// Send each client of `job` whose own Nix builds it back to it (D2), its
+/// output transfers dropped first, at `point`: how many were, and how many
+/// others wait. None if no client could be: one with network, or none.
+pub(super) async fn decline(state: &HubState, job: &Job, point: &str) -> Option<(usize, usize)> {
+    if job.req.fixed_output || !job.replay.can_local().contains(&true) {
+        return None;
+    }
+    job.restart_outputs().await;
+    let (declined, waiting) = job.replay.decline_local().await;
+    state.shadow.deferred(point, job, &declined);
+    if !declined.is_empty() {
+        Metrics::inc(&state.metrics.declined);
+    }
+    Some((declined.len(), waiting))
 }
 
 /// The hub cannot carry `job` at `point`: `err`, its own verdict, a fact

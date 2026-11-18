@@ -256,10 +256,12 @@ impl attach_hub_server::AttachHub for AttachSvc {
                     client
                 };
                 // Answered before this client came, and so unlisted: anew.
-                match replay.join(client).await {
-                    Some(rx) => break rx,
-                    None => continue,
-                }
+                let Some(rx) = replay.join(client).await else {
+                    continue;
+                };
+                // A build held for an input this client brought is free.
+                self.state.notify.notify_waiters();
+                break rx;
             }
             let id = new_id();
             let replay = Arc::new(Replay::new(id.clone()));

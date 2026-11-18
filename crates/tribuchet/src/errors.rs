@@ -45,6 +45,11 @@ pub enum Error {
     /// SILENCE_TIMEOUT: it may be gone, a lost session.
     #[error("the worker read nothing for too long")]
     Silent,
+    /// An input of the build is not valid in the hub's own store: no fact
+    /// about the build, as a client of it may bring it back (SEMANTICS-7
+    /// cut-over 10).
+    #[error("{0} is not a valid path in the local store")]
+    Missing(String),
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]

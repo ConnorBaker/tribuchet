@@ -70,6 +70,28 @@ impl Replay {
         answered
     }
 
+    /// Clients that joined so far: what `hold` is to be given.
+    pub(in crate::hub) fn joins(&self) -> usize {
+        let _clients = self.clients.lock().unwrap();
+        self.joins.load(Ordering::Relaxed)
+    }
+
+    /// Hold the build out of placement until a client joins, unless one
+    /// joined since `joins` said `since`: whether it is held.
+    pub(in crate::hub) fn hold(&self, since: usize) -> bool {
+        let _clients = self.clients.lock().unwrap();
+        let held = self.joins.load(Ordering::Relaxed) == since;
+        self.held.store(held, Ordering::Relaxed);
+        held
+    }
+
+    /// Held, with a client still waiting: a take passes it over. One with
+    /// none is taken, to be ended as any build whose clients left.
+    pub(in crate::hub) fn held(&self) -> bool {
+        let clients = self.clients.lock().unwrap();
+        self.held.load(Ordering::Relaxed) && clients.iter().any(Listener::waits)
+    }
+
     /// Decide the build's answer at this instant (SEMANTICS-7 cut-over 10):
     /// no client joins after it; each still waiting whose own Nix can build
     /// the key is declined after all the log holds now, if `local`; and

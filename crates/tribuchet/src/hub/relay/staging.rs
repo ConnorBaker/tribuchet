@@ -21,7 +21,7 @@ use super::serve::{Served, compute_recipe, serve_need};
 use crate::chunker::parse_hashes;
 use crate::chunkio;
 use crate::chunkstore::Hash;
-use crate::errors::{Result, err_msg};
+use crate::errors::{Error, Result, err_msg};
 use crate::hub::chunkcache::Recipe;
 use crate::hub::state::{HubState, Job};
 use crate::proto::{
@@ -395,11 +395,7 @@ async fn query_path_info_chunk(state: &HubState, job: &Job, paths: &[String]) ->
                     out.push(path_info(p, &store_dir, info));
                     continue;
                 }
-                Ok(None) => {
-                    return Err(err_msg(format!(
-                        "{p} is not a valid path in the local store"
-                    )));
-                }
+                Ok(None) => return Err(Error::Missing(p.clone())),
                 Err(failed) => failed,
             };
             // Its slot is free during the backoff.

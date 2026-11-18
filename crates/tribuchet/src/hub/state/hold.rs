@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 
 use super::{HubState, Job, Replay, Servability, Wait};
 use crate::hub::known::refusal;
+use crate::hub::losses;
 use crate::hub::metrics::Metrics;
 use crate::hub::semantics as sem;
 use crate::proto::attach_event;
@@ -125,6 +126,39 @@ impl HubState {
             tracing::error!("ending unservable builds: {e}");
         }
         due
+    }
+
+    /// `job`'s input `path` is not valid in the hub's store, as a query made
+    /// once `since` clients had joined says. No fact about the build: its
+    /// client's Nix made every input valid in its store, the hub's, before
+    /// it submitted, and a client that joins does so again (SEMANTICS-7
+    /// cut-over 10). Each client whose Nix builds it is declined (D2); the
+    /// others wait, the build held out of placement until a client joins.
+    pub(in crate::hub) async fn hold_for_input(
+        self: &Arc<Self>,
+        job: Job,
+        path: &str,
+        since: usize,
+    ) {
+        losses::decline(self, &job, "input missing").await;
+        if job.replay.can_local().is_empty() {
+            self.finish(&job).await;
+            return;
+        }
+        let held = job.replay.hold(since);
+        tracing::warn!(
+            id = job.id,
+            path,
+            held,
+            "an input is not in the hub's store"
+        );
+        let note = format!(
+            "tribuchet: the hub's store lacks {path}, an input; waiting for a client to bring it\n"
+        );
+        (job.replay
+            .publish(attach_event::Event::Log(note.into_bytes())))
+        .await;
+        self.requeue(job).await;
     }
 
     /// End `job`, which no connected or known worker serves, its answer

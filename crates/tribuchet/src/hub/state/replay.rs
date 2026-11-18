@@ -61,6 +61,11 @@ pub(in crate::hub) struct Replay {
     closed: AtomicBool,
     /// One past the last event published.
     published: AtomicUsize,
+    /// Out of placement until a client joins, which brings back an input
+    /// the hub's store lacked (SEMANTICS-7 cut-over 10).
+    held: AtomicBool,
+    /// Clients that joined so far.
+    joins: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -492,6 +497,8 @@ impl Replay {
             let client = client();
             let (listener, declined) = Listener::new(&tx, &client);
             clients.push(listener);
+            self.held.store(false, Ordering::Relaxed);
+            self.joins.fetch_add(1, Ordering::Relaxed);
             (client, declined)
         };
         self.hold.lock().unwrap().clientless = None;
