@@ -72,6 +72,8 @@ pub(super) struct Session {
     /// Its CPU arbiter's leader and the builds it keeps frozen, by key,
     /// as its latest heartbeat said (hub/state/clientless.rs).
     pub(super) frozen_by: Option<(String, Vec<String>)>,
+    /// The build of a lost key it runs, alone (D4, state/take.rs).
+    pub(super) alone: Option<String>,
 }
 
 impl Session {
@@ -88,6 +90,9 @@ pub(super) struct Placement {
     pub(super) history: History,
     /// Where the record's rows go; None where the hub holds no record.
     pub(super) record: Option<Recorder>,
+    /// The session taking no new build until it is empty, for a lost key
+    /// waiting to run alone (D4, state/take.rs).
+    pub(super) drain: Option<u64>,
 }
 
 impl Placement {
@@ -99,12 +104,16 @@ impl Placement {
             committed,
             wants,
             frozen_by: None,
+            alone: None,
         };
         self.sessions.insert(id, session);
     }
 
     pub(super) fn close(&mut self, id: u64) {
         self.sessions.remove(&id);
+        if self.drain == Some(id) {
+            self.drain = None;
+        }
     }
 
     pub(super) fn expect(&self, job: &Job) -> Expected {
@@ -127,11 +136,14 @@ impl Placement {
         }
     }
 
-    /// `job` went to `session`: its expected demand counts there until
-    /// it settles. The session's room with it.
-    pub(super) fn dispatched(&mut self, session: u64, job: &Job) -> Option<Room> {
+    /// `job` went to `session`, `alone` if its key is lost: its expected
+    /// demand counts there until it settles. The session's room with it.
+    pub(super) fn dispatched(&mut self, session: u64, job: &Job, alone: bool) -> Option<Room> {
         let s = self.sessions.get_mut(&session)?;
         s.committed.insert(job.id.clone(), job.expected.demand);
+        if alone {
+            s.alone = Some(job.id.clone());
+        }
         Some(room(session, s))
     }
 
@@ -139,7 +151,29 @@ impl Placement {
     pub(super) fn settled(&mut self, session: u64, build_id: &str) {
         if let Some(s) = self.sessions.get_mut(&session) {
             s.committed.remove(build_id);
+            if s.alone.as_deref() == Some(build_id) {
+                s.alone = None;
+            }
         }
+    }
+
+    /// Session `id` asked for work: a lost key it serves waits for room
+    /// (`wants`), or none does. With no session draining, it drains: it
+    /// takes no new build until it is empty, and then the lost key's. It
+    /// drains no longer once no lost key it serves waits.
+    pub(super) fn drain_for(&mut self, id: u64, wants: bool) {
+        match self.drain {
+            None if wants => self.drain = Some(id),
+            Some(d) if d == id && !wants => self.drain = None,
+            _ => {}
+        }
+    }
+
+    /// Of session `id`: whether it holds a build, and one alone (D4).
+    pub(super) fn residence(&self, id: u64) -> (bool, bool) {
+        let s = self.sessions.get(&id);
+        let busy = s.is_some_and(|s| !s.committed.is_empty());
+        (busy, s.is_some_and(|s| s.alone.is_some()))
     }
 
     pub(super) fn rooms(&self) -> Vec<Room> {
@@ -192,7 +226,7 @@ pub(super) fn dispatch(
     let (idle_elsewhere, room, record) = {
         let workers = state.worker_caps.lock().unwrap();
         let mut placement = state.placement.lock().unwrap();
-        let room = placement.dispatched(to.0, job);
+        let room = placement.dispatched(to.0, job, state.lost.has(&job.key));
         let serves = |r: &&Room| {
             (workers.get(&r.id)).is_some_and(|c| c.serves(&job.req.system, &job.features))
         };

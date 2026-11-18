@@ -14,6 +14,7 @@ use tonic::Status;
 use super::chunkcache::ChunkCache;
 use super::known::Known;
 use super::losses::{self, Loss};
+use super::lost::Lost;
 use super::metrics::Metrics;
 use super::placement::{Expected, Placement};
 use super::relay::{DAEMON_ANSWER, DaemonEvidence};
@@ -170,6 +171,8 @@ pub(super) struct HubState {
     pub(super) shadow: Arc<Shadow>,
     /// Every worker that registered, across restarts (L11).
     pub(super) known: Known,
+    /// Keys whose run ended with no known cause, across restarts (D4, L10).
+    pub(super) lost: Lost,
 }
 
 #[derive(Clone)]
@@ -260,6 +263,7 @@ impl HubState {
             runs: Runs::default(),
             shadow: Arc::default(),
             known: Known::default(),
+            lost: Lost::default(),
         }
     }
 

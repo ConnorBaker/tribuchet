@@ -39,6 +39,7 @@ mod link;
 #[cfg(test)]
 pub(crate) use chunkcache::ChunkCache;
 mod losses;
+mod lost;
 mod metrics;
 #[cfg(test)]
 mod model;

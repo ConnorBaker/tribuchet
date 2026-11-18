@@ -33,7 +33,11 @@ async fn a_build_with_no_client_is_given_up_when_its_load_sends_work_elsewhere()
         } else {
             None
         };
-        state.placement.lock().unwrap().dispatched(a.id, &held);
+        state
+            .placement
+            .lock()
+            .unwrap()
+            .dispatched(a.id, &held, false);
         let _listed = state.list_dispatch(&held, a.id);
         tokio::time::sleep(2 * FLOOR).await;
         let client = queue(&state, 0, "build-0", expecting(1.0, 0.0)).await;

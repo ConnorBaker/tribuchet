@@ -184,12 +184,14 @@ pub(super) async fn run_job(
                 }
                 state.shadow.result(job, res.run.as_ref(), res.exit_code);
                 if res.exit_code != 0 {
+                    state.lost.clear(&job.key); // An outcome lifts the mark (L10).
                     return publish_worker_failure(state, out_tx, job, &res).await;
                 }
                 dispatch.reached = Run::Finished;
                 let outputs = verify_set(res.outputs, &job.req.outputs)?;
                 deliver_outputs(state, job, out_tx, &mut in_rx, outputs).await?;
                 state.shadow.fetched(job, res.run.as_ref());
+                state.lost.clear(&job.key);
                 finish_relay(state, out_tx, &job.replay, job).await;
                 return Ok(());
             }

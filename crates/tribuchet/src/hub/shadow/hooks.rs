@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 
 use super::{CLIENTS, Client, Mirror, Shadow, Sys, answers, id, key, serves, today};
-use crate::hub::losses::Loss;
+use crate::hub::losses::{Loss, Run};
 use crate::hub::semantics::{self as sem, Answer, Event, Outcome, Phase};
 use crate::hub::state::{HubState, Job};
 use crate::proto::{Register, RunId};
@@ -260,11 +260,15 @@ impl Shadow {
 
 impl HubState {
     /// The hub stops waiting on `loss`'s worker, its session gone and the
-    /// worker not back: the core's Suspect.
-    pub(in crate::hub) fn given_up_on(&self, loss: &Loss) {
+    /// worker not back: the core's Suspect. A started run of `key` there
+    /// ended with no known cause (D4).
+    pub(in crate::hub) fn given_up_on(&self, loss: &Loss, key: &str) {
         let holding = self.holding.lock().unwrap();
         let workers = self.worker_caps.lock().unwrap();
         if !workers.contains_key(&loss.session) && !loss.back(&workers, &holding) {
+            if loss.run == Run::Started {
+                self.lost.mark(key);
+            }
             self.shadow.suspect(&loss.worker);
         }
     }
