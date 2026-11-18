@@ -55,8 +55,12 @@ GC by per-build temp roots. The worker must be a trusted daemon user
    no worker is expected for it: `worker-grace-secs` after the hub's
    start or after the last worker serving it left. A fixed-output build
    is never declined, since a local build would run in the hub host's
-   network: it waits for a worker, and its clients are told. Otherwise
-   submitters block and Nix's max-jobs bounds parallelism.
+   network. A client whose Nix cannot build it, every fixed-output
+   build's among them, waits for a worker, told why, while a known
+   worker (one that registered and was not decommissioned since) serves
+   it; if none does, it is refused once no worker is expected for it
+   (`hub/known.rs`). Otherwise submitters block and Nix's max-jobs
+   bounds parallelism.
 3. Staging: the assignment carries the input closure, with a manifest
    (Nix db metadata plus chunk list) inline for paths the hub has
    chunked before and does not know the worker to have. The worker asks
@@ -143,9 +147,8 @@ Reference implementations: `nix/src/libstore/unix/build/` and
   store path of the content hash the derivation declares. An `__impure`
   one gets none. A worker gives it a network of its own only on Linux
   with `/dev/net/tun`, so no current macOS worker advertises
-  `tribuchet-network` (one refuses such a build): a darwin one waits,
-  its clients told, until such a worker registers or the client gives
-  up.
+  `tribuchet-network` (one refuses such a build), and the hub answers
+  such a build as step 2 says.
 
 Accepted tradeoffs: no recursive-nix, sandbox parity is ours to maintain,
 trusted worker pool assumed (output authenticity rests on the
