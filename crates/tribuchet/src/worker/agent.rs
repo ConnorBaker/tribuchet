@@ -7,6 +7,13 @@
 //! (non-worker) uid. The builder is the agent's child, so builds
 //! survive worker restarts and the agent holds the exit status until
 //! the worker adopts it. The build log goes to a worker-provided fd.
+//! The agent answers Adopt and Status at once whatever Kill or Finish it
+//! runs, and once a Start has registered its build. It does not while a
+//! Start stages its build (holding `current` through its kill sweep,
+//! scratch cleanup, unpack and spawn), while it runs a Cleanup (sent once
+//! the worker has the build's result on disk), or for up to 10 s behind a
+//! client that connects and sends nothing. Beyond those, an agent that
+//! does not answer is stopped or stalled from outside.
 //! The protocol lives in
 //! crates/sandbox-proto/proto/agent.proto.
 
@@ -108,6 +115,12 @@ struct Agent {
     worker_uid: u32,
     confinement: platform::Confinement,
     current: Mutex<Option<Build>>,
+    /// Held by Kill, Finish and Cleanup from before they read `current`
+    /// until their kill sweep and helper are done: one at a time, so no
+    /// sweep kills another's helper. Start sweeps only while `current` is
+    /// empty, and only Cleanup empties it, under this lock. Never waited
+    /// on with `current` held.
+    work: Mutex<()>,
     /// True under a service manager, where the agent owns a dedicated
     /// uid: exit after Cleanup so a fresh agent is started, and sweep
     /// the whole uid when killing. Self-bound sockets (development,
@@ -146,15 +159,24 @@ pub fn run(opts: &Options) -> Result<()> {
         worker_uid: opts.worker_uid.unwrap_or_else(|| getuid().as_raw()),
         confinement,
         current: Mutex::new(None),
+        work: Mutex::new(()),
         dedicated_uid: activated || opts.dedicated_uid,
     });
     tracing::info!(uid = getuid().as_raw(), "agent listening");
-    // One thread accepts and reads every call, so Shutdown is
-    // serialized with accepts: exiting here cannot drop an accepted
-    // connection.
+    serve(&agent, &listener, activated)
+}
+
+/// One thread accepts and reads every call. It answers Status, and
+/// hands Start, Adopt, Kill and Finish to threads of their own, so no
+/// long Finish or Kill keeps an Adopt or Status unanswered. Shutdown and
+/// Cleanup, which may exit, run on it, so their exit drops no connection
+/// still to be accepted. A call already on its own thread is dropped
+/// unanswered, its caller seeing the connection close: a Kill or Finish
+/// an earlier worker sent, waiting on `work` behind the Cleanup.
+fn serve(agent: &Arc<Agent>, listener: &UnixListener, activated: bool) -> Result<()> {
     for conn in listener.incoming() {
         let conn = conn.map_err(err_ctx("accepting connection"))?;
-        let (call, fds) = match read_call(&agent, &conn) {
+        let (call, fds) = match read_call(agent, &conn) {
             Ok(x) => x,
             Err(e) => {
                 report(&conn, &e);
@@ -173,7 +195,10 @@ pub fn run(opts: &Options) -> Result<()> {
                     process::exit(0);
                 }
             }
-            call::Call::Start(_) | call::Call::Adopt(_) => {
+            call::Call::Start(_)
+            | call::Call::Adopt(_)
+            | call::Call::Kill(_)
+            | call::Call::Finish(_) => {
                 let agent = agent.clone();
                 thread::spawn(move || {
                     if let Err(e) = dispatch(&agent, &conn, call, fds) {
@@ -182,7 +207,7 @@ pub fn run(opts: &Options) -> Result<()> {
                 });
             }
             _ => {
-                if let Err(e) = dispatch(&agent, &conn, call, fds) {
+                if let Err(e) = dispatch(agent, &conn, call, fds) {
                     report(&conn, &e);
                 }
             }
@@ -349,6 +374,7 @@ fn handle_adopt(agent: &Arc<Agent>, conn: &UnixStream, req: &AdoptRequest) -> Re
 }
 
 fn handle_kill(agent: &Arc<Agent>, conn: &UnixStream, req: &KillRequest) -> Result<()> {
+    let _work = agent.work.lock().unwrap();
     let pid = {
         let current = agent.current.lock().unwrap();
         match current.as_ref() {
@@ -361,6 +387,7 @@ fn handle_kill(agent: &Arc<Agent>, conn: &UnixStream, req: &KillRequest) -> Resu
 }
 
 fn handle_finish(agent: &Arc<Agent>, conn: &UnixStream, req: &FinishRequest) -> Result<()> {
+    let _work = agent.work.lock().unwrap();
     let (outputs, root, pid) = {
         let current = agent.current.lock().unwrap();
         match current.as_ref() {
@@ -373,7 +400,10 @@ fn handle_finish(agent: &Arc<Agent>, conn: &UnixStream, req: &FinishRequest) -> 
     framing::send_reply(conn, reply::Reply::Empty(Empty {}), &[]).map_err(Error::Framing)
 }
 
+/// Waits for a Kill or Finish still at work (`work`): one an earlier
+/// worker sent, since a worker awaits each call it makes for a build.
 fn handle_cleanup(agent: &Arc<Agent>, conn: &UnixStream, req: &CleanupRequest) -> Result<()> {
+    let _work = agent.work.lock().unwrap();
     let build = {
         let mut current = agent.current.lock().unwrap();
         match current.as_ref() {
@@ -539,35 +569,4 @@ fn make_readable(path: &Path) {
 }
 
 #[cfg(test)]
-mod tests {
-    use std::os::unix::fs::{PermissionsExt, symlink};
-
-    use super::*;
-
-    #[test]
-    fn env_rewrite_replaces_tmp_dir_references() {
-        let mut env = HashMap::from([
-            ("NIX_BUILD_TOP".to_string(), "/build".to_string()),
-            ("ATTRS".to_string(), "/build/.attrs.json".to_string()),
-            ("OTHER".to_string(), "/buildings".to_string()),
-        ]);
-        rewrite_tmp_dir_env(&mut env, "/build", "/scratch/b1/build");
-        assert_eq!(env["NIX_BUILD_TOP"], "/scratch/b1/build");
-        assert_eq!(env["ATTRS"], "/scratch/b1/build/.attrs.json");
-        assert_eq!(env["OTHER"], "/buildings");
-    }
-
-    #[test]
-    fn make_readable_skips_symlinks() {
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("out");
-        fs::create_dir(&out).unwrap();
-        fs::write(out.join("file"), "x").unwrap();
-        symlink("/etc/passwd", out.join("link")).unwrap();
-        make_readable(&out);
-        assert_ne!(
-            fs::metadata(out.join("file")).unwrap().permissions().mode() & 0o444,
-            0
-        );
-    }
-}
+mod tests;

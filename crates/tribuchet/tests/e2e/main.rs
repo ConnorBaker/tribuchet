@@ -25,6 +25,7 @@ mod arbiter;
 mod daemon;
 mod fod_ipv6;
 mod harness;
+mod held;
 mod pairs;
 
 use std::time::Instant;

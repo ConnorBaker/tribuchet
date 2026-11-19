@@ -17,9 +17,9 @@ pub(super) fn requires_uid_range(a: &BuildAssignment) -> bool {
 /// System features this worker can honor, advertised to the hub for
 /// scheduling. Mirrors Nix's defaults. Emulated systems get only the
 /// baseline: kvm is an x86 device to an emulated guest, and uid-range
-/// and recursive-nix under emulation are untested. uid-range needs the
-/// delegated cgroup that spawned agents lack. The builder opens
-/// /dev/kvm as a groupless block uid, so the node must be 0666.
+/// under emulation is untested. uid-range needs the delegated cgroup
+/// that spawned agents lack. The builder opens /dev/kvm as a groupless
+/// block uid, so the node must be 0666.
 fn local_features(native: bool, opts: &WorkerConfig) -> Vec<String> {
     let mut features = vec![
         "nixos-test".to_owned(),
@@ -33,9 +33,6 @@ fn local_features(native: bool, opts: &WorkerConfig) -> Vec<String> {
         if opts.spawn_agents == 0 {
             features.push("uid-range".to_owned());
         }
-    }
-    if native && opts.recursive_nix {
-        features.push("recursive-nix".to_owned());
     }
     features
 }
@@ -82,19 +79,5 @@ mod tests {
         assert!(!requires_uid_range(&a));
         a.required_features = vec!["big-parallel".into(), "uid-range".into()];
         assert!(requires_uid_range(&a));
-    }
-
-    #[test]
-    fn recursive_nix_advertised_only_when_enabled_and_native() {
-        let toml =
-            |body: &str| toml::from_str::<WorkerConfig>(&format!("hub = \"x\"\n{body}")).unwrap();
-        let off = toml("");
-        assert!(!local_features(true, &off).contains(&"recursive-nix".to_owned()));
-        assert!(!local_features(false, &off).contains(&"recursive-nix".to_owned()));
-
-        let on = toml("recursive-nix = true");
-        assert!(local_features(true, &on).contains(&"recursive-nix".to_owned()));
-        // emulated systems must not inherit the host's recursive-nix
-        assert!(!local_features(false, &on).contains(&"recursive-nix".to_owned()));
     }
 }
