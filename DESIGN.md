@@ -470,6 +470,11 @@ reported at start, and nothing is frozen there.
   build.
 * The frozen builds' memory rule is a margin, not a bound: a leader that
   grows faster than one 200 ms sample can still fill a capped slice.
+* Within the agents' slice the kernel's OOM killer kills one process,
+  the largest, which may be a co-tenant's; a build whose child is
+  killed but whose builder exits 0 succeeds (`oom_killed=true`). From
+  Linux 7.0, and 6.19.9, its memcg scan skips an exiting victim
+  (a72f73c4dd9b) and can kill a second task.
 * Dedupe attaches duplicates to the first attempt, so a transient
   failure propagates to all attached submitters (same as Buck2's RE
   dedupe behaviour).
@@ -503,9 +508,11 @@ fixed-output build only to a worker advertising `tribuchet-network`,
 which workers older than it never do, even with `/dev/net/tun`, so
 until an upgraded worker with `/dev/net/tun` registers every
 fixed-output build waits.
-Every agent and its builds run in `system-tribuchet\x2dagent.slice`,
-where a host may cap their memory; the worker reports the slice's
-memory.max, when lower than MemTotal, as its memory.
+The agents run at OOMScoreAdjust=-1000 and their builds at 0, which a
+build cannot lower, so no agent is an OOM victim. Every agent and its
+builds run in `system-tribuchet\x2dagent.slice`, where a host may cap
+their memory; the worker reports the slice's memory.max, when lower than
+MemTotal, as its memory.
 The e2e test consumes the same module. macOS hosts use the
 `darwinModules.default` nix-darwin module, which ships both services:
 the hub adopts its listeners from launchd (`launch_activate_socket`,

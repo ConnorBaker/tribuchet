@@ -204,6 +204,9 @@ in
         environment.etc."tt/memhog.nix".text = ''
           import ${./tests/memhog.nix} { bash = "${pkgs.bash}"; }
         '';
+        environment.etc."tt/oomscore.nix".text = ''
+          import ${./tests/oomscore.nix} { bash = "${pkgs.bash}"; }
+        '';
         environment.etc."tt/drain.nix".text = ''
           import ${./tests/drain.nix} { bash = "${pkgs.bash}"; }
         '';
