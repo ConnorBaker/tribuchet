@@ -78,6 +78,94 @@ fn reaped_results_leave_nothing_to_adopt_once_their_keys_are_gone() -> Result<()
     Ok(())
 }
 
+/// A result is kept while the session it is held for is open, however
+/// long ago it finished, and the reaper's clock starts at that session's
+/// close, or at a cancel of its dispatch: a given-up build's result goes
+/// a ttl on, its session open. An ack for an earlier adoption leaves it.
+/// Before, it went 5 min after its finish, the hub's chunk request still
+/// on its way.
+#[test]
+fn a_result_is_kept_while_its_session_is_open() -> Result<()> {
+    for cancelled in [false, true] {
+        let dir = tempfile::tempdir()?;
+        let ctx = WorkerCtx::for_test(dir.path(), 4, vec![])?;
+        let build = dir.path().join("builds/k");
+        fs::create_dir_all(&build)?;
+        let mut fin = finished(&build);
+        fin.finished_at = Instant::now().checked_sub(Duration::from_mins(10)).unwrap();
+        ResumableBuild::insert(&ctx, "k".into(), "b".into(), build, Some(fin));
+        let (tx, _rx) = tokio::sync::mpsc::channel(1);
+        ctx.resumable.lock().unwrap().get_mut("k").unwrap().out_tx = Some(tx.clone());
+        let ttl = Duration::from_mins(5);
+        delivery::reap(&ctx, ttl);
+        delivery::acked(&ctx, "k", "earlier");
+        let kept = held(&ctx, "k");
+        assert_eq!(kept, Some((false, true)), "{cancelled}: gone while open");
+        if cancelled {
+            let c = CancelBuild {
+                build_id: "b".into(),
+                dedupe_key: "k".into(),
+            };
+            let (rt, outbox) = (tokio::runtime::Runtime::new()?, Outbox::default());
+            rt.block_on(handle_cancel(c, &mut HashMap::new(), &outbox, &ctx));
+        } else {
+            delivery::release(&ctx, &tx);
+        }
+        delivery::reap(&ctx, ttl);
+        let kept = held(&ctx, "k");
+        assert_eq!(
+            kept,
+            Some((false, true)),
+            "{cancelled}: gone before its ttl"
+        );
+        thread::sleep(Duration::from_millis(1));
+        delivery::reap(&ctx, Duration::ZERO);
+        assert_eq!(held(&ctx, "k"), None, "{cancelled}: kept past its ttl");
+    }
+    Ok(())
+}
+
+/// A chunk request the worker cannot serve is answered ResultGone: for a
+/// result it does not have, and for one it cannot read, which it drops
+/// first so that no later assignment adopts it again. Before, the first
+/// went unanswered, the hub waiting for the session to die, and the
+/// second was answered as a failed build.
+#[tokio::test]
+async fn a_chunk_request_it_cannot_serve_is_answered_result_gone() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let ctx = WorkerCtx::for_test(dir.path(), 4, vec![])?;
+    let build = dir.path().join("builds/k");
+    fs::create_dir_all(&build)?;
+    let (mut fin, hash) = (finished(&build), [7; 32]);
+    let chunks = vec![OutChunk {
+        hash,
+        size: 1,
+        off: 0,
+        len: 1,
+    }];
+    let (scratch, frames_file) = ("/nix/store/out".into(), build.join("gone"));
+    fin.outputs = vec![PackedOutput {
+        scratch,
+        frames_file,
+        chunks,
+    }];
+    ResumableBuild::insert(&ctx, "k".into(), "b".into(), build, Some(fin));
+    for (id, kept) in [("unknown", true), ("b", false)] {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        serve_chunks(&ctx, id.into(), &hash, tx);
+        let answer = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await;
+        let Ok(Some(WorkerMessage {
+            msg: Some(worker_message::Msg::ResultGone(gone)),
+        })) = answer
+        else {
+            panic!("{id}: answered {answer:?}");
+        };
+        let after = (gone.build_id.as_str(), held(&ctx, "k").is_some());
+        assert_eq!(after, (id, kept));
+    }
+    Ok(())
+}
+
 /// A result whose state.json the reaper or an ack cannot remove keeps its
 /// key: the hub, told the key is gone, may run the build again under the
 /// same id, which a restarted worker would take for this result. Here its

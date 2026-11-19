@@ -185,6 +185,7 @@ fn msg_build_id(msg: &worker_message::Msg) -> Option<&str> {
         worker_message::Msg::Resumed(r) => Some(&r.build_id),
         worker_message::Msg::Need(n) => Some(&n.build_id),
         worker_message::Msg::Started(s) => Some(&s.build_id),
+        worker_message::Msg::ResultGone(g) => Some(&g.build_id),
         worker_message::Msg::Register(_)
         | worker_message::Msg::Heartbeat(_)
         | worker_message::Msg::RequestJob(_) => None,
@@ -492,9 +493,10 @@ async fn supervise_job(
         state.finish(&job).await;
         return;
     };
-    // A worker that no longer lists a build it resumed lost it as much
-    // as one whose session died, though the session lives on.
-    let gone = matches!(err, Error::Unlisted);
+    // A worker that no longer lists a build it resumed, or dropped its
+    // result, lost it as much as one whose session died, though the
+    // session lives on.
+    let gone = matches!(err, Error::Unlisted | Error::ResultGone);
     let session_dead = gone || router.is_closed() || out_tx.is_closed();
     if matches!(err, Error::Superseded) {
         // Its worker delivers to the dispatch that took its key over.

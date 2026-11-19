@@ -30,8 +30,8 @@ pub(super) const CANCELLED: &str = "build cancelled";
 
 pub(super) use delivery::{
     FinishedBuild, OutChunk, PackedOutput, ResumableBuild, Usage, ack_delivery,
-    execute_to_finished, persist_finished, record_finished, serve_chunks, spawn_resumable_reaper,
-    try_deliver,
+    execute_to_finished, persist_finished, record_finished, release, serve_chunks,
+    spawn_resumable_reaper, try_deliver,
 };
 
 /// Pick up builds a previous worker instance left behind: still
