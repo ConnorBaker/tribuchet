@@ -31,6 +31,20 @@ async fn declining_a_client_its_nix_cannot_build_is_a_divergence() {
     assert!(log.has(&["shadow divergence", "no capable worker", "answer: Refuse"]));
 }
 
+/// The hub refusing a key while a client whose Nix builds it waits gives
+/// that client an answer §2 forbids (it is deferred first): the core takes
+/// no such Refuse, so the shadow warns.
+#[tokio::test]
+async fn a_refusal_while_a_client_could_build_it_diverges() {
+    let log = Captured;
+    let _guard = log.install();
+    let state = Arc::new(HubState::for_test(Duration::ZERO));
+    let sys: (&str, &[String]) = ("aarch64-linux", &[]);
+    let _local = state.shadow.submit(&key_of(0), sys, true);
+    state.shadow.declined(&key_of(0), sys, false);
+    assert_eq!(log.count("shadow divergence"), 1);
+}
+
 /// A worker of the system without a feature the build requires does not
 /// serve it in the core either: the core Refuses the client.
 #[tokio::test]
