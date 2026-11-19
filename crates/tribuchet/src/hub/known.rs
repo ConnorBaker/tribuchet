@@ -109,6 +109,17 @@ impl Known {
         }
     }
 
+    /// `f` of the systems the known workers serve, under this set's lock,
+    /// which a registration takes before the connected set's.
+    pub(super) fn with_systems<T>(&self, f: impl FnOnce(&BTreeSet<&str>) -> T) -> T {
+        let workers = self.workers.lock().unwrap();
+        f(&workers
+            .values()
+            .flat_map(BTreeMap::keys)
+            .map(String::as_str)
+            .collect())
+    }
+
     /// Whether a known worker serves `system` with `features` (WorkerCaps::serves).
     pub(super) fn serves(&self, system: &str, features: &[String]) -> bool {
         let has = |have: &BTreeSet<String>| features.iter().all(|f| have.contains(f));
@@ -119,9 +130,23 @@ impl Known {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::time::Instant;
 
     use super::*;
+    use crate::hub::tests::caps;
+
+    /// The known workers' systems are those of every one of them.
+    #[test]
+    fn the_known_systems_are_every_known_workers() {
+        let known = Known::default();
+        let mut arm = caps("a");
+        arm.systems = [("aarch64-linux".to_owned(), HashSet::new())].into();
+        known.learn(&caps("x"));
+        known.learn(&arm);
+        let both = BTreeSet::from(["aarch64-linux", "x86_64-linux"]);
+        assert!(known.with_systems(|s| *s == both));
+    }
 
     /// A worker that registered is known to a hub started after, with
     /// what it served then, and only that; once decommissioned, to none.

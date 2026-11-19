@@ -89,10 +89,10 @@ pub struct HubConfig {
     /// register as a worker (auth = tailscale).
     #[serde(default)]
     pub tailscale_allowed_tags: Vec<String>,
-    /// When set, the hub rewrites a nix.conf fragment (the
-    /// external-builders and max-jobs settings) whenever the
-    /// connected-worker set changes, so a local nix-daemon offloads to
-    /// whatever systems are available right now.
+    /// When set, the hub writes a nix.conf fragment: external-builders
+    /// over the systems its known workers serve, so a local nix-daemon
+    /// hands it their builds even while those workers are away, and
+    /// max-jobs from the capacity of those connected.
     #[serde(default)]
     pub nix_config: Option<NixConfig>,
     /// Disk budget for the staging chunk cache.

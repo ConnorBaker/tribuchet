@@ -16,11 +16,20 @@ use crate::proto::{AttachEvent, DECLINE_EXIT_CODE, attach_event};
 
 type Rx = tokio::sync::mpsc::Receiver<Result<AttachEvent, Status>>;
 
-/// A hub past its startup grace, which awaits a departed worker 30 s.
+/// A hub past its startup grace, which awaits a departed worker 30 s,
+/// rendering a nix.conf fragment.
 fn hub() -> Arc<HubState> {
     let mut state = HubState::for_test(Duration::from_secs(30));
     state.started_at = Instant::now().checked_sub(Duration::from_mins(1)).unwrap();
+    let cfg = toml::from_str("path = '/x'\nattach-program = '/a'").unwrap();
+    state.nix_config = Some((cfg, tokio::sync::watch::channel(String::new()).0));
     Arc::new(state)
+}
+
+/// The hub's nix.conf fragment.
+fn fragment(state: &HubState) -> String {
+    let (_, fragment) = state.nix_config.as_ref().unwrap();
+    fragment.borrow().clone()
 }
 
 /// The hub's answer to decommissioning `name`.
@@ -63,11 +72,17 @@ async fn only_a_known_absent_worker_is_decommissioned() {
 
 /// U4: a retired worker is no longer known or awaited, so a build only it
 /// served is answered at once (L11′): declined to a client whose Nix
-/// builds it, refused to one whose Nix cannot.
+/// builds it, refused to one whose Nix cannot. Until then, the hub's
+/// nix.conf fragment lists its system, so that Nix hands the hub its builds.
 #[tokio::test]
 async fn a_build_only_a_decommissioned_worker_served_is_answered() {
     let state = hub();
     drop(register(&state, "w", &[]));
+    let listed = fragment(&state);
+    assert!(
+        listed.contains("x86_64-linux"),
+        "unlisted while known: {listed}"
+    );
     let replay = Arc::new(Replay::default());
     let mut local = replay.subscribe_as(Client::untracked(true)).await;
     let mut remote = replay.subscribe_as(Client::untracked(false)).await;
@@ -76,6 +91,11 @@ async fn a_build_only_a_decommissioned_worker_served_is_answered() {
     assert_eq!(state.queue.lock().await.len(), 1, "not awaiting w");
     assert_eq!(retire(&state, "w").await, Ok(()));
     assert!(!state.known.serves("x86_64-linux", &[]), "still known");
+    let listed = fragment(&state);
+    assert!(
+        !listed.contains("x86_64-linux"),
+        "listed once decommissioned"
+    );
     assert!(state.queue.lock().await.is_empty(), "still queued");
     let first = async |rx: &mut Rx| {
         let ev = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await;

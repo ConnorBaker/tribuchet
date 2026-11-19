@@ -159,8 +159,8 @@ pub(super) struct HubState {
     pub(super) caps_changed: Notify,
     /// Build lifecycle counters scraped by the metrics endpoint.
     pub(super) metrics: Metrics,
-    /// When set, the connected-worker set is mirrored to this nix.conf
-    /// fragment on every register/deregister, through its one writer.
+    /// When set, the known workers' systems and the connected workers'
+    /// capacity are mirrored to this nix.conf fragment, through its one writer.
     pub(super) nix_config: Option<(NixConfig, watch::Sender<String>)>,
     pub(super) chunks: Arc<ChunkCache>,
     /// Each worker session's admission (placement.rs).
@@ -187,15 +187,15 @@ pub(super) struct WorkerCaps {
     pub(super) max_jobs: u32,
 }
 
-/// nix.conf fragment for the connected workers: external-builders over
-/// every served system, and max-jobs at the oversubscribed, capped
+/// nix.conf fragment: external-builders over `systems`, the known workers'
+/// (L11), and max-jobs at the connected workers' oversubscribed, capped
 /// aggregate capacity. max-jobs is omitted with no workers, leaving the
 /// base nix.conf default to govern local fallback builds.
-fn render_nix_config(caps: &HashMap<u64, WorkerCaps>, cfg: &NixConfig) -> String {
-    let systems: BTreeSet<&str> = caps
-        .values()
-        .flat_map(|c| c.systems.keys().map(String::as_str))
-        .collect();
+fn render_nix_config(
+    systems: &BTreeSet<&str>,
+    caps: &HashMap<u64, WorkerCaps>,
+    cfg: &NixConfig,
+) -> String {
     // System names are peer-supplied; Rust Debug is not valid JSON.
     let builders = serde_json::json!([{
         "systems": systems,
@@ -267,15 +267,19 @@ impl HubState {
         }
     }
 
-    /// Mirror the connected-worker set to the nix.conf fragment. Called
-    /// after a register/deregister mutates `worker_caps`.
+    /// Mirror the known workers' systems and the connected workers'
+    /// capacity to the nix.conf fragment. Called as the hub starts, and
+    /// after a register, deregister, decommission or capacity change.
     pub(super) fn regen_nix_config(&self) {
         let Some((cfg, tx)) = &self.nix_config else {
             return;
         };
-        // Render and send under the lock: the last sent is the newest.
-        let caps = self.worker_caps.lock().unwrap();
-        tx.send_replace(render_nix_config(&caps, cfg));
+        // Render and send under both locks, in a registration's order:
+        // the last sent is the newest.
+        self.known.with_systems(|systems| {
+            let caps = self.worker_caps.lock().unwrap();
+            tx.send_replace(render_nix_config(systems, &caps, cfg));
+        });
     }
 
     /// The fragment's one writer: each time it wakes it writes the newest
@@ -442,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn nix_config_union_systems_and_capped_oversubscribed_jobs() {
+    fn nix_config_lists_systems_and_capped_oversubscribed_jobs() {
         let cfg = NixConfig {
             path: "/run/x".into(),
             attach_program: "/nix/store/attach".into(),
@@ -460,7 +464,11 @@ mod tests {
             c.max_jobs = 50;
             c
         });
-        let out = render_nix_config(&workers, &cfg);
+        let out = render_nix_config(
+            &BTreeSet::from(["aarch64-linux", "x86_64-linux"]),
+            &workers,
+            &cfg,
+        );
         assert!(
             out.contains(r#""systems":["aarch64-linux","x86_64-linux"]"#),
             "{out}"
@@ -480,7 +488,7 @@ mod tests {
         };
         let mut workers = HashMap::new();
         workers.insert(1, caps("x86_64-linux\u{2028}\"", &[]));
-        let out = render_nix_config(&workers, &cfg);
+        let out = render_nix_config(&BTreeSet::from(["x86_64-linux\u{2028}\""]), &workers, &cfg);
         let json = out
             .strip_prefix("external-builders = ")
             .and_then(|s| s.lines().next())
@@ -500,7 +508,7 @@ mod tests {
             oversubscribe_percent: 200,
             max_jobs_cap: 256,
         };
-        let out = render_nix_config(&HashMap::new(), &cfg);
+        let out = render_nix_config(&BTreeSet::new(), &HashMap::new(), &cfg);
         assert!(out.contains(r#""systems":[]"#), "{out}");
         // No worker -> leave max-jobs to the base nix.conf default so a
         // local fallback build is not run at the offload capacity.

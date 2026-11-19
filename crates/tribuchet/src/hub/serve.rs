@@ -138,24 +138,29 @@ pub fn run(cfg: HubConfig) -> Result<()> {
     rt.block_on(run_async(cfg))
 }
 
+/// The hub's state as `cfg` sets it, its nix.conf fragment listing the known
+/// workers before any connects (/run is emptied by a reboot). The run epoch,
+/// the known workers and the lost keys are kept beside the record at
+/// `record`: all are the hub's state.
+fn open_state(cfg: &HubConfig, chunks: Arc<ChunkCache>, record: &Path) -> HubState {
+    let grace = Duration::from_secs(cfg.worker_grace_secs);
+    let mut state = HubState::new(grace, cfg.nix_config.clone(), chunks);
+    state.runs = Runs::open(&record.with_file_name("run-epoch"));
+    state.known = Known::open(&record.with_file_name("known-workers"));
+    state.lost = Lost::open(&record.with_file_name("lost-keys"));
+    state.regen_nix_config();
+    state
+}
+
 async fn run_async(cfg: HubConfig) -> Result<()> {
     let socket = cfg.socket.as_path();
     let listen = cfg.listen.as_str();
     let config_dir = cfg.config_dir.as_path();
     let chunks = open_chunk_cache(&cfg)?;
 
-    let mut state = HubState::new(
-        Duration::from_secs(cfg.worker_grace_secs),
-        cfg.nix_config.clone(),
-        chunks,
-    );
-    // The record is folded into the history before the hub serves. The run
-    // epoch and the known workers are kept beside it: all are the hub's state.
+    // The record is folded into the history before the hub serves.
     let path = cfg.placement.record.clone().unwrap_or_else(default_record);
-    state.runs = Runs::open(&path.with_file_name("run-epoch"));
-    state.known = Known::open(&path.with_file_name("known-workers"));
-    state.lost = Lost::open(&path.with_file_name("lost-keys"));
-    let state = Arc::new(state);
+    let state = Arc::new(open_state(&cfg, chunks, &path));
     let opened = tokio::task::spawn_blocking(move || record::open(&path))
         .await
         .map_err(err_ctx("opening the build record"))?;
@@ -269,4 +274,25 @@ fn open_chunk_cache(cfg: &HubConfig) -> Result<Arc<ChunkCache>> {
     let cache = ChunkCache::open(dir.clone(), cfg.chunk_cache_bytes)
         .map_err(io_ctx("opening chunk cache", &dir))?;
     Ok(Arc::new(cache))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::hub::tests::caps;
+
+    /// The hub opens its known workers as it starts, and lists their systems
+    /// in the nix.conf fragment before any of them connects.
+    #[tokio::test]
+    async fn a_starting_hub_lists_its_known_workers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (record, path) = (dir.path().join("record"), dir.path().join("nix.conf"));
+        Known::open(&record.with_file_name("known-workers")).learn(&caps("w"));
+        let set = format!("[nix-config]\npath = {path:?}\nattach-program = '/a'");
+        let cfg: HubConfig = toml::from_str(&set).unwrap();
+        let chunks = Arc::new(ChunkCache::open(dir.path().join("chunks"), 1 << 20).unwrap());
+        let (_, rendered) = open_state(&cfg, chunks, &record).nix_config.unwrap();
+        let listed = rendered.borrow().clone();
+        assert!(listed.contains(r#""systems":["x86_64-linux"]"#), "{listed}");
+    }
 }

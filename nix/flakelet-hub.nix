@@ -74,8 +74,9 @@
           config-dir = configDir;
         }
         # Dynamic external-builders: the hub rewrites the host's nix.conf
-        # fragment as workers come and go. The attach program lives in this
-        # flakelet's closure, so generations keep it gc-rooted.
+        # fragment from the workers it knows and those connected. The attach
+        # program lives in this flakelet's closure, so generations keep it
+        # gc-rooted.
         // lib.optionalAttrs (options.nixConfigPath != null) {
           nix-config = {
             path = options.nixConfigPath;
