@@ -21,6 +21,7 @@ hyper-util = "0.1"
 rustix = { version = "1", features = ["event", "fs", "mount", "net", "pipe", "process", "stdio", "system", "thread"] }
 nix = { version = "0.31", features = ["net", "process", "user"] }
 libc = "0.2"
+libseccomp = "0.4"
 prost = "0.14"
 getrandom = "0.4"
 rcgen = { version = "0.14", features = ["x509-parser"] }

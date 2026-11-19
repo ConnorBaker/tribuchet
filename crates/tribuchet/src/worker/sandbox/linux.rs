@@ -13,6 +13,8 @@ use super::{Error, step};
 
 use crate::fsutil::io_ctx;
 
+#[path = "linux/seccomp.rs"]
+mod seccomp;
 #[path = "linux/stage.rs"]
 pub(super) mod stage;
 pub use stage::setup_stage;

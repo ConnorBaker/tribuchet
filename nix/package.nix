@@ -5,6 +5,7 @@
   protobuf,
   busybox-sandbox-shell,
   jq,
+  libseccomp,
 }:
 let
   # repository root is one level up from this file
@@ -24,6 +25,8 @@ let
     inherit src;
     strictDeps = true;
     nativeBuildInputs = [ protobuf ];
+    # the build sandbox's system-call filter
+    buildInputs = lib.optional stdenv.hostPlatform.isLinux libseccomp;
     PROTOC = "${protobuf}/bin/protoc";
     # tokio's eager driver hand-off (rt.rs) is unstable.
     RUSTFLAGS = "--cfg tokio_unstable";
