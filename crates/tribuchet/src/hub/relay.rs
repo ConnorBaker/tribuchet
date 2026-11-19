@@ -43,7 +43,7 @@ pub(super) async fn run_job(
     state: &HubState,
     job: &Job,
     (out_tx, worker, session): (&mpsc::Sender<Result<HubMessage, Status>>, &str, u64),
-    mut in_rx: mpsc::Receiver<worker_message::Msg>,
+    mut in_rx: Inbox,
     sess: Arc<WorkerSession>,
     dispatch: &mut Dispatch,
 ) -> Result<()> {
@@ -74,8 +74,6 @@ pub(super) async fn run_job(
     .await?;
     dispatch.sent = true;
 
-    stream_tmp_dir(&job.id, &job.tmp_dir_pack, out_tx).await?;
-
     let mut cancel_sent = false;
     let given_up = state.given_up(&job.id);
     // The worker's heartbeats when it said it holds the build already.
@@ -87,7 +85,7 @@ pub(super) async fn run_job(
 
     loop {
         let m = tokio::select! {
-            r = staging.progress(out_tx), if staging.busy() => {
+            r = staging.progress(&sess.bulk), if staging.busy() => {
                 r?;
                 continue;
             }
@@ -125,12 +123,19 @@ pub(super) async fn run_job(
             worker_message::Msg::Started(_) => {
                 dispatch.reached = dispatch.reached.max(Run::Started);
             }
+            worker_message::Msg::ResultGone(_) => return Err(Error::ResultGone),
             worker_message::Msg::Log(l) => {
                 job.replay.publish(attach_event::Event::Log(l.data)).await;
             }
             worker_message::Msg::Need(n) => {
+                // The build's bulk goes on the session's other connection,
+                // once the worker has answered its assignment: none of it
+                // can overtake the assignment then.
+                if !dispatch.staged {
+                    stream_tmp_dir(&job.id, &job.tmp_dir_pack, &sess.bulk).await?;
+                }
                 dispatch.staged = true;
-                staging.handle_need(n, out_tx).await?;
+                staging.handle_need(n, &sess.bulk).await?;
             }
             worker_message::Msg::Result(res) => {
                 if let Some(u) = &res.usage {
@@ -191,18 +196,26 @@ pub(crate) fn msg_name(msg: &worker_message::Msg) -> &'static str {
         worker_message::Msg::RequestJob(_) => "RequestJob",
         worker_message::Msg::Resumed(_) => "Resumed",
         worker_message::Msg::Started(_) => "Started",
+        worker_message::Msg::ResultGone(_) => "ResultGone",
     }
 }
 
-/// The channel carries only this build's messages (route_loop filters);
-/// it closes when the worker disconnects or goes silent.
-pub(super) async fn recv(
-    in_rx: &mut mpsc::Receiver<worker_message::Msg>,
-) -> Result<worker_message::Msg> {
-    in_rx
-        .recv()
-        .await
-        .ok_or_else(|| err_msg("worker disconnected or went silent"))
+/// One build's messages from its worker (Router::route): its output
+/// chunks apart, so that none of its control waits behind them.
+pub(in crate::hub) struct Inbox {
+    pub(in crate::hub) ctl: mpsc::UnboundedReceiver<worker_message::Msg>,
+    pub(in crate::hub) bulk: mpsc::Receiver<worker_message::Msg>,
+}
+
+/// The build's next message, control first; an error once the worker
+/// disconnects or goes silent.
+pub(super) async fn recv(in_rx: &mut Inbox) -> Result<worker_message::Msg> {
+    tokio::select! {
+        biased;
+        Some(m) = in_rx.ctl.recv() => Ok(m),
+        Some(m) = in_rx.bulk.recv() => Ok(m),
+        else => Err(err_msg("worker disconnected or went silent")),
+    }
 }
 
 async fn finish_relay(

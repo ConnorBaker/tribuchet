@@ -172,7 +172,7 @@ impl WorkerCtx {
         let n = NonZeroU64::MIN.saturating_add(ADOPTIONS.fetch_add(1, Ordering::Relaxed));
         (e.adoption, e.resuming) = (n.get(), true);
         e.build_id.clone_from(&a.build_id);
-        e.out_tx = Some(out_tx.clone());
+        (e.out_tx, e.released) = (Some(out_tx.clone()), None);
         e.worker_name.clone_from(&a.worker_name);
         if let Some(t) = e.log_tail.take() {
             // An earlier resume's tailer feeds a dead session.
