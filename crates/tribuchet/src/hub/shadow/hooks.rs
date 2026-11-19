@@ -5,7 +5,7 @@ use std::sync::atomic::Ordering::Relaxed;
 
 use super::{CLIENTS, Client, Mirror, Shadow, Sys, id, key, serves, today};
 use crate::hub::losses::Loss;
-use crate::hub::semantics::{Answer, Event, Outcome, Phase};
+use crate::hub::semantics::{self as sem, Answer, Event, Outcome, Phase};
 use crate::hub::state::{HubState, Job};
 use crate::proto::{Register, RunId, attach_event};
 
@@ -210,7 +210,7 @@ impl Shadow {
         });
     }
 
-    /// The hub fails `job`'s clients at `point`, a lost run's or its own
+    /// The hub fails `job`'s clients still waiting at `point`, its own
     /// error, cancelling `run` if it names it.
     pub(in crate::hub) fn failed(&self, job: &Job, point: &str, run: Option<&RunId>) {
         let today = today(job, Answer::Give(Outcome::Failed(1)));
@@ -224,23 +224,14 @@ impl Shadow {
         });
     }
 
-    /// The hub sends every client of `job` back to its own Nix (exit 222).
-    pub(in crate::hub) fn deferred(&self, job: &Job) {
-        let n = job.replay.can_local().len();
+    /// The hub sends the `clients` of `job` back to their own Nix (exit 222),
+    /// at a loss cap or as it cannot carry the build.
+    pub(in crate::hub) fn deferred(&self, job: &Job, clients: &[sem::Client]) {
         self.with(|m| {
             let Some(key) = key(&job.key) else { return };
-            let clients = m
-                .hub
-                .builds
-                .get(&key)
-                .map(|b| b.clients.keys().copied().collect());
-            let defer = |client| Event::Defer { key, client };
-            let evs = clients
-                .unwrap_or_else(Vec::new)
-                .into_iter()
-                .map(defer)
-                .collect();
-            m.feed("transport-loss cap", &vec![(key, Answer::Defer); n], evs);
+            let defer = |&client| Event::Defer { key, client };
+            let today = vec![(key, Answer::Defer); clients.len()];
+            m.feed("loss cap", &today, clients.iter().map(defer).collect());
         });
     }
 
@@ -253,8 +244,9 @@ impl Shadow {
 }
 
 impl Job {
-    /// Fail the build's clients with `err`, as the hub does at `point`
-    /// (attach fails on an Error), cancelling `run` if it names it.
+    /// Fail the build's clients still waiting with `err`, as the hub does
+    /// at `point` (attach fails on an Error), cancelling `run` if it
+    /// names it.
     pub(in crate::hub) async fn fail(
         &self,
         state: &HubState,
