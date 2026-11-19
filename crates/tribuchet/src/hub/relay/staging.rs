@@ -35,6 +35,8 @@ const KNOWN_CAP: usize = 1 << 18;
 pub(in crate::hub) struct WorkerSession {
     /// The worker's name, as it registered: for the log lines.
     pub(super) worker: String,
+    /// Its Session, for the session's bulk: manifests, chunks, tmp dirs.
+    pub(super) bulk: mpsc::Sender<Result<HubMessage, Status>>,
     /// One permit: the Need that sends the next chunk frame. A path is
     /// asked for by one build only; the others wait on its claim
     /// (spec/staging.qnt).
@@ -47,9 +49,13 @@ pub(in crate::hub) struct WorkerSession {
 }
 
 impl WorkerSession {
-    pub(in crate::hub) fn new(worker: String) -> Self {
+    pub(in crate::hub) fn new(
+        worker: String,
+        bulk: mpsc::Sender<Result<HubMessage, Status>>,
+    ) -> Self {
         Self {
             worker,
+            bulk,
             sends: Semaphore::new(1),
             #[cfg(test)]
             asked: AtomicUsize::default(),
@@ -538,7 +544,7 @@ mod tests {
     async fn manifest_survives_full_channel() {
         let state = HubState::for_test(Duration::from_secs(1));
         let job = test_job();
-        let sess = WorkerSession::new("w".into());
+        let sess = WorkerSession::new("w".into(), mpsc::channel(1).0);
         let mut staging = Staging::new(&state, &job, &sess);
         let path = "/nix/store/00000000000000000000000000000000-x";
         staging.computing.insert(path.into());

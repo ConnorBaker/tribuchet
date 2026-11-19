@@ -358,7 +358,7 @@ async fn an_assignment_the_worker_never_got_counts_no_loss() {
     let (out_tx, out_rx) = mpsc::channel(64);
     drop(out_rx);
     let session = (w.id, w.caps.name.clone());
-    let sess = Arc::new(WorkerSession::new("w".into()));
+    let sess = Arc::new(WorkerSession::new("w".into(), out_tx.clone()));
     let admission = Arc::new(Mutex::new(Admission::default()));
     supervise_job(
         state.clone(),

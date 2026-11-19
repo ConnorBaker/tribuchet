@@ -106,8 +106,8 @@ fn a_result_is_kept_while_its_session_is_open() -> Result<()> {
                 build_id: "b".into(),
                 dedupe_key: "k".into(),
             };
-            let (rt, outbox) = (tokio::runtime::Runtime::new()?, Outbox::default());
-            rt.block_on(handle_cancel(c, &mut HashMap::new(), &outbox, &ctx));
+            let rt = tokio::runtime::Runtime::new()?;
+            rt.block_on(handle_cancel(c, &mut HashMap::new(), &tx, &ctx))?;
         } else {
             delivery::release(&ctx, &tx);
         }
@@ -152,7 +152,7 @@ async fn a_chunk_request_it_cannot_serve_is_answered_result_gone() -> Result<()>
     ResumableBuild::insert(&ctx, "k".into(), "b".into(), build, Some(fin));
     for (id, kept) in [("unknown", true), ("b", false)] {
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        serve_chunks(&ctx, id.into(), &hash, tx);
+        serve_chunks(&ctx, id.into(), &hash, (tx.clone(), tx));
         let answer = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await;
         let Ok(Some(WorkerMessage {
             msg: Some(worker_message::Msg::ResultGone(gone)),

@@ -21,7 +21,7 @@ use tonic::transport::server::TcpConnectInfo;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::proto::worker_hub_server::WorkerHub;
-use crate::{chunkio, tailscale};
+use crate::tailscale;
 
 use crate::proto::{
     CancelBuild, HubMessage, Register, RequestJob, WorkerMessage, attach_event, hub_message,
@@ -29,6 +29,7 @@ use crate::proto::{
 };
 
 mod chunkcache;
+mod link;
 #[cfg(test)]
 pub(crate) use chunkcache::ChunkCache;
 mod losses;
@@ -51,9 +52,10 @@ mod testlog;
 pub use serve::run;
 
 use crate::errors::{Error, Result, chain};
+use link::{Half, Pending, route_bulk};
 use losses::Dispatch;
 use metrics::Metrics;
-use relay::{WorkerSession, run_job, send};
+use relay::{Inbox, WorkerSession, run_job, send};
 use state::{HubState, Job, WorkerCaps};
 
 /// No worker message for this long tears the session down and fails
@@ -77,6 +79,7 @@ enum PeerAuth {
 struct WorkerSvc {
     state: Arc<HubState>,
     auth: Arc<PeerAuth>,
+    pending: Pending,
 }
 
 /// Registers the worker's capabilities while alive; removes them on
@@ -109,20 +112,49 @@ impl Drop for CapsGuard {
     }
 }
 
-/// Routes the single worker stream to per-build channels so multiple
-/// jobs share one session. Dropping a sender closes the job's receiver,
+/// What a build's Inbox is fed by: control, never waited on, and output
+/// chunks, bounded so that a build slow to take them slows its worker.
+type Inlet = (
+    mpsc::UnboundedSender<worker_message::Msg>,
+    mpsc::Sender<worker_message::Msg>,
+);
+
+/// Routes a worker session's messages to per-build inboxes so multiple
+/// jobs share one session. Dropping the senders closes the job's inbox,
 /// which it observes as the worker going away.
 #[derive(Default, Clone)]
 struct Router {
-    builds: Arc<Mutex<HashMap<String, mpsc::Sender<worker_message::Msg>>>>,
+    builds: Arc<Mutex<HashMap<String, Inlet>>>,
     closed: Arc<AtomicBool>,
 }
 
 impl Router {
-    fn register(&self, build_id: &str) -> mpsc::Receiver<worker_message::Msg> {
-        let (tx, rx) = mpsc::channel(64);
-        self.builds.lock().unwrap().insert(build_id.to_string(), tx);
-        rx
+    fn register(&self, build_id: &str) -> Inbox {
+        let (ctl_tx, ctl) = mpsc::unbounded_channel();
+        let (bulk_tx, bulk) = mpsc::channel(64);
+        let inlet = (ctl_tx, bulk_tx);
+        self.builds
+            .lock()
+            .unwrap()
+            .insert(build_id.to_string(), inlet);
+        Inbox { ctl, bulk }
+    }
+
+    /// Hand `m` to its build: an output chunk once the build has room.
+    async fn route(&self, m: worker_message::Msg) {
+        let Some(id) = msg_build_id(&m).map(str::to_string) else {
+            return;
+        };
+        // clone outside the lock: a send must not block other routing
+        let inlet = self.builds.lock().unwrap().get(&id).cloned();
+        // send error = job already ended; drop the message
+        match inlet {
+            Some((_, bulk)) if matches!(m, worker_message::Msg::Chunk(_)) => {
+                drop(bulk.send(m).await);
+            }
+            Some((ctl, _)) => drop(ctl.send(m)),
+            None => tracing::warn!(id, "dropping worker message for unknown build"),
+        }
     }
 
     fn unregister(&self, build_id: &str) {
@@ -248,29 +280,20 @@ async fn route_loop(
                 state.regen_nix_config();
             }
         }
-        let Some(id) = msg_build_id(&m).map(str::to_string) else {
-            continue;
-        };
-        // clone outside the lock: a send must not block other routing
-        let tx = router.builds.lock().unwrap().get(&id).cloned();
-        if let Some(tx) = tx {
-            // send error = job already ended; drop the message
-            drop(tx.send(m).await);
-        } else {
-            tracing::warn!(id, "dropping worker message for unknown build");
-        }
+        router.route(m).await;
     }
     router.close_all();
 }
 
 #[tonic::async_trait]
 impl WorkerHub for WorkerSvc {
+    type ControlStream = ReceiverStream<Result<HubMessage, Status>>;
     type SessionStream = ReceiverStream<Result<HubMessage, Status>>;
 
-    async fn session(
+    async fn control(
         &self,
         request: Request<Streaming<WorkerMessage>>,
-    ) -> Result<Response<Self::SessionStream>, Status> {
+    ) -> Result<Response<Self::ControlStream>, Status> {
         let remote = request
             .extensions()
             .get::<TcpConnectInfo>()
@@ -309,6 +332,9 @@ impl WorkerHub for WorkerSvc {
             // another in logs and metrics.
             register.worker_name = who.node_name;
         }
+        if register.session.is_empty() {
+            return Err(Status::invalid_argument("Register names no session"));
+        }
         tracing::info!(
             worker = register.worker_name,
             caps = ?register.caps,
@@ -316,37 +342,28 @@ impl WorkerHub for WorkerSvc {
             build_memory = register.build_memory,
             "worker registered"
         );
-
         let (out_tx, out_rx) = mpsc::channel::<Result<HubMessage, Status>>(64);
-        let (in_tx, in_rx) = mpsc::channel::<WorkerMessage>(64);
-        let worker = register.worker_name.clone();
+        let streams = self.pending.control(&register, inbound, out_tx);
+        let state = self.state.clone();
         tokio::spawn(async move {
-            loop {
-                match inbound.message().await {
-                    Ok(Some(m)) => {
-                        if in_tx.send(m).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(e) => {
-                        tracing::warn!(worker, "worker stream failed: {}", chain(&e));
-                        break;
-                    }
-                }
+            if let Some((ctl, bulk)) = streams.await {
+                worker_loop(state, register, ctl, bulk).await;
             }
         });
-        tokio::spawn(worker_loop(self.state.clone(), register, out_tx, in_rx));
         Ok(Response::new(ReceiverStream::new(out_rx)))
+    }
+
+    async fn session(
+        &self,
+        request: Request<Streaming<WorkerMessage>>,
+    ) -> Result<Response<Self::SessionStream>, Status> {
+        self.pending.session(request).await
     }
 }
 
-async fn worker_loop(
-    state: Arc<HubState>,
-    register: Register,
-    out_tx: mpsc::Sender<Result<HubMessage, Status>>,
-    in_rx: mpsc::Receiver<WorkerMessage>,
-) {
+/// A worker session: its Control, and its Session.
+async fn worker_loop(state: Arc<HubState>, register: Register, ctl: Half, bulk: Half) {
+    let ((out_tx, in_rx), (bulk_tx, bulk_rx)) = (ctl, bulk);
     let caps = WorkerCaps {
         name: register.worker_name.clone(),
         connected_at: Instant::now(),
@@ -381,13 +398,13 @@ async fn worker_loop(
         state.clone(),
         worker_id,
     ));
-    let sess = Arc::new(WorkerSession::new(register.worker_name.clone()));
-    let beat = tokio::spawn(beat(out_tx.clone()));
+    let mut bulk = tokio::spawn(route_bulk(bulk_rx, router.clone()));
+    let sess = Arc::new(WorkerSession::new(register.worker_name.clone(), bulk_tx));
     let mut listed = None;
 
     'outer: loop {
         let (job, resumed) = loop {
-            if out_tx.is_closed() || route.is_finished() {
+            if out_tx.is_closed() || route.is_finished() || bulk.is_finished() {
                 break 'outer;
             }
             // Once a listing, before it is handed a build of their key.
@@ -417,6 +434,7 @@ async fn worker_loop(
                 () = state.notify.notified() => {}
                 () = tokio::time::sleep(Duration::from_secs(1)) => {}
                 _ = &mut route => break 'outer,
+                _ = &mut bulk => break 'outer,
             }
         };
         let to = (worker_id, register.worker_name.as_str());
@@ -444,24 +462,13 @@ async fn worker_loop(
     }
     // Builds in flight fail through their closed router channels.
     route.abort();
-    beat.abort();
+    bulk.abort();
     router.close_all();
     state.placement.lock().unwrap().close(worker_id);
     drop(caps_guard);
     state.hold_unservable().await;
     Metrics::inc(&state.metrics.disconnected);
     tracing::info!(worker = register.worker_name, "worker disconnected");
-}
-
-/// An empty message for the worker to read every chunkio::HEARTBEAT,
-/// so that its keepalive never PINGs a live hub. None while the queue
-/// is full: the worker has those to read.
-pub(crate) async fn beat(out_tx: mpsc::Sender<Result<HubMessage, Status>>) {
-    let mut tick = tokio::time::interval(chunkio::HEARTBEAT);
-    loop {
-        tick.tick().await;
-        drop(out_tx.try_send(Ok(HubMessage::default())));
-    }
 }
 
 /// Run one dispatched job and settle it: finish, requeue or fail.
@@ -471,7 +478,7 @@ async fn supervise_job(
     mut job: Job,
     router: Router,
     out_tx: mpsc::Sender<Result<HubMessage, Status>>,
-    in_rx: mpsc::Receiver<worker_message::Msg>,
+    in_rx: Inbox,
     sess: Arc<WorkerSession>,
     worker: (u64, String),
     admission: Arc<Mutex<Admission>>,

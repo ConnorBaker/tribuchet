@@ -14,7 +14,7 @@ use testlog::Captured;
 use crate::config::NixConfig;
 use crate::proto::attach_hub_client::AttachHubClient;
 use crate::proto::{
-    AttachEvent, BuildAssignment, BuildMessage, BuildRequest, Heartbeat, Resumed, SystemCaps,
+    AttachEvent, BuildAssignment, BuildMessage, BuildRequest, Heartbeat, Need, Resumed, SystemCaps,
     TmpDirChunk, attach_hub_server, build_message,
 };
 
@@ -27,6 +27,7 @@ pub(super) mod fake_daemon;
 mod rank;
 mod reconnect;
 mod slow_link;
+use slow_link::spawn_session;
 mod unlisted;
 mod usage;
 
@@ -195,14 +196,13 @@ async fn lose_session(
     let router = Router::default();
     let in_rx = router.register(&job.id);
     for m in said {
-        let tx = router.builds.lock().unwrap()[&job.id].clone();
-        tx.send(m).await.unwrap();
+        router.route(m).await;
     }
     let (out_tx, _out_rx) = mpsc::channel(64);
     let session = (worker.id, worker.caps.name.clone());
     router.close_all();
     drop(worker);
-    let sess = Arc::new(WorkerSession::new("w".into()));
+    let sess = Arc::new(WorkerSession::new("w".into(), out_tx.clone()));
     let admission = Arc::new(Mutex::new(Admission::default()));
     supervise_job(
         state.clone(),
@@ -347,7 +347,7 @@ pub(super) fn connect(state: &Arc<HubState>, name: &str, slots: u32, held: &[&st
     };
     let (out_tx, from_hub) = mpsc::channel(256);
     let (to_hub, in_rx) = mpsc::channel(64);
-    let hub = tokio::spawn(worker_loop(state.clone(), register, out_tx, in_rx));
+    let hub = spawn_session(state.clone(), register, out_tx, in_rx);
     Worker {
         to_hub,
         from_hub,
@@ -583,7 +583,7 @@ async fn a_worker_advertising_recursive_nix_gets_no_build_requiring_it() {
     };
     let (out_tx, mut from_hub) = mpsc::channel(256);
     let (to_hub, in_rx) = mpsc::channel(64);
-    let hub = tokio::spawn(worker_loop(state.clone(), register, out_tx, in_rx));
+    let hub = spawn_session(state.clone(), register, out_tx, in_rx);
     to_hub.send(request_job(2, Some(0))).await.unwrap();
     let sent = assignments(&mut from_hub, QUIET).await;
     hub.abort();

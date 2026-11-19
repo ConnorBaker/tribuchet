@@ -116,7 +116,7 @@ fn position(frames: &[(String, bool)], id: &str, eof: bool) -> usize {
 #[tokio::test(start_paused = true)]
 async fn a_small_need_does_not_wait_for_a_large_one() {
     let state = HubState::for_test(Duration::from_secs(1));
-    let sess = WorkerSession::new("w".into());
+    let sess = WorkerSession::new("w".into(), mpsc::channel(1).0);
     let big_job = job_with_id("0000000000000000000000000000000a");
     let small_job = job_with_id("0000000000000000000000000000000b");
     let mut big = staged(
@@ -148,7 +148,10 @@ async fn a_builds_needs_log_one_line_with_their_sums() {
     let log = Captured::default();
     let _guard = log.install();
     let state = HubState::for_test(Duration::from_secs(1));
-    let (job, sess) = (test_job(), WorkerSession::new("w1".into()));
+    let (job, sess) = (
+        test_job(),
+        WorkerSession::new("w1".into(), mpsc::channel(1).0),
+    );
     let mut staging = Staging::new(&state, &job, &sess);
     let (out_tx, mut out_rx) = mpsc::channel(1);
     for i in 0..3 {
