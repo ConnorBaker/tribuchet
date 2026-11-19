@@ -102,6 +102,10 @@ pub(super) struct HubState {
     /// When set, the connected-worker set is mirrored to this nix.conf
     /// fragment on every register/deregister.
     pub(super) nix_config: Option<NixConfig>,
+    /// The fragment's renderings, numbered in worker_caps order, and the
+    /// newest written (write_newest).
+    nix_rendered: atomic::AtomicU64,
+    nix_written: Arc<StdMutex<u64>>,
     pub(super) chunks: Arc<ChunkCache>,
 }
 
@@ -187,33 +191,53 @@ impl HubState {
             caps_changed: Notify::default(),
             metrics: Metrics::default(),
             nix_config,
+            nix_rendered: atomic::AtomicU64::default(),
+            nix_written: Arc::default(),
             chunks,
         }
     }
 
     /// Mirror the connected-worker set to the nix.conf fragment. Called
-    /// after a register/deregister mutates `worker_caps`.
+    /// after a register/deregister mutates `worker_caps`. The fragment is
+    /// rendered and numbered under that lock, so concurrent register/
+    /// deregister number their renderings in the order they changed it,
+    /// and written on a blocking thread, outside it: no file I/O on the
+    /// runtime or under a lock.
     pub(super) fn regen_nix_config(&self) {
         let Some(cfg) = &self.nix_config else {
             return;
         };
-        // Render and write under the lock so concurrent register/
-        // deregister serialize and never leave stale content behind.
-        let caps = self.worker_caps.lock().unwrap();
-        let content = render_nix_config(&caps, cfg);
-        // Skip the write, and the daemon restart the watching path unit
-        // would trigger, when nothing changed (e.g. a worker reconnects
-        // with the same capabilities).
-        if fs::read_to_string(&cfg.path).is_ok_and(|cur| cur == content) {
-            return;
-        }
-        if let Err(e) = write_atomic(&cfg.path, &content) {
-            tracing::warn!(
-                error = %e,
-                path = %cfg.path.display(),
-                "failed to write nix.conf fragment"
-            );
-        }
+        let (generation, content) = {
+            let caps = self.worker_caps.lock().unwrap();
+            let generation = self.nix_rendered.fetch_add(1, atomic::Ordering::Relaxed) + 1;
+            (generation, render_nix_config(&caps, cfg))
+        };
+        let (written, path) = (self.nix_written.clone(), cfg.path.clone());
+        tokio::task::spawn_blocking(move || write_newest(&written, generation, &path, &content));
+    }
+}
+
+/// Write `content`, rendering number `generation`, to `path` unless a
+/// newer rendering was written: whatever order the writes run in, the
+/// newest rendering is the one left, never stale content.
+fn write_newest(written: &StdMutex<u64>, generation: u64, path: &Path, content: &str) {
+    let mut newest = written.lock().unwrap();
+    if *newest > generation {
+        return;
+    }
+    *newest = generation;
+    // Skip the write, and the daemon restart the watching path unit
+    // would trigger, when nothing changed (e.g. a worker reconnects
+    // with the same capabilities).
+    if fs::read_to_string(path).is_ok_and(|cur| cur == content) {
+        return;
+    }
+    if let Err(e) = write_atomic(path, content) {
+        tracing::warn!(
+            error = %e,
+            path = %path.display(),
+            "failed to write nix.conf fragment"
+        );
     }
 }
 

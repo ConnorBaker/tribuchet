@@ -16,6 +16,8 @@ pub(crate) mod agent_spawn;
 mod agents;
 pub mod binfmt;
 mod build;
+#[cfg(test)]
+pub(crate) use build::chunk_tests;
 mod caps;
 mod logtail;
 mod pins;
@@ -98,7 +100,7 @@ struct WorkerCtx {
     claims: build::Claims,
     /// Parallel daemon connections importing input NARs per build.
     import_jobs: usize,
-    chunks: Arc<Mutex<ChunkStore>>,
+    chunks: Arc<ChunkStore>,
 }
 
 impl WorkerCtx {
@@ -264,11 +266,11 @@ pub fn run(opts: WorkerConfig) -> Result<()> {
 }
 
 /// Validate the emulate map and register its systems.
-fn open_chunk_store(opts: &WorkerConfig) -> Result<Arc<Mutex<ChunkStore>>> {
+fn open_chunk_store(opts: &WorkerConfig) -> Result<Arc<ChunkStore>> {
     let dir = opts.state_dir.join("chunks");
     let store = ChunkStore::open(dir.clone(), opts.chunk_store_bytes)
         .map_err(io_ctx("opening chunk store", &dir))?;
-    Ok(Arc::new(Mutex::new(store)))
+    Ok(Arc::new(store))
 }
 
 fn resolve_emulators(opts: &mut WorkerConfig) -> Result<HashMap<String, PathBuf>> {

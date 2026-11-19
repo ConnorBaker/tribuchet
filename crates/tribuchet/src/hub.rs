@@ -27,6 +27,8 @@ use crate::proto::{
 };
 
 mod chunkcache;
+#[cfg(test)]
+pub(crate) use chunkcache::ChunkCache;
 mod metrics;
 mod relay;
 mod serve;
@@ -342,6 +344,7 @@ async fn worker_loop(
     router.close_all();
     drop(caps_guard);
     state.fail_unservable().await;
+    Metrics::inc(&state.metrics.disconnected);
     tracing::info!(worker = register.worker_name, "worker disconnected");
 }
 

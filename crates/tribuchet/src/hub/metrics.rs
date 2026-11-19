@@ -27,6 +27,7 @@ pub(super) struct Metrics {
     pub(super) submitted: AtomicU64,
     pub(super) declined: AtomicU64,
     pub(super) requeued: AtomicU64,
+    pub(super) disconnected: AtomicU64,
     pub(super) failed: AtomicU64,
     pub(super) succeeded: AtomicU64,
     /// Worker-to-hub messages by variant, indexed like [`MSG_KINDS`].
@@ -202,6 +203,11 @@ async fn render(state: &HubState) -> String {
             "tribuchet_builds_requeued_total",
             "Builds requeued after a worker session was lost.",
             &m.requeued,
+        ),
+        (
+            "tribuchet_worker_disconnects_total",
+            "Worker sessions that ended.",
+            &m.disconnected,
         ),
         (
             "tribuchet_builds_failed_total",

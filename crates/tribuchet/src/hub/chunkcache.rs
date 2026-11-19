@@ -1,7 +1,9 @@
 //! Hub chunk cache for staging fan-out: without it the hub
 //! re-compresses the shared base paths for every worker and build.
-//! Cached chunks ship as their stored zstd frame. Only chunks seen
-//! at least twice are admitted, so one-off leaf paths never fill it.
+//! Cached chunks ship as their stored zstd frame. Staging admits only
+//! chunks seen at least twice, so one-off leaf paths never fill it.
+//! Output delivery admits every chunk it gets from the worker, and
+//! reads it back for its repeats and for catch-ups.
 
 use std::collections::{HashSet, VecDeque};
 use std::io;
@@ -11,7 +13,9 @@ use std::sync::Mutex;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use crate::chunker::decode_chunk;
 use crate::chunkstore::{ChunkStore, FrameRef, Hash, PinGuard};
+use crate::errors::{Result, err_ctx, err_msg};
 
 /// Bound on remembered first-sightings, ~16 MB of RAM.
 const SEEN_CAP: usize = 256 * 1024;
@@ -24,7 +28,7 @@ const RECIPE_CAP: usize = 64 * 1024;
 pub type Recipe = Arc<Vec<(Hash, u64)>>;
 
 pub enum Disposition {
-    /// A stored frame, read outside the cache lock. A failed read
+    /// A stored frame, read outside every lock. A failed read
     /// degrades to shipping the chunk inside the run.
     Cached(FrameRef),
     /// Seen before: compress individually and hand the frame to
@@ -35,11 +39,13 @@ pub enum Disposition {
 }
 
 pub struct ChunkCache {
+    /// Locks of its own, none held across file I/O by a lookup or pin.
+    store: ChunkStore,
+    /// In-memory only, never held across file I/O.
     inner: Mutex<Inner>,
 }
 
 struct Inner {
-    store: ChunkStore,
     seen: VecDeque<Hash>,
     seen_set: HashSet<Hash>,
     /// keyed with the nar_sha256 it was computed for
@@ -50,8 +56,8 @@ struct Inner {
 impl ChunkCache {
     pub fn open(dir: PathBuf, budget: u64) -> io::Result<Self> {
         Ok(Self {
+            store: ChunkStore::open(dir, budget)?,
             inner: Mutex::new(Inner {
-                store: ChunkStore::open(dir, budget)?,
                 seen: VecDeque::new(),
                 seen_set: HashSet::new(),
                 recipes: HashMap::new(),
@@ -61,10 +67,10 @@ impl ChunkCache {
     }
 
     pub fn classify(&self, hash: &Hash) -> Disposition {
-        let mut inner = self.inner.lock().unwrap();
-        if let Some(frame) = inner.store.locate(hash) {
+        if let Some(frame) = self.store.locate(hash) {
             return Disposition::Cached(frame);
         }
+        let mut inner = self.inner.lock().unwrap();
         if inner.seen_set.remove(hash) {
             return Disposition::Admit;
         }
@@ -78,20 +84,28 @@ impl ChunkCache {
     }
 
     pub fn pin(&self, hashes: impl IntoIterator<Item = Hash>) -> PinGuard {
-        self.inner.lock().unwrap().store.pin(hashes)
+        self.store.pin(hashes)
     }
 
     pub fn locate(&self, hash: &Hash) -> Option<FrameRef> {
-        self.inner.lock().unwrap().store.locate(hash)
+        self.store.locate(hash)
+    }
+
+    /// The cached chunk `hash`'s frame, read off the runtime, checked
+    /// against its plaintext `size`.
+    pub async fn read_checked(&self, hash: &Hash, size: usize) -> Result<Vec<u8>> {
+        let read = match self.locate(hash) {
+            Some(f) => f.read().await.ok(),
+            None => None,
+        };
+        let frame = read.ok_or_else(|| err_msg("pinned output chunk missing from the cache"))?;
+        decode_chunk(&frame, hash, size).map_err(err_ctx("cached output chunk"))?;
+        Ok(frame)
     }
 
     /// Locate every hash under one lock. None unless all are cached.
     pub fn locate_all(&self, hashes: &HashSet<Hash>) -> Option<Vec<(Hash, FrameRef)>> {
-        let mut inner = self.inner.lock().unwrap();
-        hashes
-            .iter()
-            .map(|h| inner.store.locate(h).map(|f| (*h, f)))
-            .collect()
+        self.store.locate_all(hashes)
     }
 
     pub fn has_recipe(&self, store_path: &str) -> bool {
@@ -119,8 +133,14 @@ impl ChunkCache {
         }
     }
 
+    /// Does file I/O and may fsync: call it from a blocking thread.
     pub fn admit(&self, hash: Hash, frame: &[u8]) -> io::Result<()> {
-        self.inner.lock().unwrap().store.insert(hash, frame)
+        self.store.insert(hash, frame)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_limits(&self, budget: u64, seal_bytes: u64) {
+        self.store.set_limits(budget, seal_bytes);
     }
 }
 

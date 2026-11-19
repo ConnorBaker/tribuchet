@@ -1,3 +1,9 @@
+use std::sync::mpsc as std_mpsc;
+use std::thread;
+
+#[cfg(target_os = "linux")]
+use rustix::fs::{CWD, FileType, Mode, mknodat};
+
 use super::*;
 
 impl HubState {
@@ -111,6 +117,64 @@ fn nix_config_without_workers_omits_max_jobs() {
     // No worker -> leave max-jobs to the base nix.conf default so a
     // local fallback build is not run at the offload capacity.
     assert!(!out.contains("max-jobs"), "{out}");
+}
+
+/// A nix.conf fragment write that does not finish holds neither
+/// the register or deregister that asked for it nor `worker_caps`, which
+/// every take_job reads. A FIFO stands for such a file: reading it waits
+/// for a writer.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_stuck_nix_conf_write_holds_neither_its_caller_nor_worker_caps() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nix.conf");
+    mknodat(CWD, &path, FileType::Fifo, Mode::RWXU, 0).unwrap();
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    let mut state = HubState::for_test(Duration::ZERO);
+    state.nix_config = Some(NixConfig {
+        path: path.clone(),
+        attach_program: "/attach".into(),
+        oversubscribe_percent: 100,
+        max_jobs_cap: 1,
+    });
+    let state = Arc::new(state);
+    let (tx, rx) = std_mpsc::channel();
+    let (s, rt_handle) = (state.clone(), rt.handle().clone());
+    thread::spawn(move || {
+        let _rt = rt_handle.enter();
+        s.regen_nix_config();
+        tx.send(()).unwrap();
+    });
+    let returned = rx.recv_timeout(Duration::from_secs(10)).is_ok();
+    let caps_free = state.worker_caps.try_lock().is_ok();
+    // Let the read go: a writer opens the FIFO and closes it.
+    drop(fs::OpenOptions::new().write(true).open(&path).unwrap());
+    assert!(returned, "regen_nix_config waited on the fragment's file");
+    assert!(
+        caps_free,
+        "worker_caps was held across the fragment's write"
+    );
+    let end = Instant::now() + Duration::from_secs(10);
+    while !fs::symlink_metadata(&path).unwrap().is_file() {
+        assert!(Instant::now() < end, "the fragment was never written");
+        thread::sleep(Duration::from_millis(10));
+    }
+    assert!(
+        fs::read_to_string(&path)
+            .unwrap()
+            .starts_with("external-builders")
+    );
+}
+
+/// Renderings written out of order leave the newest.
+#[test]
+fn the_newest_nix_conf_rendering_is_the_one_left() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nix.conf");
+    let written = StdMutex::new(0);
+    write_newest(&written, 2, &path, "two");
+    write_newest(&written, 1, &path, "one");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "two");
 }
 
 #[test]

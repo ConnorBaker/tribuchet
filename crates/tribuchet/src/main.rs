@@ -14,6 +14,8 @@ mod proto;
 mod rt;
 mod sd;
 mod sockpath;
+#[cfg(test)]
+mod stalltest;
 mod store;
 mod tailscale;
 mod tmpdir;

@@ -211,6 +211,7 @@
             (treefmtFor pkgs).config.build.wrapper
           ];
           PROTOC = "${pkgs.protobuf}/bin/protoc";
+          RUSTFLAGS = "--cfg tokio_unstable";
         };
       });
     };

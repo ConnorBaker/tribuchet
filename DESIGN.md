@@ -173,10 +173,16 @@ worker has, so repeat builds carry bare path names only.
 
 Both sides back this with an on-disk chunk store (hub:
 `chunk-cache-bytes`, worker: `chunk-store-bytes`, 10 GiB default): append-only packs with S3-FIFO eviction, chosen over LRU
-because cold stagings are one-hit-wonder scans. The store is never a
-source of truth — a lost or corrupt chunk costs a re-transfer and the
-daemon's NAR-hash check backstops correctness, so the whole directory
-can be deleted at rest. A chunk evicted before use is requested again.
+because cold stagings are one-hit-wonder scans. At rest the store is
+never a source of truth — a lost or corrupt chunk costs a re-transfer
+and the daemon's NAR-hash check backstops correctness, so the whole
+directory can be deleted at rest. A chunk evicted before use is
+requested again. An output delivery pins its chunks in the hub's cache
+until the build ends, and while a late client still catches up on it.
+No lock that a lookup or pin takes is held across file I/O, and the
+hub's runtime does no store I/O; systemd is pinged only while the
+runtime's own timer fires (`sd.rs`), and tokio's eager driver hand-off
+keeps one blocked worker from stopping that timer (`rt.rs`).
 
 Hub restarts cancel nothing, without any state handoff: on SIGTERM the
 hub exits immediately and the replacement reconstructs its state from
@@ -217,6 +223,8 @@ wait on disk until a worker starts again (or expire undelivered).
   all gone is killed only after a grace period, and an abandoned
   queued job is dropped when a worker would have picked it up, not
   immediately.
+* An output delivery fails its build when the hub's chunk cache cannot
+  store or read back a chunk of it.
 * Dedupe attaches duplicates to the first attempt, so a transient
   failure propagates to all attached submitters (same as Buck2's RE
   dedupe behaviour).
