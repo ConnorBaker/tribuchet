@@ -391,7 +391,8 @@ in
         worker.succeed("systemctl start tribuchet-worker")
         # agents = "auto": the generator made one agent socket per core
         worker.succeed(
-            "systemctl is-active tribuchet-agent@1.socket tribuchet-agent@${toString agents}.socket"
+            # one unit per call: with several, is-active succeeds if any is
+            "systemctl is-active tribuchet-agent@1.socket && systemctl is-active tribuchet-agent@${toString agents}.socket"
         )
         worker.fail("systemctl is-active tribuchet-agent@${toString (agents + 1)}.socket")
         hub.wait_until_succeeds(
@@ -401,6 +402,11 @@ in
         # they do not pin the binary they were started with.
         worker.wait_until_succeeds(
             "test $(systemctl list-units --state=active --no-legend 'tribuchet-agent@*.service' | wc -l) = 0",
+            timeout=30,
+        )
+        # agent 1's state dir: its own, traverse-only for the worker and the uid block
+        worker.wait_until_succeeds(
+            "test \"$(stat -c '%a %U %G' /var/lib/tribuchet/a1)\" = '711 tribuchet-agent-1 tribuchet-agent-1'",
             timeout=30,
         )
 

@@ -334,18 +334,7 @@ in
         n: v: lib.nameValuePair "tribuchet-${n}" v
       ) workerUnits.generators;
 
-      systemd.sockets = {
-        "tribuchet-agent@" = removeAttrs workerUnits.agentSocketConfig [ "wantedBy" ];
-      }
-      // lib.listToAttrs (
-        map (
-          i:
-          lib.nameValuePair "tribuchet-agent@${i}" {
-            overrideStrategy = "asDropin";
-            wantedBy = [ "sockets.target" ];
-          }
-        ) workerUnits.agentInstances
-      );
+      systemd.sockets."tribuchet-agent@" = removeAttrs workerUnits.agentSocketConfig [ "wantedBy" ];
 
       systemd.services = {
         "tribuchet-agent@" = workerUnits.agentServiceConfig;
