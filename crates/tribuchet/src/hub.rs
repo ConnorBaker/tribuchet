@@ -460,6 +460,7 @@ async fn supervise_job(
     let dispatch_listed = state.list_dispatch(&job, worker.0);
     let mut dispatch = Dispatch::default();
     let bulk = sess.bulk.clone();
+    let since = job.replay.joins();
     let res = run_job(
         &state,
         &job,
@@ -510,15 +511,23 @@ async fn supervise_job(
         state.finish(&job).await;
         return;
     }
-    let err = chain(&err);
     if !dispatched && session_dead {
         // The worker never got the assignment: no loss to count, and
         // any loss pending from before is still pending.
+        let err = chain(&err);
         tracing::warn!(id = job.id, "assignment not sent, requeueing build: {err}");
         Metrics::inc(&state.metrics.requeued);
         state.requeue(job).await;
         return;
     }
+    if let Error::Missing(path) = &err {
+        // Not a verdict: its clients wait for one to bring the input back.
+        let _ = cancel(&out_tx, &job).await;
+        state.shadow.abort("input missing", dispatch.run.as_ref());
+        state.hold_for_input(job, path, since).await;
+        return;
+    }
+    let err = chain(&err);
     if !dispatched {
         // The hub could not prepare the assignment: its own failure,
         // never a loss of the worker's (an input it does not have, or

@@ -2,13 +2,15 @@
 //! while a known worker serves them, else answered per client as a new
 //! client would be (SEMANTICS-7 L11′).
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use super::{HubState, Job, Replay, Servability, Wait};
 use crate::hub::known::refusal;
+use crate::hub::losses;
 use crate::hub::metrics::Metrics;
+use crate::hub::semantics as sem;
 use crate::proto::attach_event;
 
 /// A queued build no connected worker serves, none expected back, that a
@@ -48,6 +50,7 @@ impl HubState {
     async fn hold_unservable_now(self: &Arc<Self>) -> Option<Instant> {
         let mut due: Option<Instant> = None;
         let mut unservable = Vec::new();
+        let mut answered = HashMap::new();
         let unserved: Vec<Job> = {
             let mut queue = self.queue.lock().await;
             let (unserved, kept) = (queue.drain(..)).partition::<VecDeque<Job>, _>(|j| {
@@ -55,7 +58,13 @@ impl HubState {
                     Servability::Now => {}
                     Servability::ExpectedBy(at) => due = Some(due.map_or(at, |d| d.max(at))),
                     Servability::Never if !self.known.serves(&j.req.system, &j.features) => {
-                        j.unlist();
+                        let local = !j.req.fixed_output;
+                        let decided = j.replay.close(local, |declined, waiting| {
+                            self.shadow.deferred("no known worker", j, declined);
+                            self.shadow.refused(j, waiting);
+                            j.unlist();
+                        });
+                        answered.insert(j.id.clone(), decided);
                         return true;
                     }
                     Servability::Never => unservable.push(Unservable {
@@ -75,7 +84,8 @@ impl HubState {
         let state = self.clone();
         let ended = tokio::spawn(async move {
             for job in unserved {
-                state.end_unservable(job).await;
+                let decided = answered.remove(&job.id).unwrap_or_default();
+                state.end_unservable(job, decided).await;
             }
         });
         // Outside the queue lock: both wait on the job's replay.
@@ -118,28 +128,57 @@ impl HubState {
         due
     }
 
-    /// End `job`, which no connected or known worker serves: each client
-    /// whose Nix builds it is declined, the others refused (L11′).
-    async fn end_unservable(&self, job: Job) {
+    /// `job`'s input `path` is not valid in the hub's store, as a query made
+    /// once `since` clients had joined says. No fact about the build: its
+    /// client's Nix made every input valid in its store, the hub's, before
+    /// it submitted, and a client that joins does so again (SEMANTICS-7
+    /// cut-over 10). Each client whose Nix builds it is declined (D2); the
+    /// others wait, the build held out of placement until a client joins.
+    pub(in crate::hub) async fn hold_for_input(
+        self: &Arc<Self>,
+        job: Job,
+        path: &str,
+        since: usize,
+    ) {
+        losses::decline(self, &job, "input missing").await;
+        if job.replay.can_local().is_empty() {
+            self.finish(&job).await;
+            return;
+        }
+        let held = job.replay.hold(since);
+        tracing::warn!(
+            id = job.id,
+            path,
+            held,
+            "an input is not in the hub's store"
+        );
+        let note = format!(
+            "tribuchet: the hub's store lacks {path}, an input; waiting for a client to bring it\n"
+        );
+        (job.replay
+            .publish(attach_event::Event::Log(note.into_bytes())))
+        .await;
+        self.requeue(job).await;
+    }
+
+    /// End `job`, which no connected or known worker serves, its answer
+    /// decided as it left the queue: each client whose Nix builds it was
+    /// `declined`, the others, `waiting`, are refused (L11′). A queued build
+    /// has no half-sent output: a requeue restarted them.
+    async fn end_unservable(&self, job: Job, (declined, waiting): (Vec<sem::Client>, usize)) {
         let (id, system) = (job.id.as_str(), job.req.system.as_str());
-        if !job.replay.has_subscribers().await {
+        if declined.is_empty() && waiting == 0 {
             tracing::info!(id, "dropping queued build: no client attached");
             self.finish(&job).await;
             return;
         }
         let features = job.features.join(",");
-        if !job.req.fixed_output && job.replay.can_local().contains(&true) {
-            job.restart_outputs().await;
-            let (declined, waiting) = job.replay.decline_local().await;
-            self.shadow.deferred("no known worker", &job, &declined);
+        if !declined.is_empty() {
             tracing::info!(id, system, features, waiting, "no known worker; declining");
-            if !declined.is_empty() {
-                Metrics::inc(&self.metrics.declined);
-            }
+            Metrics::inc(&self.metrics.declined);
         }
-        if !job.replay.can_local().is_empty() {
+        if waiting > 0 {
             tracing::info!(id, system, features, "no known worker; refusing");
-            self.shadow.refused(&job);
             let err = refusal(system, &job.features);
             job.replay.publish(attach_event::Event::Error(err)).await;
         }

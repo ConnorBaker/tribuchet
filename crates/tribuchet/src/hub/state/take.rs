@@ -114,7 +114,8 @@ impl HubState {
                 let workers = self.worker_caps.lock().unwrap();
                 let (now, mut left) = (Instant::now(), Vec::new());
                 let pos = queue.iter_mut().position(|j| {
-                    if !caps.serves(&j.req.system, &j.features) || j.kept(&workers, &holding) {
+                    let unfit = !caps.serves(&j.req.system, &j.features) || j.replay.held();
+                    if unfit || j.kept(&workers, &holding) {
                         return false;
                     }
                     let (system, features, first) =

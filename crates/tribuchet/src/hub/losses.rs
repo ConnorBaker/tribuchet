@@ -197,22 +197,16 @@ pub(super) async fn count(state: &HubState, mut job: Job, charge: Charge) -> Opt
 /// clients, and all of a build with network (which would run in the
 /// client host's network, outside every fod-network policy), wait on.
 async fn defer(state: &HubState, job: Job, (losses, lost): (u32, &str)) -> Option<Job> {
-    if job.req.fixed_output || !job.replay.can_local().contains(&true) {
+    let Some((declined, waiting)) = decline(state, &job, "loss cap").await else {
         return Some(job);
-    }
-    job.restart_outputs().await;
-    let (declined, waiting) = job.replay.decline_local().await;
-    state.shadow.deferred("loss cap", &job, &declined);
+    };
     tracing::warn!(
         id = job.id,
         losses,
-        declined = declined.len(),
+        declined,
         waiting,
         "build lost {lost} too often; declining it to the clients whose Nix builds it"
     );
-    if !declined.is_empty() {
-        Metrics::inc(&state.metrics.declined);
-    }
     if waiting > 0 {
         return Some(job);
     }
@@ -220,15 +214,39 @@ async fn defer(state: &HubState, job: Job, (losses, lost): (u32, &str)) -> Optio
     None
 }
 
+/// Send each client of `job` whose own Nix builds it back to it (D2), its
+/// output transfers dropped first, at `point`: how many were, and how many
+/// others wait. None if no client could be: one with network, or none.
+pub(super) async fn decline(state: &HubState, job: &Job, point: &str) -> Option<(usize, usize)> {
+    if job.req.fixed_output || !job.replay.can_local().contains(&true) {
+        return None;
+    }
+    job.restart_outputs().await;
+    let (declined, waiting) = job.replay.decline_local().await;
+    state.shadow.deferred(point, job, &declined);
+    if !declined.is_empty() {
+        Metrics::inc(&state.metrics.declined);
+    }
+    Some((declined.len(), waiting))
+}
+
 /// The hub cannot carry `job` at `point`: `err`, its own verdict, a fact
 /// about the hub (relay/daemon.rs), not an outcome of the build's
 /// (SEMANTICS-7 L12). Each client whose own Nix builds it is declined,
-/// which needs nothing of the hub's; the others fail with `err`.
+/// which needs nothing of the hub's; the others fail with `err`. Only the
+/// clients waiting as that is decided are answered: the build is unlisted
+/// in the same step, so a client after starts a build of its own.
 pub(super) async fn hub_cannot(state: &HubState, job: Job, point: &str, err: String) {
-    if !job.req.fixed_output && job.replay.can_local().contains(&true) {
+    let local = !job.req.fixed_output;
+    if local {
         job.restart_outputs().await;
-        let (declined, _) = job.replay.decline_local().await;
-        state.shadow.deferred(point, &job, &declined);
+    }
+    let (declined, waiting) = job.replay.close(local, |declined, waiting| {
+        state.shadow.deferred(point, &job, declined);
+        state.shadow.cannot(&job, point, waiting);
+        job.unlist();
+    });
+    if !declined.is_empty() {
         let n = declined.len();
         tracing::warn!(
             id = job.id,
@@ -236,12 +254,9 @@ pub(super) async fn hub_cannot(state: &HubState, job: Job, point: &str, err: Str
             declined = n,
             "hub cannot build it; declining: {err}"
         );
-        if n > 0 {
-            Metrics::inc(&state.metrics.declined);
-        }
+        Metrics::inc(&state.metrics.declined);
     }
-    state.shadow.cannot(&job, point);
-    if !job.replay.can_local().is_empty() {
+    if waiting > 0 {
         tracing::warn!(id = job.id, point, "build failed: {err}");
         Metrics::inc(&state.metrics.failed);
         job.replay.publish(attach_event::Event::Error(err)).await;

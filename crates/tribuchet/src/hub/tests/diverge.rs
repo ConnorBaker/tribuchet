@@ -99,8 +99,39 @@ async fn a_verdict_while_a_client_could_build_it_diverges() {
     j.key = key_of(0);
     let c = state.shadow.submit(&j.key, ("aarch64-linux", &[]), true);
     let _client = j.replay.subscribe_as(c).await;
-    state.shadow.cannot(&j, "hub-side error");
+    state.shadow.cannot(&j, "hub-side error", 1);
     assert_eq!(log.count("shadow divergence"), 1);
+}
+
+/// An input the hub's store lacks is no verdict (cut-over 10): the client
+/// whose Nix builds the key is declined, as the core Defers it, and the
+/// other waits, the run aborted, as the core's build does.
+#[tokio::test]
+async fn a_build_held_for_an_input_is_no_divergence() {
+    let log = Captured;
+    let _guard = log.install();
+    let state = Arc::new(HubState::for_test(Duration::ZERO));
+    let _w = connect(&state, "w1", 1, &[]);
+    while state.worker_caps.lock().unwrap().is_empty() {
+        tokio::task::yield_now().await;
+    }
+    let mut j = job(0, Arc::new(Replay::default()));
+    j.key = key_of(0);
+    let mut clients = Vec::new();
+    for can_local in [true, false] {
+        let c = state
+            .shadow
+            .submit(&j.key, ("x86_64-linux", &[]), can_local);
+        clients.push(j.replay.subscribe_as(c).await);
+    }
+    let run = RunId { epoch: 1, seq: 1 };
+    state.shadow.assigned(&run, &j.key, "w1");
+    state.shadow.need(Some(&run));
+    state.shadow.abort("input missing", Some(&run));
+    state.hold_for_input(j, "/nix/store/x", 0).await;
+    let bad = "shadow divergence";
+    assert_eq!(log.count(bad), 0, "{}", log.line(bad));
+    assert_eq!(state.queue.lock().await.len(), 1, "not held");
 }
 
 /// A worker of the system without a feature the build requires does not

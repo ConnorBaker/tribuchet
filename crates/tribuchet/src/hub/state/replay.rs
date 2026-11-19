@@ -3,7 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::mem;
 use std::sync::Mutex as StdMutex;
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock, Weak};
 use std::time::Duration;
 
@@ -56,6 +56,16 @@ pub(in crate::hub) struct Replay {
     /// Each client, and whether its own Nix can build the key (canLocal):
     /// a client's, not the build's, since clients sharing a key may differ.
     clients: StdMutex<Vec<Listener>>,
+    /// Its answer was decided (close): no client joins. Set and read under
+    /// `clients`' lock.
+    closed: AtomicBool,
+    /// One past the last event published.
+    published: AtomicUsize,
+    /// Out of placement until a client joins, which brings back an input
+    /// the hub's store lacked (SEMANTICS-7 cut-over 10).
+    held: AtomicBool,
+    /// Clients that joined so far.
+    joins: AtomicUsize,
 }
 
 #[derive(Default)]
@@ -451,6 +461,7 @@ impl Replay {
             event: ev,
             nth,
         });
+        self.published.store(i + 1, Ordering::Release);
         inner.trim(&self.id);
         drop(inner);
         self.grew.notify_waiters();
@@ -468,14 +479,33 @@ impl Replay {
         self: &Arc<Self>,
         client: Client,
     ) -> mpsc::Receiver<Result<AttachEvent, Status>> {
-        self.hold.lock().unwrap().clientless = None;
+        (self.join(|| client).await).expect("a build answered before it was listed")
+    }
+
+    /// The client `client` makes joins the build, unless its answer was
+    /// decided (`close`): then none is made, and the build is unlisted.
+    pub(in crate::hub) async fn join(
+        self: &Arc<Self>,
+        client: impl FnOnce() -> Client,
+    ) -> Option<mpsc::Receiver<Result<AttachEvent, Status>>> {
         let (tx, rx) = mpsc::channel(SUB_CHANNEL_SLACK);
-        let (listener, declined) = Listener::new(&tx, &client);
-        self.clients.lock().unwrap().push(listener);
+        let (client, declined) = {
+            let mut clients = self.clients.lock().unwrap();
+            if self.closed.load(Ordering::Relaxed) {
+                return None;
+            }
+            let client = client();
+            let (listener, declined) = Listener::new(&tx, &client);
+            clients.push(listener);
+            self.held.store(false, Ordering::Relaxed);
+            self.joins.fetch_add(1, Ordering::Relaxed);
+            (client, declined)
+        };
+        self.hold.lock().unwrap().clientless = None;
         // Before the reader, which takes it out when it ends.
         self.inner.lock().await.subs.push(tx.clone());
         tokio::spawn(read(self.clone(), tx, client, declined));
-        rx
+        Some(rx)
     }
 
     /// Tell the clients the build waits for `wait`, once until it is

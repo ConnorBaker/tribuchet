@@ -250,9 +250,18 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 .cloned();
             if let Some(replay) = existing {
                 let sys = (req.system.as_str(), features.as_slice());
-                let client = self.state.shadow.submit(&key, sys, can_local);
-                tracing::info!(key, client = client.id, "deduplicating build submission");
-                break replay.subscribe_as(client).await;
+                let client = || {
+                    let client = self.state.shadow.submit(&key, sys, can_local);
+                    tracing::info!(key, client = client.id, "deduplicating build submission");
+                    client
+                };
+                // Answered before this client came, and so unlisted: anew.
+                let Some(rx) = replay.join(client).await else {
+                    continue;
+                };
+                // A build held for an input this client brought is free.
+                self.state.notify.notify_waiters();
+                break rx;
             }
             let id = new_id();
             let replay = Arc::new(Replay::new(id.clone()));

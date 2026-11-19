@@ -3,7 +3,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering::Relaxed;
 
-use super::{CLIENTS, Client, Mirror, Shadow, Sys, id, key, serves, today};
+use super::{CLIENTS, Client, Mirror, Shadow, Sys, answers, id, key, serves, today};
 use crate::hub::losses::Loss;
 use crate::hub::semantics::{self as sem, Answer, Event, Outcome, Phase};
 use crate::hub::state::{HubState, Job};
@@ -212,9 +212,9 @@ impl Shadow {
 
     /// The hub cannot carry `job` (its verdict at `point`): it refuses the
     /// clients still waiting, those whose Nix builds the key deferred first,
-    /// and cancels its run (L12).
-    pub(in crate::hub) fn cannot(&self, job: &Job, point: &str) {
-        let today = today(job, Answer::Refuse);
+    /// and cancels its run (L12); `waiting` others are refused.
+    pub(in crate::hub) fn cannot(&self, job: &Job, point: &str, waiting: usize) {
+        let today = answers(job, Answer::Refuse, waiting);
         self.with(|m| {
             let Some(key) = key(&job.key) else { return };
             m.feed(point, &today, vec![Event::Cannot { key }]);
@@ -233,9 +233,9 @@ impl Shadow {
     }
 
     /// No known worker serves queued `job`: the hub refuses its clients
-    /// still waiting (L11′).
-    pub(in crate::hub) fn refused(&self, job: &Job) {
-        let today = today(job, Answer::Refuse);
+    /// still waiting, `waiting` of them (L11′).
+    pub(in crate::hub) fn refused(&self, job: &Job, waiting: usize) {
+        let today = answers(job, Answer::Refuse, waiting);
         self.with(|m| {
             let Some(key) = key(&job.key) else { return };
             m.feed("no known worker", &today, vec![Event::Refuse { key }]);

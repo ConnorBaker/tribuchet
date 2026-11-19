@@ -119,7 +119,11 @@ fn id(point: &str, run: Option<&RunId>) -> Option<(u64, u64)> {
 
 /// What the hub answers `job`'s clients still reading at a point.
 fn today(job: &Job, a: Answer) -> Vec<(sem::Key, Answer)> {
-    let n = job.replay.can_local().len();
+    answers(job, a, job.replay.can_local().len())
+}
+
+/// What the hub answers `n` of `job`'s clients.
+fn answers(job: &Job, a: Answer, n: usize) -> Vec<(sem::Key, Answer)> {
     key(&job.key).map_or(vec![], |k| vec![(k, a); n.min(1)])
 }
 
