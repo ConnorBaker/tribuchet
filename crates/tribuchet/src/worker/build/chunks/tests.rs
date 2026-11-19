@@ -10,7 +10,11 @@ use zstd::bulk::compress;
 
 use super::*;
 use crate::chunkstore::io_hook::{self, Op};
+use crate::proto::{ChunkFrame, Manifest, PathInfoMsg};
 use crate::stalltest::Gate;
+use crate::testlog::Captured;
+use crate::worker::WorkerCtx;
+use crate::worker::build::tests::base_assignment;
 
 #[test]
 fn feed_import_forgets_corrupt_and_missing_chunks() {
@@ -332,4 +336,40 @@ fn feeds_racing_the_sessions_evictions_read_every_pinned_chunk_intact() {
          lookup-to-read window, {copies} copies forward, feed rounds {rounds:?}"
     );
     drop(builds);
+}
+
+/// A Need answered without a chunk the build waits on says, naming the
+/// build, that it asks again: the worker's journal holds many stagings.
+#[tokio::test]
+async fn chunks_lost_name_their_build() -> Result<()> {
+    let log = Captured;
+    let _guard = log.install();
+    let dir = tempfile::tempdir()?;
+    let ctx = WorkerCtx::for_test(dir.path(), 1, vec![])?;
+    let mut build = ActiveBuild::new(base_assignment(), ctx, mpsc::unbounded_channel().0)?;
+    let (id, path) = (
+        build.assignment.build_id.clone(),
+        "/nix/store/00000000000000000000000000000000-in",
+    );
+    build.pending.insert(path.into());
+    let info = PathInfoMsg {
+        nar_sha256: vec![0; 32],
+        nar_size: 1,
+        ..PathInfoMsg::default()
+    };
+    let m = Manifest {
+        store_path: path.into(),
+        info: Some(info),
+        hashes: vec![7; 32],
+        sizes: vec![1],
+        ..Manifest::default()
+    };
+    build.feed_manifest(&m)?;
+    build.feed_chunk(&ChunkFrame {
+        build_id: id.clone(),
+        eof: true,
+        ..ChunkFrame::default()
+    })?;
+    assert!(log.line("chunks lost").contains(&format!(r#"id="{id}""#)));
+    Ok(())
 }

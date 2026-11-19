@@ -9,7 +9,7 @@ use rusqlite::config::DbConfig;
 
 use super::*;
 use crate::hub::metrics;
-use crate::hub::testlog::Captured;
+use crate::testlog::Captured;
 
 /// A reader of the record at `path`, as another process would open it,
 /// that never waits for a lock.

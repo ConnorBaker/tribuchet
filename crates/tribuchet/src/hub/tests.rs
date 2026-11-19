@@ -7,9 +7,9 @@ use hyper_util::rt::TokioIo;
 use tonic::transport::{Endpoint, Server, Uri};
 use tower::service_fn;
 
+use crate::testlog::Captured;
 use state::{FLOOR, Replay};
 use submit::AttachSvc;
-use testlog::Captured;
 
 use crate::config::NixConfig;
 use crate::proto::attach_hub_client::AttachHubClient;

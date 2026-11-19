@@ -2,6 +2,8 @@
 
 mod daemon;
 mod outputs;
+#[cfg(test)]
+mod report_tests;
 mod serve;
 mod staging;
 pub(super) use daemon::{ANSWER as DAEMON_ANSWER, Evidence as DaemonEvidence};
@@ -106,6 +108,9 @@ pub(super) async fn run_job(
                 continue;
             }
             _ = abandon_check.tick() => {
+                if dispatch.reached < Run::Started {
+                    staging.report_if_due();
+                }
                 if resumed_after.is_some_and(|n| state.unlisted(session, &job.key, n)) {
                     tracing::warn!(id = job.id, "the worker no longer lists the build it resumed");
                     state.shadow.gone("unlisted", dispatch.run.as_ref());
@@ -131,12 +136,14 @@ pub(super) async fn run_job(
                 resumed_after = Some(state.heartbeats(session));
                 let held = r.run.as_ref().map(ToString::to_string);
                 tracing::info!(id = job.id, held, "worker resumed an in-flight build");
+                staging.summarize(r.run.as_ref());
                 state
                     .shadow
                     .resumed(dispatch.run.as_ref(), r.run.as_ref(), &job.key);
             }
             worker_message::Msg::Started(s) => {
                 dispatch.reached = dispatch.reached.max(Run::Started);
+                staging.summarize(s.run.as_ref());
                 state.shadow.started(s.run.as_ref());
             }
             worker_message::Msg::ResultGone(g) => {

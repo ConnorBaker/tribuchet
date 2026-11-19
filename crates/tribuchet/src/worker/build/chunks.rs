@@ -135,7 +135,7 @@ impl ChunkStaging {
 }
 
 impl ActiveBuild {
-    pub(super) fn need(&mut self, paths: Vec<String>, hashes: Vec<u8>) -> Option<Need> {
+    pub(in crate::worker) fn need(&mut self, paths: Vec<String>, hashes: Vec<u8>) -> Option<Need> {
         if paths.is_empty() && hashes.is_empty() {
             return None;
         }
@@ -229,7 +229,8 @@ impl ActiveBuild {
                         return Err(err_msg("input chunks keep going missing"));
                     }
                     self.resend_rounds += 1;
-                    tracing::warn!(chunks = hashes.len() / 32, "chunks lost, requesting again");
+                    let (id, chunks) = (&self.assignment.build_id, hashes.len() / 32);
+                    tracing::warn!(id, chunks, "chunks lost, requesting again");
                 }
                 for p in ready {
                     self.start_chunk_import(&p)?;

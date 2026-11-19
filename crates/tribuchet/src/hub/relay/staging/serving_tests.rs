@@ -1,12 +1,17 @@
 //! Chunk serving of several builds on one worker session.
 
+use std::fs;
 use std::ops::Range;
+use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::time::{Duration, Instant};
 
 use super::tests::{info, test_job};
 use super::*;
+use crate::chunker::{Chunk, chunk_store_path};
 use crate::chunkstore::io_hook;
-use crate::hub::testlog::Captured;
+use crate::report::REPORT;
+use crate::testlog::Captured;
 
 /// Recipe size of every test chunk.
 const CHUNK: u64 = 1 << 20;
@@ -179,4 +184,126 @@ async fn a_builds_needs_log_one_line_with_their_sums() {
     let sums = "needs: 3, cached: 3, repacked: 0, plain_bytes: 3145728, wire_bytes: 3,";
     assert!(line.contains(sums), "{line}");
     assert!(line.contains(r#"worker="w1""#), "{line}");
+}
+
+/// A staging whose Need is never answered said nothing while it lasted:
+/// one served for 4 h with no line after its first Need. It reports its
+/// counts once per REPORT.
+#[tokio::test(start_paused = true)]
+async fn a_staging_that_never_finishes_reports_where_it_stands() {
+    let log = Captured;
+    let _guard = log.install();
+    let state = HubState::for_test(Duration::from_secs(1));
+    let path = "/nix/store/22222222222222222222222222222222-stuck";
+    let mut job = job_with_id("0000000000000000000000000000000c");
+    job.req.input_paths = vec![path.into()];
+    let sess = WorkerSession::new("w2".into(), mpsc::channel(1).0);
+    let mut staging = staged(&state, &job, &sess, path, 0..2);
+    // Never polled, the Need being served sends nothing.
+    let (out_tx, _out_rx) = mpsc::channel(8);
+    need_all(&mut staging, &out_tx).await;
+    staging.tasks.push(Box::pin(pending()));
+    tokio::time::advance(REPORT).await;
+    staging.report_if_due();
+    let line = log.line("build not started");
+    for field in [
+        r#"id="0000000000000000000000000000000c""#,
+        r#"worker="w2""#,
+        "staging_s=600",
+        "computing=1",
+        "needs_received=1",
+        "serving=true",
+        "needs: 0,",
+    ] {
+        assert!(line.contains(field), "{field} in {line}");
+    }
+}
+
+/// A manifest for a file of `len` bytes that does not repeat, as its own
+/// path: the NAR the packer scans, of chunks the cache lacks.
+fn file_manifest(dir: &Path, len: usize) -> Arc<(Info, Recipe)> {
+    let file = dir.join("input");
+    let mut x: u64 = 0x9e37_79b9_7f4a_7c15;
+    let bytes: Vec<u8> = (0..len)
+        .map(|_| {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x.to_le_bytes()[0]
+        })
+        .collect();
+    fs::write(&file, bytes).unwrap();
+    let mut recipe = Vec::new();
+    let mut chunk = |c: Chunk| {
+        recipe.push((c.hash, c.data.len() as u64));
+        Ok(true)
+    };
+    chunk_store_path(&file, &mut chunk).unwrap();
+    let msg = PathInfoMsg {
+        nar_size: recipe.iter().map(|(_, n)| n).sum(),
+        ..PathInfoMsg::default()
+    };
+    let store_path = file.to_str().unwrap().into();
+    Arc::new((Info { store_path, msg }, Arc::new(recipe)))
+}
+
+/// A sum of `served`'s, by name.
+fn sum(served: &Served, name: &str) -> u64 {
+    let served = format!("{served:?}");
+    let at = served.find(&format!("{name}: ")).unwrap() + name.len() + 2;
+    served[at..]
+        .split([',', ' '])
+        .next()
+        .unwrap()
+        .parse()
+        .unwrap()
+}
+
+/// A Need's two waits to send show apart: for the session's send permit,
+/// held here by another Need until this one asks for it and 200 ms on,
+/// and for room in the session's stream, read only 500 ms after that.
+#[tokio::test(start_paused = true)]
+async fn a_need_being_served_tells_its_wait_for_the_permit_from_the_link() {
+    let state = HubState::for_test(Duration::from_secs(1));
+    let job = test_job();
+    let sess = WorkerSession::new("w".into(), mpsc::channel(1).0);
+    let dir = tempfile::tempdir().unwrap();
+    let mut staging = Staging::new(&state, &job, &sess);
+    staging.sent.push(file_manifest(dir.path(), 300_000));
+    let (out_tx, mut out_rx) = mpsc::channel(1);
+    let held = sess.send_permit().await;
+    let asked = sess.asked();
+    need_all(&mut staging, &out_tx).await;
+    let released = AtomicBool::new(false);
+    let serve = async {
+        while staging.busy() {
+            staging.progress(&out_tx).await.unwrap();
+        }
+    };
+    let release = async {
+        while sess.asked() == asked {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        drop(held);
+        released.store(true, Ordering::Relaxed);
+    };
+    let read = async {
+        while !released.load(Ordering::Relaxed) {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        while let Some(m) = out_rx.recv().await {
+            if let Some(hub_message::Msg::Chunk(c)) = m.unwrap().msg
+                && c.eof
+            {
+                break;
+            }
+        }
+    };
+    tokio::join!(serve, release, read);
+    let s = &staging.served;
+    let (permit, send) = (sum(s, "permit_us"), sum(s, "send_us"));
+    assert!((200_000..300_000).contains(&permit), "{s:?}");
+    assert!((500_000..600_000).contains(&send), "{s:?}");
 }

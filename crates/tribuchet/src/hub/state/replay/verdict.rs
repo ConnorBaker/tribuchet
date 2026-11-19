@@ -10,9 +10,9 @@ use futures_util::poll;
 use super::*;
 use crate::hub::losses;
 use crate::hub::state::HubState;
-use crate::hub::testlog::Captured;
 use crate::hub::tests::{H, connect, submit};
 use crate::proto::BuildRequest;
+use crate::testlog::Captured;
 
 fn request(can_local: bool) -> BuildRequest {
     BuildRequest {

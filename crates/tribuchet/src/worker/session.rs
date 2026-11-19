@@ -155,6 +155,7 @@ async fn session_loop(
                 continue;
             }
             _ = heartbeat.tick() => {
+                active.values_mut().for_each(ActiveBuild::report_if_due);
                 let _ = bulk_tx.try_send(WorkerMessage::default());
                 out_tx.send(beat(active, ctx)).await?;
                 out_tx.send(capacity(active, &ready, &env)).await?;
@@ -506,6 +507,8 @@ async fn fail_build(
 
 #[cfg(test)]
 mod negotiate_tests;
+#[cfg(test)]
+mod report_tests;
 #[cfg(test)]
 mod slow_link_tests;
 #[cfg(test)]

@@ -27,6 +27,7 @@ use crate::hub::state::{HubState, Job};
 use crate::proto::{
     ChunkFrame, HubMessage, Manifest, Need, PathInfoMsg, TmpDirArchive, hub_message,
 };
+use crate::report::Ticker;
 
 /// Forget everything rather than track LRU. A miss costs one round trip.
 const KNOWN_CAP: usize = 1 << 18;
@@ -96,19 +97,23 @@ pub(super) struct Staging<'a> {
     /// reading the worker, so neither side blocks on a full peer.
     queued: VecDeque<HashSet<Hash>>,
     serving: Option<Serving<'a>>,
-    /// What its Needs were served (serve::Served), logged once as the
-    /// staging ends, however it ends: a line per Need (per late manifest)
-    /// flooded journald. On success the line comes after the outputs are
-    /// delivered. A hub killed outright (SIGKILL, the watchdog's SIGABRT,
-    /// the OOM killer) loses the line of every staging in flight.
+    /// What its Needs were served (serve::Served), logged once (report.rs)
+    /// when the worker starts or resumes the build, else as the staging
+    /// ends: a line per Need (per late manifest) flooded journald. A hub
+    /// killed outright (SIGKILL, the watchdog's SIGABRT, the OOM killer)
+    /// loses the line of every staging in flight.
     served: Arc<Served>,
-    first_need: bool,
+    /// Whether its "needs served" line was logged (report.rs summarize).
+    summarized: bool,
+    /// Needs the worker sent, the first included.
+    needs: u64,
+    /// When it says where it stands (report.rs).
+    report: Ticker,
 }
 
 impl Drop for Staging<'_> {
     fn drop(&mut self) {
-        let (id, worker) = (&self.job.id, &self.sess.worker);
-        tracing::info!(id, worker, served = ?self.served, "needs served");
+        self.summarize(None);
     }
 }
 
@@ -126,7 +131,9 @@ impl<'a> Staging<'a> {
             queued: VecDeque::new(),
             serving: None,
             served: Arc::default(),
-            first_need: true,
+            summarized: false,
+            needs: 0,
+            report: Ticker::default(),
         }
     }
 
@@ -241,9 +248,9 @@ impl<'a> Staging<'a> {
                 return Err(err_msg(format!("worker requested unoffered path {p}")));
             }
         }
-        let first = self.first_need;
-        self.update_known(&n.paths);
-        self.first_need = false;
+        let first = self.needs == 0;
+        self.needs += 1;
+        self.update_known(first, &n.paths);
         if first {
             tracing::info!(
                 id = self.job.id,
@@ -283,9 +290,9 @@ impl<'a> Staging<'a> {
         Ok(())
     }
 
-    fn update_known(&self, missing: &[String]) {
+    fn update_known(&self, first: bool, missing: &[String]) {
         let mut known = self.sess.known.lock().unwrap();
-        if self.first_need {
+        if first {
             if known.len() > KNOWN_CAP {
                 known.clear();
             }
@@ -582,5 +589,6 @@ mod tests {
     }
 }
 
+mod report;
 #[cfg(test)]
 mod serving_tests;
