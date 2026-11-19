@@ -15,25 +15,28 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tonic::Status;
 
-use super::cancel;
 use super::losses::{Dispatch, Run};
 use super::metrics::Metrics;
 use super::naming::drv_name;
 use super::record::Rest;
 use super::state::{HubState, Job, Replay};
+use super::{SILENCE_TIMEOUT, cancel};
 use crate::errors::{Error, Result, err_msg};
 use crate::proto::{
     BuildAssignment, BuildResult, HubMessage, ResultAck, attach_event, hub_message, worker_message,
 };
 
+/// Send `msg` on a stream of the worker's session: bounded, as the
+/// worker's silence is (chunkio::SILENCE_TIMEOUT).
 pub(super) async fn send(
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
     msg: hub_message::Msg,
 ) -> Result<()> {
-    out_tx
-        .send(Ok(HubMessage { msg: Some(msg) }))
-        .await
-        .map_err(|_| err_msg("worker connection lost"))
+    let sent = out_tx.send(Ok(HubMessage { msg: Some(msg) }));
+    match tokio::time::timeout(SILENCE_TIMEOUT, sent).await {
+        Ok(sent) => sent.map_err(|_| err_msg("worker connection lost")),
+        Err(_) => Err(Error::Silent),
+    }
 }
 
 /// Drive one dispatched build to its verdict on the worker the hub
