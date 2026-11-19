@@ -84,6 +84,7 @@ in
   nodes = {
     hub =
       {
+        config,
         pkgs,
         nodes,
         ...
@@ -264,6 +265,23 @@ in
         # started by the test script once certificates exist
         systemd.sockets.tribuchet-hub.wantedBy = lib.mkForce [ ];
         systemd.services.tribuchet-hub.wantedBy = lib.mkForce [ ];
+        # The module's attach, but keeping a copy of each build.json, so
+        # that the e2e tests read Nix's own canBuildLocally.
+        nix.settings.external-builders = lib.mkForce (
+          builtins.toJSON [
+            {
+              systems = config.services.tribuchet-hub.externalBuilders.systems;
+              program = pkgs.writeShellScript "tt-attach" ''
+                set -e
+                cp "$1" "$(mktemp /var/lib/tt-buildjson/XXXXXX)"
+                exec ${lib.getExe' tribuchet "tribuchet"} attach "$1" \
+                  --socket ${config.services.tribuchet-hub.socketPath}
+              '';
+              args = [ ];
+            }
+          ]
+        );
+        systemd.tmpfiles.rules = [ "d /var/lib/tt-buildjson 1777 root root -" ];
       };
 
     worker =

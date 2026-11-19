@@ -63,7 +63,8 @@ async fn run_async(build: BuildJson, socket: PathBuf) -> Result<i32> {
     let fixed_output = build.network_allowed(attrs.as_ref());
     let required_features = required_system_features(&build.env, attrs.as_ref());
     let local_networking = flag(&build.env, attrs.as_ref(), "__darwinAllowLocalNetworking");
-    tracing::info!(fixed_output, system = %build.system, "submitting build");
+    let can_local = build.can_local(fixed_output);
+    tracing::info!(fixed_output, can_local, system = %build.system, "submitting build");
     let req = BuildRequest {
         system: build.system,
         builder: build.builder,
@@ -78,6 +79,7 @@ async fn run_async(build: BuildJson, socket: PathBuf) -> Result<i32> {
         local_networking,
         timeout_secs: build.timeout,
         max_silent_secs: build.max_silent_time,
+        can_local,
     };
     // Packed once and resent verbatim on every reconnect attempt.
     // Nix places everything the builder consumes in topTmpDir/build.

@@ -338,6 +338,10 @@ message BuildRequest {
   // time it waits for a worker or an agent, nor the time it is frozen.
   uint64 timeout_secs = 12;
   uint64 max_silent_secs = 13;
+  // Whether the client's own Nix builds it when declined (canLocal), as
+  // its build.json says, false with network; unset when Nix does not say.
+  // Not part of the build.
+  optional bool can_local = 14;
 }
 
 message AttachEvent {
