@@ -24,6 +24,13 @@ pub(super) fn refusal(system: &str, features: &[String]) -> String {
     )
 }
 
+/// Why a worker was not decommissioned.
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum Forget {
+    Unknown,
+    Connected,
+}
+
 #[derive(Default)]
 pub(super) struct Known {
     /// Where they are stored; none in tests.
@@ -54,26 +61,43 @@ impl Known {
     }
 
     /// `caps`'s worker registered: it is known, serving what it said.
+    #[cfg(test)]
     pub(super) fn learn(&self, caps: &WorkerCaps) {
+        self.join(caps, || {});
+    }
+
+    /// `caps`'s worker registers: it is known, serving what it said, before
+    /// `connect` makes it connected, both under this set's lock, so that a
+    /// connected worker is always known (SEMANTICS-7 cut-over 7).
+    pub(super) fn join(&self, caps: &WorkerCaps, connect: impl FnOnce()) {
         let systems: Systems = (caps.systems.iter())
             .map(|(s, f)| (s.clone(), f.iter().cloned().collect()))
             .collect();
         let mut workers = self.workers.lock().unwrap();
-        if workers.get(&caps.name) == Some(&systems) {
-            return;
-        }
-        workers.insert(caps.name.clone(), systems);
-        self.store(&workers);
-    }
-
-    /// The worker `name` is decommissioned: whether it was known.
-    pub(super) fn forget(&self, name: &str) -> bool {
-        let mut workers = self.workers.lock().unwrap();
-        let known = workers.remove(name).is_some();
-        if known {
+        if workers.get(&caps.name) != Some(&systems) {
+            workers.insert(caps.name.clone(), systems);
             self.store(&workers);
         }
-        known
+        connect();
+    }
+
+    /// Decommission the worker `name`, unless it is unknown, or `connected`
+    /// says it is connected, which is asked under this set's lock.
+    pub(super) fn forget(
+        &self,
+        name: &str,
+        connected: impl FnOnce() -> bool,
+    ) -> Result<(), Forget> {
+        let mut workers = self.workers.lock().unwrap();
+        if !workers.contains_key(name) {
+            return Err(Forget::Unknown);
+        }
+        if connected() {
+            return Err(Forget::Connected);
+        }
+        workers.remove(name);
+        self.store(&workers);
+        Ok(())
     }
 
     fn store(&self, workers: &BTreeMap<String, Systems>) {
@@ -116,7 +140,9 @@ mod tests {
         assert!(known.serves("x86_64-linux", &["kvm".to_owned()]));
         assert!(!known.serves("x86_64-linux", &["big-parallel".to_owned()]));
         assert!(!known.serves("aarch64-linux", &[]));
-        assert!(known.forget("w") && !known.forget("w"), "forgotten once");
+        assert_eq!(known.forget("w", || true), Err(Forget::Connected));
+        assert_eq!(known.forget("w", || false), Ok(()));
+        assert_eq!(known.forget("w", || false), Err(Forget::Unknown));
         let known = Known::open(&path);
         assert!(!known.serves("x86_64-linux", &["kvm".to_owned()]));
     }
