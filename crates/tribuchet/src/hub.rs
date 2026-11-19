@@ -236,6 +236,7 @@ async fn route_loop(
         }
         if let worker_message::Msg::Heartbeat(h) = &m {
             state.hold(worker, h.resumable_keys.iter().cloned().collect(), true);
+            state.record_frozen(worker, h);
             let changed = h.max_jobs.is_some_and(|jobs| {
                 let mut caps = state.worker_caps.lock().unwrap();
                 caps.get_mut(&worker)
@@ -380,11 +381,19 @@ async fn worker_loop(
     ));
     let sess = Arc::new(WorkerSession::new(register.worker_name.clone()));
     let beat = tokio::spawn(beat(out_tx.clone()));
+    let mut listed = None;
 
     'outer: loop {
         let (job, resumed) = loop {
             if out_tx.is_closed() || route.is_finished() {
                 break 'outer;
+            }
+            // Once a listing, before it is handed a build of their key.
+            let beats = state.heartbeats(worker_id);
+            if listed.replace(beats) != Some(beats) {
+                for c in state.strays(worker_id).await {
+                    let _ = send(&out_tx, hub_message::Msg::Cancel(c)).await;
+                }
             }
             // resumed builds already occupy their slot on the worker
             if let Some(job) = state.take_job_by_key(worker_id).await {
@@ -466,6 +475,7 @@ async fn supervise_job(
     admission: Arc<Mutex<Admission>>,
 ) {
     let _running = state.metrics.running(&job.req.system);
+    state.ran(&worker.1, &job);
     let dispatch_listed = state.list_dispatch(&job, worker.0);
     let mut dispatch = Dispatch::default();
     let res = run_job(

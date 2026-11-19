@@ -239,6 +239,7 @@ fn beat(active: &HashMap<String, ActiveBuild>, ctx: &WorkerCtx) -> WorkerMessage
         load1: loadavg1(),
         resumable_keys: ctx.resumable_keys(),
         max_jobs: u32::try_from(room.capacity).ok(),
+        ..ctx.arbiter.frozen_by()
     }))
 }
 

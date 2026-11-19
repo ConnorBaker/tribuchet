@@ -5,7 +5,7 @@
 //! dispatch's log line and record row. A queued build goes to the worker that asks for it unless
 //! another with an idle agent would be less full with it (rank.rs).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use rusqlite::types::Value;
@@ -13,7 +13,7 @@ use rusqlite::types::Value;
 use super::Admission;
 use super::naming::drv_name;
 use super::record::{Recorder, Rest, Row, int, now_ms, result_row, val};
-use super::state::{HubState, Job};
+use super::state::{HubState, Job, Replay};
 use crate::proto::{BuildUsage, Register};
 
 #[path = "placement/history.rs"]
@@ -65,6 +65,13 @@ pub(super) struct Session {
     /// What the builds handed to it and not yet settled are expected to
     /// use, by build id.
     pub(super) committed: HashMap<String, Demand>,
+    /// The builds, by id, that placement left elsewhere or to the asker
+    /// only for the load of this session's clientless builds (Rooms's
+    /// wants) since the clientless decider last read them.
+    pub(super) wants: HashMap<String, Arc<Replay>>,
+    /// Its CPU arbiter's leader and the builds it keeps frozen, by key,
+    /// as its latest heartbeat said (hub/state/clientless.rs).
+    pub(super) frozen_by: Option<(String, Vec<String>)>,
 }
 
 impl Session {
@@ -85,11 +92,13 @@ pub(super) struct Placement {
 
 impl Placement {
     pub(super) fn open(&mut self, id: u64, admission: Arc<Mutex<Admission>>, size: Size) {
-        let committed = HashMap::new();
+        let (committed, wants) = (HashMap::new(), HashMap::new());
         let session = Session {
             admission,
             size,
             committed,
+            wants,
+            frozen_by: None,
         };
         self.sessions.insert(id, session);
     }
@@ -137,12 +146,18 @@ impl Placement {
         (self.sessions.iter()).map(|(id, s)| room(*id, s)).collect()
     }
 
-    /// Every session's room as session `asker` asks for work.
-    pub(super) fn rooms_for(&self, asker: u64) -> Rooms {
-        Rooms {
-            asker,
-            rooms: self.rooms(),
-        }
+    /// Every session's room as session `asker` asks for work, with what
+    /// its builds of `clientless`, those the clientless rule may give
+    /// up, hold of its load.
+    pub(super) fn rooms_for(&self, asker: u64, clientless: &HashSet<String>) -> Rooms {
+        let rooms = self.sessions.iter().map(|(id, s)| {
+            let theirs = s.committed.iter().filter(|(b, _)| clientless.contains(*b));
+            Room {
+                clientless: theirs.fold(Demand::default(), |sum, (_, d)| sum.plus(*d)),
+                ..room(*id, s)
+            }
+        });
+        Rooms::new(asker, rooms.collect())
     }
 }
 
@@ -152,6 +167,7 @@ fn room(id: u64, s: &Session) -> Room {
         idle: s.admission.lock().unwrap().idle(),
         size: s.size,
         load: s.load(),
+        clientless: Demand::default(),
     }
 }
 

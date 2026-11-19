@@ -226,12 +226,25 @@ fn every_scenario_freezes_and_thaws_as_the_table_says() {
                 now += SAMPLE_EVERY;
                 a.tick(now);
             }
-            let written = |key| fs::read_to_string(slice.join(key).join("cgroup.freeze")).unwrap();
+            let written =
+                |key: &str| fs::read_to_string(slice.join(key).join("cgroup.freeze")).unwrap();
             let got: Vec<_> = builds
                 .iter()
                 .map(|b| format!("{}={}", b.0, written(b.0)))
                 .collect();
             assert_eq!(got.join(" "), want, "scenario {row}, step {step}");
+            // The heartbeat names the builds it froze, and a leader of
+            // its builds, not frozen, while any is.
+            let beat = a.frozen_by();
+            let froze = |k: &&str| !bare.contains(k) && written(*k).ends_with('1');
+            let mut frozen: Vec<&str> = builds.iter().map(|b| b.0).filter(froze).collect();
+            let mut said = beat.frozen_keys.clone();
+            said.sort_unstable();
+            frozen.sort_unstable();
+            assert_eq!(said, frozen, "scenario {row}, step {step}");
+            let leader = beat.leader_key.filter(|l| !frozen.contains(&l.as_str()));
+            let ours = leader.is_some_and(|l| builds.iter().any(|b| b.0 == l));
+            assert_eq!(ours, !frozen.is_empty(), "scenario {row}, step {step}");
         }
     }
 }
