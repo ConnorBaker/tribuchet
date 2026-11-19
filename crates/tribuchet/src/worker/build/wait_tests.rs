@@ -14,7 +14,7 @@ use super::*;
 use crate::proto::{CancelBuild, WorkerMessage, worker_message};
 use crate::worker::hostname;
 use crate::worker::resume::ResumableBuild;
-use crate::worker::session::handle_cancel;
+use crate::worker::session::{Outbox, handle_cancel};
 
 type Woken = mpsc::UnboundedReceiver<Wake>;
 
@@ -188,8 +188,9 @@ fn every_wait_is_told_as_the_table_says() -> Result<()> {
                 build_id: old_id.clone(),
                 dedupe_key: "test-key".into(),
             };
-            let cancelled = handle_cancel(c, &mut HashMap::new(), &new_tx, &ctx).now_or_never();
-            assert!(matches!(cancelled, Some(Ok(()))));
+            let outbox = Outbox::default();
+            let cancelled = handle_cancel(c, &mut HashMap::new(), &outbox, &ctx).now_or_never();
+            assert!(cancelled.is_some());
             let end = Instant::now() + Duration::from_secs(5);
             while !running.is_finished() {
                 assert!(

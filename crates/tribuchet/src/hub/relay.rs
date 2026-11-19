@@ -180,7 +180,7 @@ pub(super) async fn run_job(
 /// Log/error-safe name of a worker message variant. The messages embed
 /// peer-controlled bytes (NAR chunks, log data); Debug-formatting them
 /// into error strings would balloon logs and replay buffers.
-pub(super) fn msg_name(msg: &worker_message::Msg) -> &'static str {
+pub(crate) fn msg_name(msg: &worker_message::Msg) -> &'static str {
     match msg {
         worker_message::Msg::Register(_) => "Register",
         worker_message::Msg::Heartbeat(_) => "Heartbeat",

@@ -21,7 +21,7 @@ use tonic::transport::server::TcpConnectInfo;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::proto::worker_hub_server::WorkerHub;
-use crate::tailscale;
+use crate::{chunkio, tailscale};
 
 use crate::proto::{
     CancelBuild, HubMessage, Register, RequestJob, WorkerMessage, attach_event, hub_message,
@@ -39,6 +39,8 @@ mod naming;
 mod placement;
 mod record;
 mod relay;
+#[cfg(test)]
+pub(crate) use relay::msg_name;
 mod serve;
 mod state;
 mod submit;
@@ -53,8 +55,9 @@ use relay::{WorkerSession, run_job, send};
 use state::{HubState, Job, WorkerCaps};
 
 /// No worker message for this long tears the session down and fails
-/// its builds: heartbeats flow every 30s, so silence means a dead
-/// worker that would otherwise pin its builds (and dedupe keys) forever.
+/// its builds: heartbeats flow every chunkio::HEARTBEAT, so silence
+/// means a dead worker that would otherwise pin its builds (and dedupe
+/// keys) forever.
 const WORKER_SILENCE_TIMEOUT: Duration = Duration::from_mins(3);
 
 /// In tailscale mode the hub asks tailscaled who the peer is on every
@@ -375,6 +378,7 @@ async fn worker_loop(
         worker_id,
     ));
     let sess = Arc::new(WorkerSession::new(register.worker_name.clone()));
+    let beat = tokio::spawn(beat(out_tx.clone()));
 
     'outer: loop {
         let (job, resumed) = loop {
@@ -428,12 +432,24 @@ async fn worker_loop(
     }
     // Builds in flight fail through their closed router channels.
     route.abort();
+    beat.abort();
     router.close_all();
     state.placement.lock().unwrap().close(worker_id);
     drop(caps_guard);
     state.hold_unservable().await;
     Metrics::inc(&state.metrics.disconnected);
     tracing::info!(worker = register.worker_name, "worker disconnected");
+}
+
+/// An empty message for the worker to read every chunkio::HEARTBEAT,
+/// so that its keepalive never PINGs a live hub. None while the queue
+/// is full: the worker has those to read.
+pub(crate) async fn beat(out_tx: mpsc::Sender<Result<HubMessage, Status>>) {
+    let mut tick = tokio::time::interval(chunkio::HEARTBEAT);
+    loop {
+        tick.tick().await;
+        drop(out_tx.try_send(Ok(HubMessage::default())));
+    }
 }
 
 /// Run one dispatched job and settle it: finish, requeue or fail.

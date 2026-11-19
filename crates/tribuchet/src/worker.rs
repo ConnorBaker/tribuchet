@@ -108,6 +108,8 @@ struct WorkerCtx {
     claims: build::Claims,
     /// Parallel daemon connections importing input NARs per build.
     import_jobs: usize,
+    /// The daemon socket negotiation connects to: None, the default one.
+    daemon_socket: Option<PathBuf>,
     chunks: Arc<ChunkStore>,
 }
 
@@ -424,6 +426,7 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         build_memory_max_bytes: opts.build_memory_max_bytes,
         agents: lease::Pool::new(opts.agent_sockets.clone(), opts.max_jobs.max(1) as usize),
         arbiter: arbiter::Arbiter::new(),
+        daemon_socket: None,
     });
 
     // Ready once local setup is done, not once the hub answers: the
@@ -510,6 +513,7 @@ mod tests {
                 cancelled: Mutex::new(HashSet::new()),
                 claims: build::Claims::default(),
                 import_jobs: 1,
+                daemon_socket: None,
                 chunks: Arc::new(chunks),
             }))
         }
