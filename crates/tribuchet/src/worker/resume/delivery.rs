@@ -11,13 +11,14 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
-use super::{BuildState, unrecord};
+use super::{BuildState, Ending};
 use crate::chunker::parse_hashes;
 use crate::chunkstore::Hash;
 use crate::errors::{Result, chain, err_msg};
 use crate::fsutil::io_ctx;
 use crate::proto::{BuildResult, BuildUsage, ChunkFrame, Manifest, WorkerMessage, worker_message};
 use crate::worker::build::ActiveBuild;
+use crate::worker::lease::Lease;
 use crate::worker::logtail::LogTail;
 use crate::worker::{WorkerCtx, msg, remove_build_dir};
 
@@ -43,11 +44,8 @@ fn expired(e: &ResumableBuild, ttl: Duration) -> Option<&PathBuf> {
     (idle && fin.finished_at.elapsed() > ttl).then_some(&fin.dir)
 }
 
-/// Drop the results `expired` names, with no file I/O under the registry
-/// lock. Each one's state.json goes before its key: the hub, told by the
-/// next heartbeat without the key, may run the build again under the same
-/// build id, which a worker adopting from that state would take for this
-/// result. A result a session starts to deliver meanwhile keeps its key.
+/// End the results `expired` names (Ending), off the registry lock; one a
+/// delivery starts to read meanwhile keeps its key, as does a stuck one.
 pub(super) fn reap(ctx: &WorkerCtx, ttl: Duration) {
     let candidates: Vec<(String, PathBuf)> = ctx
         .resumable
@@ -57,18 +55,11 @@ pub(super) fn reap(ctx: &WorkerCtx, ttl: Duration) {
         .filter_map(|(key, e)| Some((key.clone(), expired(e, ttl)?.clone())))
         .collect();
     for (key, dir) in candidates {
-        unrecord(&dir);
-        let mut map = ctx.resumable.lock().unwrap();
-        if map.get(&key).and_then(|e| expired(e, ttl)) != Some(&dir) {
-            continue;
-        }
-        map.remove(&key);
-        drop(map);
-        remove_build_dir(&dir);
         tracing::warn!(
             key,
             "dropping undelivered build result (no resume within TTL)"
         );
+        Ending(Some(key), dir, None, None).end(ctx, None);
     }
 }
 
@@ -88,6 +79,14 @@ pub(in crate::worker) struct ResumableBuild {
     /// A delivery is in flight; a concurrent re-assignment must not
     /// start a second one.
     pub(in crate::worker) delivering: bool,
+    /// The number of its latest adoption by an assignment, unique in the
+    /// worker (adopt_assignment); 0 for the one it was registered under.
+    pub(in crate::worker) adoption: u64,
+    /// The adoption its result was last delivered to.
+    pub(in crate::worker) delivered: Option<u64>,
+    /// Its latest adoption's session is not told it resumed yet (Resumed):
+    /// nothing is delivered to it until then (try_deliver).
+    pub(in crate::worker) resuming: bool,
     /// Build dir holding build.log, for log replay on resume.
     pub(in crate::worker) dir: PathBuf,
     /// Replays the log to the resumed session; joined before the
@@ -111,6 +110,16 @@ pub(in crate::worker) struct ResumableBuild {
 }
 
 impl ResumableBuild {
+    /// Make `e` `key`'s run; a finished result it displaces (one cancelled
+    /// after the assignment) ends off this thread, unless the worker stops.
+    pub(in crate::worker) fn launch(ctx: &Arc<WorkerCtx>, key: String, e: Self) {
+        let old = ctx.resumable.lock().unwrap().insert(key, e);
+        if let Some(old) = old.filter(|o| o.finished.is_some()) {
+            let ctx = ctx.clone();
+            tokio::task::spawn_blocking(move || Ending(None, old.dir, None, None).end(&ctx, None));
+        }
+    }
+
     /// Register a build no session has assigned yet.
     pub(in crate::worker) fn insert(
         ctx: &Arc<WorkerCtx>,
@@ -235,7 +244,7 @@ pub(in crate::worker) fn record_finished(ctx: &Arc<WorkerCtx>, key: &str, fin: F
     // Cancel handler only adds the flag while the entry is unfinished
     // (under the registry lock), so no new flag can appear afterwards.
     ctx.cancelled.lock().unwrap().remove(key);
-    try_deliver(ctx, key);
+    try_deliver(ctx, key, None);
 }
 
 /// Persist for redelivery by a replacement worker; the rename
@@ -263,10 +272,12 @@ pub(in crate::worker) fn persist_finished(key: &str, build_id: &str, fin: &Finis
 /// entry unfinished and the client waiting forever.
 pub(in crate::worker) fn execute_to_finished(
     build: &ActiveBuild,
+    lease: &mut Lease,
     out_tx: &mpsc::Sender<WorkerMessage>,
     timeout: Duration,
 ) -> FinishedBuild {
-    panic::catch_unwind(panic::AssertUnwindSafe(|| build.execute(out_tx, timeout)))
+    let run = || build.execute(lease, out_tx, timeout);
+    panic::catch_unwind(panic::AssertUnwindSafe(run))
         .unwrap_or_else(|_| Err(err_msg("build execution panicked")))
         .unwrap_or_else(|e| {
             let e = chain(&e);
@@ -391,57 +402,93 @@ pub(in crate::worker) fn serve_chunks(
 /// stable identity); the ack's build_id may predate a concurrent
 /// resume that rotated the entry's id.
 pub(in crate::worker) fn ack_delivery(ctx: &Arc<WorkerCtx>, key: &str, build_id: &str) {
+    let (ctx, key, build_id) = (ctx.clone(), key.to_owned(), build_id.to_owned());
+    tokio::task::spawn_blocking(move || acked(&ctx, &key, &build_id));
+}
+
+pub(super) fn acked(ctx: &WorkerCtx, key: &str, build_id: &str) {
     let removed = {
-        let mut map = ctx.resumable.lock().unwrap();
+        let map = ctx.resumable.lock().unwrap();
         match map.get(key) {
-            Some(e) if e.finished.is_some() => map.remove(key),
+            Some(e) if e.finished.is_some() => Some(e.dir.clone()),
             _ => None,
         }
     };
-    if let Some(e) = removed {
-        remove_build_dir(&e.dir);
+    if let Some(dir) = removed {
+        Ending(Some(key.into()), dir, None, None).end(ctx, None);
         tracing::info!(id = build_id, "build result acknowledged");
     }
 }
 
-/// Deliver `key`'s finished result if there is one and no other
-/// delivery is running, over the session that issued its latest
-/// assignment. The build is kept until the hub acknowledges the
-/// result; a failed or unacknowledged delivery is retried on the next
-/// assignment of the same key.
-pub(in crate::worker) fn try_deliver(ctx: &Arc<WorkerCtx>, key: &str) {
-    let (build_id, out_tx, fin, log_tail) = {
+/// What a claimed delivery takes: build id, session, result, log replay.
+type Claim = (
+    String,
+    mpsc::Sender<WorkerMessage>,
+    Arc<FinishedBuild>,
+    Option<LogTail>,
+);
+
+/// Claim the delivery of `e`'s result to its latest adoption, if its
+/// session was told it resumed and that adoption was delivered none.
+fn claim(e: &mut ResumableBuild) -> Option<Claim> {
+    let (Some(fin), Some(out_tx)) = (e.finished.clone(), e.out_tx.clone()) else {
+        return None;
+    };
+    if e.resuming || e.delivered == Some(e.adoption) {
+        return None;
+    }
+    e.delivering = true;
+    e.delivered = Some(e.adoption);
+    Some((e.build_id.clone(), out_tx, fin, e.log_tail.take()))
+}
+
+/// Deliver `key`'s finished result if there is one to its latest
+/// adoption, under its build id: once per adoption, never two at a time,
+/// and to a takeover only once its session was told it resumed, which
+/// `resumed`, that adoption's number, says. One taken meanwhile is
+/// delivered to as a running delivery ends. The build is kept until the
+/// hub acknowledges the result; a failed or unacknowledged delivery is
+/// retried on the next assignment of the same key, under its id or not.
+pub(in crate::worker) fn try_deliver(ctx: &Arc<WorkerCtx>, key: &str, resumed: Option<u64>) {
+    let mut next = {
         let mut map = ctx.resumable.lock().unwrap();
         let Some(e) = map.get_mut(key) else { return };
+        if resumed == Some(e.adoption) {
+            e.resuming = false;
+        }
         if e.delivering {
             return;
         }
-        let (Some(fin), Some(out_tx)) = (e.finished.clone(), e.out_tx.clone()) else {
-            return;
-        };
-        e.delivering = true;
-        (e.build_id.clone(), out_tx, fin, e.log_tail.take())
+        claim(e)
     };
-    // Flush any log replay first so the result arrives after the log.
-    if let Some(t) = log_tail {
-        t.stop();
-    }
-    let result = deliver(&fin, &build_id, &out_tx);
-    let mut map = ctx.resumable.lock().unwrap();
-    // The ack may already have removed the entry; nothing to update then.
-    if let Some(entry) = map.get_mut(key) {
-        entry.delivering = false;
-    }
-    match result {
-        Ok(()) => {
-            tracing::info!(id = build_id, "build result sent, awaiting chunk request");
+    while let Some((build_id, out_tx, fin, log_tail)) = next {
+        // Flush any log replay first so the result arrives after the log.
+        if let Some(t) = log_tail {
+            t.stop();
         }
-        Err(e) => {
-            tracing::warn!(
-                id = build_id,
-                "result delivery failed, keeping for resume: {}",
-                chain(&e)
-            );
+        match deliver(&fin, &build_id, &out_tx) {
+            Ok(()) => {
+                tracing::info!(id = build_id, "build result sent, awaiting chunk request");
+            }
+            Err(e) => {
+                tracing::warn!(
+                    id = build_id,
+                    "result delivery failed, keeping for resume: {}",
+                    chain(&e)
+                );
+            }
         }
+        // Released or claimed anew in one step, so no other delivery
+        // starts between. The ack may already have removed the entry, or a
+        // new run of the key replaced it; nothing to update then.
+        let mut map = ctx.resumable.lock().unwrap();
+        let ours = map
+            .get_mut(key)
+            .filter(|e| (e.finished.as_ref()).is_some_and(|f| Arc::ptr_eq(f, &fin)));
+        next = ours.and_then(|e| {
+            let next = claim(e);
+            e.delivering = next.is_some();
+            next
+        });
     }
 }

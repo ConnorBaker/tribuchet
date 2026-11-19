@@ -212,11 +212,17 @@ Worker redeploys are plain unit restarts: builds run under the
 per-uid agent services, which hold the log and exit status until a
 worker collects them, and resume state is persisted in the build
 dir of each run (`builds/<id>.<ns>`, one per run of a build, which no
-other run removes). The replacement worker re-adopts running builds
+other run removes but the launch that displaces its result). The replacement worker re-adopts running builds
 from their agents, supervises them to completion and redelivers finished
-results. A worker runs min(`max-jobs`, reachable agents) builds; a
-running build whose agent does not answer keeps its key, its slot and
-its agent until the agent answers, and its clients are told it waits.
+results. A build leases a slot and its agent together, only while fewer
+than min(`max-jobs`, reachable agents) leases are held; a build that runs
+already when it starts (adopted, held, an orphan's cleanup) leases its
+own agent past that, until it ends, and takes a slot
+from the pool even when that agent is outside it. A running build whose
+agent does not answer keeps its key and its lease until the agent
+answers, and its clients are told it waits. A build whose agent did not
+answer its start keeps a lease with no agent (its agent set down), its
+clients told, until another agent is free or the build is cancelled.
 An agent answers Adopt and Status at once whatever Kill or Finish it runs
 (each on a thread of its own; Kill, Finish and Cleanup take turns, so no
 kill sweep kills another's helper), and once a Start has registered its
