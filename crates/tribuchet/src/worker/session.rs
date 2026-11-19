@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fs;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -11,7 +12,7 @@ use tokio_stream::wrappers::ReceiverStream;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
 use super::build::{ActiveBuild, StagingStatus, Wake, validate_assignment};
-use super::caps::system_caps;
+use super::caps::{build_memory, cores, own_cgroup, system_caps};
 use super::resume::{
     CANCELLED, ResumableBuild, ack_delivery, execute_to_finished, record_finished, serve_chunks,
     try_deliver,
@@ -67,6 +68,12 @@ pub(super) async fn session(opts: &WorkerConfig, ctx: &Arc<WorkerCtx>) -> Result
             caps: system_caps(opts, ctx),
             resumable_keys: ctx.resumable_keys(),
             max_jobs: u32::try_from(ctx.jobs()).unwrap_or(u32::MAX),
+            cores: cores(),
+            build_memory: build_memory(
+                Path::new("/sys/fs/cgroup"),
+                Path::new("/proc/meminfo"),
+                &own_cgroup(),
+            ),
         })))
         .await?;
 
@@ -197,11 +204,12 @@ async fn declare_capacity(
 ) -> Result<()> {
     let lookahead =
         env.ctx.jobs() > 0 && ready.is_empty() && active.values().all(|b| b.slot.is_some());
-    let capacity = env.ctx.free_slots() + usize::from(lookahead);
+    let free = env.ctx.free_slots();
     env.out_tx
         .send(msg(worker_message::Msg::RequestJob(RequestJob {
-            capacity: u32::try_from(capacity).unwrap_or(u32::MAX),
+            capacity: u32::try_from(free + usize::from(lookahead)).unwrap_or(u32::MAX),
             assignments: Some(env.assignments.load(Ordering::Relaxed)),
+            free_slots: u32::try_from(free).ok(),
         })))
         .await?;
     Ok(())
@@ -547,7 +555,30 @@ mod tests {
         let Some(worker_message::Msg::RequestJob(r)) = out_rx.recv().await.unwrap().msg else {
             panic!("expected RequestJob");
         };
-        assert_eq!(r.capacity, 0);
+        assert_eq!((r.capacity, r.free_slots), (0, Some(0)));
+        Ok(())
+    }
+
+    /// A declaration tells the hub which of its capacity are free slots,
+    /// apart from the one build staged ahead while every slot is busy.
+    #[tokio::test]
+    async fn a_declaration_tells_free_slots_from_the_lookahead() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let agents = ["1.sock", "2.sock"].map(|s| dir.path().join(s)).to_vec();
+        let ctx = WorkerCtx::for_test(dir.path(), 4, agents)?;
+        *ctx.held.lock().unwrap() = 1;
+        let (out_tx, mut out_rx) = mpsc::channel(1);
+        let env = LaunchEnv {
+            ctx: &ctx,
+            out_tx: &out_tx,
+            build_timeout: Duration::ZERO,
+            assignments: AtomicU64::default(),
+        };
+        declare_capacity(&HashMap::new(), &VecDeque::new(), &env).await?;
+        let Some(worker_message::Msg::RequestJob(r)) = out_rx.recv().await.unwrap().msg else {
+            panic!("expected RequestJob");
+        };
+        assert_eq!((r.capacity, r.free_slots), (2, Some(1)));
         Ok(())
     }
 }

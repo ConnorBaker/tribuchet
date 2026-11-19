@@ -26,6 +26,7 @@ mod clientless_chain;
 mod clientless_farm;
 mod daemon;
 pub(super) mod fake_daemon;
+mod rank;
 mod reconnect;
 mod unlisted;
 mod usage;
@@ -192,6 +193,8 @@ pub(super) fn job(n: usize, replay: Arc<Replay>) -> Job {
         resumed_losses: 0,
         queued_at: Instant::now(),
         loss: None,
+        deferred: None,
+        expected: placement::Expected::prior(false),
     }
 }
 
@@ -237,11 +240,11 @@ async fn restarted_worker_gets_its_build_back() {
     let _client = replay.subscribe().await;
     lose_session(&state, job(1, replay), register(&state, "w1", &[]), None).await;
     assert!(
-        state.take_job(&caps("w2")).await.is_none(),
+        state.take_job(&caps("w2"), None).await.is_none(),
         "build handed to another worker while its own reconnects"
     );
     let back = register(&state, "w1", &["k1"]);
-    assert!(state.take_job(&caps("w2")).await.is_none());
+    assert!(state.take_job(&caps("w2"), None).await.is_none());
     // Not counted: the dispatch to the worker that lost it settles it.
     let resumed = state.take_job_by_key(back.id).await;
     assert_eq!(
@@ -257,9 +260,9 @@ async fn build_goes_elsewhere_once_the_grace_ends() {
     let replay = Arc::new(Replay::default());
     let _client = replay.subscribe().await;
     lose_session(&state, job(1, replay), register(&state, "w1", &[]), None).await;
-    assert!(state.take_job(&caps("w2")).await.is_none());
+    assert!(state.take_job(&caps("w2"), None).await.is_none());
     tokio::time::sleep(Duration::from_millis(1100)).await;
-    assert!(state.take_job(&caps("w2")).await.is_some());
+    assert!(state.take_job(&caps("w2"), None).await.is_some());
 }
 
 /// The worker came back without the build (it was still staging):
@@ -272,7 +275,7 @@ async fn build_is_released_when_its_worker_returns_without_it() {
     let _client = replay.subscribe().await;
     lose_session(&state, job(1, replay), register(&state, "w1", &[]), None).await;
     let _back = register(&state, "w1", &[]);
-    assert!(state.take_job(&caps("w2")).await.is_some());
+    assert!(state.take_job(&caps("w2"), None).await.is_some());
 }
 
 /// No worker returns and none other serves the system: the build is
@@ -308,7 +311,7 @@ async fn client_waits_when_no_worker_returns() {
     assert!(waited >= 1200, "told after {waited} ms");
     let _back = register(&state, "w2", &[]);
     assert!(
-        state.take_job(&caps("w2")).await.is_some(),
+        state.take_job(&caps("w2"), None).await.is_some(),
         "the held build was not handed out"
     );
 }
@@ -327,6 +330,7 @@ fn request_job(capacity: u32, assignments: Option<u64>) -> WorkerMessage {
         msg: Some(worker_message::Msg::RequestJob(RequestJob {
             capacity,
             assignments,
+            free_slots: None,
         })),
     }
 }
@@ -348,6 +352,7 @@ pub(super) fn connect(state: &Arc<HubState>, name: &str, slots: u32, held: &[&st
         }],
         resumable_keys: held.iter().map(|k| (*k).to_owned()).collect(),
         max_jobs: slots,
+        ..Register::default()
     };
     let (out_tx, from_hub) = mpsc::channel(256);
     let (to_hub, in_rx) = mpsc::channel(64);
@@ -462,6 +467,7 @@ fn a_declaration_leaves_free_what_the_worker_has_not_been_sent() {
         a.declare(&RequestJob {
             capacity,
             assignments,
+            free_slots: None,
         });
         assert_eq!(
             a.free, free,
@@ -581,8 +587,8 @@ async fn a_worker_advertising_recursive_nix_gets_no_build_requiring_it() {
             system: "x86_64-linux".into(),
             features: features.to_vec(),
         }],
-        resumable_keys: vec![],
         max_jobs: 2,
+        ..Register::default()
     };
     let (out_tx, mut from_hub) = mpsc::channel(256);
     let (to_hub, in_rx) = mpsc::channel(64);

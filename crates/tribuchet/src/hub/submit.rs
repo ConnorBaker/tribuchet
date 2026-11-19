@@ -12,6 +12,7 @@ use tonic::{Request, Response, Status, Streaming};
 
 use super::metrics::Metrics;
 use super::naming::drv_name;
+use super::placement::Expected;
 use super::state::{HubState, Inflight, Job, Replay, Servability, unserved};
 use crate::proto::{
     AttachEvent, BuildMessage, BuildRequest, DECLINE_EXIT_CODE, NETWORK, attach_event,
@@ -249,7 +250,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 continue;
             };
             let rx = replay.subscribe().await;
-            let job = Job {
+            let mut job = Job {
                 id,
                 key,
                 req,
@@ -261,7 +262,10 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 resumed_losses: 0,
                 queued_at: Instant::now(),
                 loss: None,
+                deferred: None,
+                expected: Expected::prior(false),
             };
+            job.expected = self.state.placement.lock().unwrap().expect(&job);
             tracing::info!(
                 id = job.id,
                 system = job.req.system,
@@ -450,7 +454,7 @@ mod tests {
         let _events = submit(&state, fod).await;
         let without = state.worker_caps.lock().unwrap()[&1].clone();
         assert!(
-            state.take_job(&without).await.is_none(),
+            state.take_job(&without, None).await.is_none(),
             "handed to a worker without network"
         );
         let with = WorkerCaps {
@@ -458,7 +462,7 @@ mod tests {
             ..without
         };
         assert!(
-            state.take_job(&with).await.is_some(),
+            state.take_job(&with, None).await.is_some(),
             "not handed to one with"
         );
     }

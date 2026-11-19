@@ -24,6 +24,7 @@ mod worker;
 #[cfg(target_os = "linux")]
 use std::env;
 use std::fs;
+use std::io::{self, IsTerminal};
 use std::num::NonZero;
 use std::os::unix::fs::symlink;
 use std::path::PathBuf;
@@ -133,7 +134,10 @@ fn run() -> Result<(), Error> {
     if env::args().nth(1).as_deref() == Some(worker::USERNS_HOLD_ARG) {
         worker::userns_hold_stage();
     }
+    // Colour only on a terminal: the hub's journal is read back by
+    // anyone grepping it.
     tracing_subscriber::fmt()
+        .with_ansi(io::stdout().is_terminal())
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()),
         )
@@ -206,4 +210,12 @@ fn agent_generator(
         }
     }
     Ok(())
+}
+
+/// The doc comment above Cli is the description --help prints.
+#[test]
+fn help_describes_the_program() {
+    let cli = <Cli as clap::CommandFactory>::command();
+    let about = cli.get_about().map(ToString::to_string);
+    assert!(about.is_some_and(|a| a.starts_with("RBE-style")));
 }

@@ -17,7 +17,7 @@ use super::Loss;
 use super::chunkcache::ChunkCache;
 use super::losses;
 use super::metrics::Metrics;
-use super::placement::Placement;
+use super::placement::{Expected, Placement};
 use super::relay::{DAEMON_ANSWER, DaemonEvidence};
 use crate::config::NixConfig;
 use crate::fsutil::io_ctx;
@@ -78,6 +78,13 @@ pub(super) struct Job {
     /// it as a loss on a resume. Until the loss's grace ends, or the
     /// worker is back, the build is kept for that worker (Loss::awaited).
     pub(super) loss: Option<Loss>,
+    /// When it was first passed over for another worker (placement::
+    /// Rooms): none since it last entered the queue.
+    pub(super) deferred: Option<Instant>,
+    /// What it is expected to use, from the history as it was submitted:
+    /// take_job's scan reads it under the queue lock, where it takes no
+    /// placement lock.
+    pub(super) expected: Expected,
 }
 
 impl Job {
@@ -204,14 +211,21 @@ fn render_nix_config(caps: &HashMap<u64, WorkerCaps>, cfg: &NixConfig) -> String
     out
 }
 
+/// Write `content` to `path` through a temporary file, `path` and ".tmp",
+/// made anew (one left there is removed: a symlink is never followed),
+/// renamed into place, and removed where the write failed. A path's
+/// writers are serialised by write_newest.
 pub(super) fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    {
-        let mut f = fs::File::create(&tmp).map_err(io_ctx("creating", &tmp))?;
-        f.write_all(content.as_bytes())?;
-        f.sync_all()?;
+    let tmp = path.with_added_extension("tmp");
+    let _ = fs::remove_file(&tmp);
+    let written = fs::File::create_new(&tmp)
+        .map_err(io_ctx("creating", &tmp))
+        .and_then(|mut f| f.write_all(content.as_bytes()).and_then(|()| f.sync_all()))
+        .and_then(|()| fs::rename(&tmp, path).map_err(io_ctx("renaming into", path)));
+    if written.is_err() {
+        let _ = fs::remove_file(&tmp);
     }
-    fs::rename(&tmp, path).map_err(io_ctx("renaming into", path))
+    written
 }
 
 impl WorkerCaps {
@@ -282,14 +296,23 @@ impl HubState {
             (generation, render_nix_config(&caps, cfg))
         };
         let (written, path) = (self.nix_written.clone(), cfg.path.clone());
-        tokio::task::spawn_blocking(move || write_newest(&written, generation, &path, &content));
+        tokio::task::spawn_blocking(move || {
+            write_newest(&written, generation, &path, &content, "nix.conf fragment");
+        });
     }
 }
 
 /// Write `content`, rendering number `generation`, to `path` unless a
 /// newer rendering was written: whatever order the writes run in, the
-/// newest rendering is the one left, never stale content.
-fn write_newest(written: &StdMutex<u64>, generation: u64, path: &Path, content: &str) {
+/// newest rendering is the one left, never stale content. `what` names
+/// the file in a warning.
+pub(super) fn write_newest(
+    written: &StdMutex<u64>,
+    generation: u64,
+    path: &Path,
+    content: &str,
+    what: &str,
+) {
     let mut newest = written.lock().unwrap();
     if *newest > generation {
         return;
@@ -302,11 +325,7 @@ fn write_newest(written: &StdMutex<u64>, generation: u64, path: &Path, content: 
         return;
     }
     if let Err(e) = write_atomic(path, content) {
-        tracing::warn!(
-            error = %e,
-            path = %path.display(),
-            "failed to write nix.conf fragment"
-        );
+        tracing::warn!(error = %e, path = %path.display(), "failed to write the {what}");
     }
 }
 
@@ -386,21 +405,50 @@ impl HubState {
             .max()
     }
 
-    /// The first queued job `caps`'s worker can take.
-    pub(super) async fn take_job(&self, caps: &WorkerCaps) -> Option<Job> {
+    /// The first queued job `caps`'s worker can take, as worker session
+    /// `asker`, if any: a build it passes over to a less full worker
+    /// (placement::Rooms) stays queued, the session it is left to woken.
+    pub(super) async fn take_job(&self, caps: &WorkerCaps, asker: Option<u64>) -> Option<Job> {
         loop {
-            let mut job = {
+            // Read before the queue lock, so that nothing more is taken
+            // under it; afresh on a rescan, which passes over again.
+            let mut rooms = asker.map(|id| self.placement.lock().unwrap().rooms_for(id));
+            let (taken, left) = {
                 let mut queue = self.queue.lock().await;
                 let holding = self.holding.lock().unwrap();
                 // A held key goes to its holder by take_job_by_key, this
                 // worker included: a fresh take would count the loss its
                 // Resumed is about to clear.
                 let workers = self.worker_caps.lock().unwrap();
-                let pos = queue.iter().position(|j| {
-                    caps.serves(&j.req.system, &j.features) && !j.kept(&workers, &holding)
+                let (now, mut left) = (Instant::now(), Vec::new());
+                let pos = queue.iter_mut().position(|j| {
+                    if !caps.serves(&j.req.system, &j.features) || j.kept(&workers, &holding) {
+                        return false;
+                    }
+                    let (system, features, first) =
+                        (&j.req.system, &j.features, j.deferred.is_none());
+                    let serves = |id| workers.get(&id).is_some_and(|c| c.serves(system, features));
+                    let demand = j.expected.demand;
+                    let to = (rooms.as_mut())
+                        .and_then(|r| r.passes(demand, &mut j.deferred, serves, now));
+                    if let Some(to) = to.filter(|_| first) {
+                        left.push((j.id.clone(), workers.get(&to).map(|c| c.name.clone())));
+                    }
+                    to.is_none()
                 });
-                queue.remove(pos?)?
+                (pos.and_then(|p| queue.remove(p)), left)
             };
+            for (id, to) in &left {
+                tracing::info!(
+                    id,
+                    to,
+                    "leaving a build to a less full worker with an idle agent"
+                );
+            }
+            if !left.is_empty() {
+                self.notify.notify_waiters();
+            }
+            let mut job = taken?;
             // Abandoned while queued (every attach client gone): drop it
             // here, at the moment it would have occupied a build slot.
             if !job.replay.has_subscribers().await {
@@ -455,7 +503,7 @@ impl HubState {
     /// (the next attempt re-streams them from the start), and leaving
     /// their chunks to the cache while it waits, held or not.
     pub(super) async fn requeue(self: &Arc<Self>, mut job: Job) {
-        job.queued_at = Instant::now();
+        (job.queued_at, job.deferred) = (Instant::now(), None);
         for path in job.req.outputs.values() {
             job.replay
                 .publish(attach_event::Event::OutputRestart(path.clone()))

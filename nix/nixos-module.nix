@@ -295,6 +295,11 @@ in
       environment.etc."tribuchet/hub.toml".source = hubToml;
       systemd.services.tribuchet-hub = {
         wantedBy = [ "multi-user.target" ];
+        # Stopped before its socket, which then listens while the hub
+        # commits the last of its build record. Requires= makes it;
+        # After= is systemd's own for a socket's service, written out.
+        requires = [ "tribuchet-hub.socket" ];
+        after = [ "tribuchet-hub.socket" ];
         restartTriggers = [ hubToml ];
         serviceConfig = {
           Type = "notify";
@@ -305,9 +310,12 @@ in
           RuntimeDirectoryPreserve = true;
           # staging chunk cache
           CacheDirectory = "tribuchet";
+          # the build record (state, not cache: the only copy)
+          StateDirectory = "tribuchet";
           Environment = [
             "RUST_LOG=info"
             "XDG_CACHE_HOME=/var/cache"
+            "XDG_STATE_HOME=/var/lib"
           ];
           WatchdogSec = "30";
           Restart = "on-failure";

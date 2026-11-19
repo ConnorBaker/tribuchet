@@ -35,6 +35,7 @@ mod losses;
 mod metrics;
 mod naming;
 mod placement;
+mod record;
 mod relay;
 mod serve;
 mod state;
@@ -143,6 +144,9 @@ struct Admission {
     /// The last declaration as received, for the dispatch log.
     capacity: u32,
     assignments: Option<u64>,
+    /// Of the declaration, what the worker stages beyond its free slots:
+    /// all of it from a worker predating `free_slots`.
+    lookahead: u32,
 }
 
 impl Admission {
@@ -158,6 +162,13 @@ impl Admission {
         self.free = r
             .capacity
             .saturating_sub(u32::try_from(unseen).unwrap_or(u32::MAX));
+        self.lookahead = r.capacity.saturating_sub(r.free_slots.unwrap_or(0));
+    }
+
+    /// Idle agents left: an assignment takes a free slot before the
+    /// lookahead.
+    fn idle(&self) -> u32 {
+        self.free.saturating_sub(self.lookahead)
     }
 }
 
@@ -291,6 +302,8 @@ impl WorkerHub for WorkerSvc {
         tracing::info!(
             worker = register.worker_name,
             caps = ?register.caps,
+            cores = register.cores,
+            build_memory = register.build_memory,
             "worker registered"
         );
 
@@ -336,11 +349,11 @@ async fn worker_loop(
         false,
     );
     let admission = Arc::new(Mutex::new(Admission::default()));
-    state
-        .placement
-        .lock()
-        .unwrap()
-        .open(worker_id, admission.clone());
+    state.placement.lock().unwrap().open(
+        worker_id,
+        admission.clone(),
+        placement::size_of(&register),
+    );
     let mut route = tokio::spawn(route_loop(
         in_rx,
         router.clone(),
@@ -362,7 +375,7 @@ async fn worker_loop(
             }
             let free = admission.lock().unwrap().free;
             if free > 0
-                && let Some(job) = state.take_job(&caps).await
+                && let Some(job) = state.take_job(&caps, Some(worker_id)).await
             {
                 let mut a = admission.lock().unwrap();
                 a.free = a.free.saturating_sub(1);
@@ -377,7 +390,8 @@ async fn worker_loop(
                 _ = &mut route => break 'outer,
             }
         };
-        placement::dispatch(&register.worker_name, &job, resumed, &admission);
+        let to = (worker_id, register.worker_name.as_str());
+        placement::dispatch(&state, to, &job, resumed, &admission);
         // Tell the attach client where its build runs.
         job.replay
             .publish(attach_event::Event::Dispatched(
@@ -460,6 +474,7 @@ async fn supervise_job(
     drop(dispatch_listed);
     let dispatched = dispatch.sent;
     router.unregister(&job.id);
+    state.placement.lock().unwrap().settled(worker.0, &job.id);
     if !dispatched {
         // The worker will never count an assignment that was not sent.
         let mut a = admission.lock().unwrap();
