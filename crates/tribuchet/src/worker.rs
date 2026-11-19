@@ -77,9 +77,9 @@ struct WorkerCtx {
     resumable: Mutex<HashMap<String, ResumableBuild>>,
     /// system -> static emulator binary, from the emulate setting.
     emulators: HashMap<String, PathBuf>,
-    /// Fixed-output builds get a private netns with the presto-pasta
-    /// user-mode NAT (Linux workers with /dev/net/tun).
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    /// A build with network can get a network of its own, a private
+    /// netns with the presto-pasta user-mode NAT: a Linux worker with
+    /// /dev/net/tun. Without it such a build is refused.
     fod_isolation: bool,
     /// Flow policy for that network, from the fod-network setting.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
