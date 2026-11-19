@@ -222,13 +222,26 @@ pub fn wait_until_succeeds(node: Node, cmd: &str, secs: u64) {
     }
 }
 
-/// `journalctl ... | grep -c pattern`, tolerating no matches. `grep -c` drains
+/// A unit's journal as plain lines, for a shell pipeline: `-a`, since
+/// journalctl may show a long line with colour escapes as "[blob data]", and
+/// the escapes dropped, so that a pattern can span a field.
+pub fn journal(unit: &str) -> String {
+    format!("journalctl -a -u {unit} | sed 's/\\x1b\\[[0-9;]*m//g'")
+}
+
+/// A shell test that `unit`'s journal has more than `n` lines matching
+/// `pattern`.
+pub fn more_than(unit: &str, pattern: &str, n: i64) -> String {
+    format!("[ $({} | grep -c '{pattern}') -gt {n} ]", journal(unit))
+}
+
+/// `journal(unit) | grep -c pattern`, tolerating no matches. `grep -c` drains
 /// the whole stream, so journalctl never gets SIGPIPE (unlike `grep -q`, which
 /// closes the pipe early and would trip `set -o pipefail`).
 pub fn count(node: Node, unit: &str, pattern: &str) -> i64 {
     succeed(
         node,
-        &format!("journalctl -u {unit} | grep -c '{pattern}' || true"),
+        &format!("{} | grep -c '{pattern}' || true", journal(unit)),
     )
     .trim()
     .parse()

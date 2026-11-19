@@ -3,6 +3,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::fs;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use tokio::sync::mpsc;
@@ -105,6 +106,7 @@ async fn session_loop(
         ctx,
         out_tx,
         build_timeout,
+        assignments: AtomicU64::default(),
     };
     // Builds staged to completion but waiting for a free slot.
     let mut ready: VecDeque<String> = VecDeque::new();
@@ -144,6 +146,7 @@ async fn session_loop(
         let Some(m) = m.msg else { continue };
         match m {
             hub_message::Msg::Assignment(a) => {
+                env.assignments.fetch_add(1, Ordering::Relaxed);
                 if let Some(id) = handle_assignment(a, active, &wake_tx, out_tx, ctx).await? {
                     let res = active.get_mut(&id).unwrap().negotiate().await;
                     advance_staging(active, &mut ready, &id, res, &env).await?;
@@ -197,6 +200,7 @@ async fn declare_capacity(
     env.out_tx
         .send(msg(worker_message::Msg::RequestJob(RequestJob {
             capacity: u32::try_from(capacity).unwrap_or(u32::MAX),
+            assignments: Some(env.assignments.load(Ordering::Relaxed)),
         })))
         .await?;
     Ok(())
@@ -275,6 +279,8 @@ struct LaunchEnv<'a> {
     ctx: &'a Arc<WorkerCtx>,
     out_tx: &'a mpsc::Sender<WorkerMessage>,
     build_timeout: Duration,
+    /// Assignments received this session, declared with the capacity.
+    assignments: AtomicU64,
 }
 
 /// Hand freed slots to staged builds waiting for one.

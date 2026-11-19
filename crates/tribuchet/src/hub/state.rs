@@ -13,20 +13,29 @@ use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, mpsc};
 use tonic::Status;
 
+use super::Loss;
 use super::chunkcache::ChunkCache;
+use super::losses;
 use super::metrics::Metrics;
+use super::placement::Placement;
+use super::relay::{DAEMON_ANSWER, DaemonEvidence};
 use crate::config::NixConfig;
 use crate::fsutil::io_ctx;
 
 use crate::proto::{AttachEvent, BuildRequest, attach_event};
 
+#[path = "state/clientless.rs"]
+mod clientless;
 #[path = "state/inflight.rs"]
 mod inflight;
 #[path = "state/replay.rs"]
 mod replay;
 
+pub(super) use clientless::Dispatched;
+#[cfg(test)]
+pub(super) use clientless::FLOOR;
 pub(super) use inflight::{Inflight, Listing};
-pub(super) use replay::Replay;
+pub(super) use replay::{KeptOutputs, Replay, Wait};
 
 type EventTx = mpsc::Sender<Result<AttachEvent, Status>>;
 
@@ -34,9 +43,10 @@ type EventTx = mpsc::Sender<Result<AttachEvent, Status>>;
 /// streams chunks forever grows root-hub memory without bound.
 const MAX_REPLAY_BYTES: usize = 256 * 1024 * 1024;
 
-/// Per-subscriber channel headroom beyond the buffered backlog. A
-/// stalled attach client is dropped once it falls this far behind
-/// instead of buffering the whole build a second time.
+/// Per-subscriber channel headroom beyond the buffered backlog. An
+/// attach client that falls this far behind gets no live events until
+/// it has room again, or catches up once its build ends (replay.rs),
+/// instead of the hub buffering the whole build a second time for it.
 const SUB_CHANNEL_SLACK: usize = 1024;
 
 pub(super) struct Job {
@@ -49,19 +59,37 @@ pub(super) struct Job {
     /// requiredSystemFeatures; only workers advertising them get the job.
     pub(super) features: Vec<String>,
     pub(super) replay: Arc<Replay>,
-    /// Dedupe registration, dropped on cancel or with the job.
-    pub(super) listing: StdMutex<Option<Listing>>,
-    /// Times the job went back to the queue after its worker session
-    /// died; capped so a crash-looping build cannot bounce forever.
+    /// Dedupe registration, dropped on cancel, when given up, or with
+    /// the job.
+    pub(super) listing: Arc<StdMutex<Option<Listing>>>,
+    /// Genuine losses (hub/losses.rs): capped so a crash-looping
+    /// build cannot bounce forever.
     pub(super) attempts: u32,
+    /// Losses on a resume (hub/losses.rs): capped so a worker that
+    /// loses every resume cannot keep the build forever.
+    pub(super) resumed_losses: u32,
     /// When the job last entered the queue, for the queue-wait histogram.
     pub(super) queued_at: Instant,
+    /// The loss of the build with its worker's session, which the next
+    /// dispatch settles: a resume by that worker clears it; a
+    /// start-over, or an assignment the hub could not hand over, counts
+    /// it as genuine; that worker's session dying before either counts
+    /// it as a loss on a resume. Until the loss's grace ends, or the
+    /// worker is back, the build is kept for that worker (Loss::awaited).
+    pub(super) loss: Option<Loss>,
 }
 
 impl Job {
     /// Stop deduping new submissions onto this job.
     pub(super) fn unlist(&self) {
         drop(self.listing.lock().unwrap().take());
+    }
+
+    /// Whether no fresh take may have it: a worker's key holds it, or its
+    /// loss keeps it for a worker still awaited.
+    fn kept(&self, workers: &HashMap<u64, WorkerCaps>, holding: &HashMap<u64, Holding>) -> bool {
+        holding.values().any(|h| h.holds(&self.key))
+            || (self.loss.as_ref()).is_some_and(|r| r.awaited(workers, holding))
     }
 }
 
@@ -71,6 +99,8 @@ pub(super) enum Servability {
     Never,
 }
 
+const DAEMON_SOCKET: &str = "/nix/var/nix/daemon-socket/socket";
+
 pub(super) struct HubState {
     pub(super) queue: Mutex<VecDeque<Job>>,
     pub(super) inflight: Arc<StdMutex<Inflight>>,
@@ -79,6 +109,13 @@ pub(super) struct HubState {
     /// queries); jobs are frequent enough that per-job handshakes
     /// would add up.
     pub(super) daemon_pool: harmonia_store_remote::ConnectionPool,
+    /// What the hub reads of the daemon to tell whether waiting clears
+    /// what it does (its journal).
+    pub(super) daemon_evidence: DaemonEvidence,
+    /// Build id -> its dispatch, while supervised (clientless.rs).
+    pub(super) dispatched: StdMutex<HashMap<String, Dispatched>>,
+    /// The clientless decider runs, from the first dispatch on.
+    deciding: atomic::AtomicBool,
     /// Connected workers' capabilities, keyed by a per-connection id;
     /// submissions no worker can serve fail fast instead of queueing
     /// forever.
@@ -92,8 +129,8 @@ pub(super) struct HubState {
     /// still worth waiting for after a restart or a worker drop.
     pub(super) started_at: Instant,
     pub(super) departed: StdMutex<Vec<(WorkerCaps, Instant)>>,
-    /// worker id -> dedupe keys it can resume
-    pub(super) held: StdMutex<HashMap<u64, HashSet<String>>>,
+    /// worker id -> the builds it holds from before (Holding).
+    pub(super) holding: StdMutex<HashMap<u64, Holding>>,
     /// Woken when worker capabilities change so waiting submissions
     /// re-check servability without polling.
     pub(super) caps_changed: Notify,
@@ -107,6 +144,26 @@ pub(super) struct HubState {
     nix_rendered: atomic::AtomicU64,
     nix_written: Arc<StdMutex<u64>>,
     pub(super) chunks: Arc<ChunkCache>,
+    /// Each worker session's admission (placement.rs).
+    pub(super) placement: StdMutex<Placement>,
+}
+
+/// The builds a worker session holds from before, by dedupe key: the
+/// keys it listed last (Register's, then each Heartbeat's
+/// resumable_keys), after `beats` heartbeats, less those a dispatch took
+/// since: each is honoured once. A key a later heartbeat leaves out is
+/// no longer held, which `unlisted` tells a resumed build.
+#[derive(Default)]
+pub(super) struct Holding {
+    beats: u64,
+    keys: HashSet<String>,
+    taken: HashSet<String>,
+}
+
+impl Holding {
+    pub(super) fn holds(&self, key: &str) -> bool {
+        self.keys.contains(key) && !self.taken.contains(key)
+    }
 }
 
 #[derive(Clone)]
@@ -146,7 +203,7 @@ fn render_nix_config(caps: &HashMap<u64, WorkerCaps>, cfg: &NixConfig) -> String
     out
 }
 
-fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
+pub(super) fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
     {
         let mut f = fs::File::create(&tmp).map_err(io_ctx("creating", &tmp))?;
@@ -175,25 +232,29 @@ impl HubState {
             inflight: Arc::default(),
             notify: Notify::default(),
             daemon_pool: harmonia_store_remote::ConnectionPool::new(
-                "/nix/var/nix/daemon-socket/socket",
+                DAEMON_SOCKET,
                 // A loaded nix-daemon can exceed the 10s default.
                 harmonia_store_remote::PoolConfig {
-                    connection_timeout: Duration::from_mins(1),
+                    connection_timeout: DAEMON_ANSWER,
                     ..Default::default()
                 },
             ),
+            daemon_evidence: DaemonEvidence::default(),
+            dispatched: StdMutex::default(),
+            deciding: atomic::AtomicBool::default(),
             worker_caps: StdMutex::default(),
             next_worker_id: atomic::AtomicU64::default(),
             worker_grace,
             started_at: Instant::now(),
             departed: StdMutex::default(),
-            held: StdMutex::default(),
+            holding: StdMutex::default(),
             caps_changed: Notify::default(),
             metrics: Metrics::default(),
             nix_config,
             nix_rendered: atomic::AtomicU64::default(),
             nix_written: Arc::default(),
             chunks,
+            placement: StdMutex::default(),
         }
     }
 
@@ -242,6 +303,34 @@ fn write_newest(written: &StdMutex<u64>, generation: u64, path: &Path, content: 
 }
 
 impl HubState {
+    /// Worker session `worker` lists `keys` as held: at registration,
+    /// or in a heartbeat (`beat`), which also counts it.
+    pub(super) fn hold(&self, worker: u64, keys: HashSet<String>, beat: bool) {
+        let mut holding = self.holding.lock().unwrap();
+        let h = holding.entry(worker).or_default();
+        (h.beats, h.keys) = (h.beats + u64::from(beat), keys);
+        h.taken.clear();
+    }
+
+    /// The heartbeats worker session `worker` has sent so far.
+    pub(super) fn heartbeats(&self, worker: u64) -> u64 {
+        self.holding
+            .lock()
+            .unwrap()
+            .get(&worker)
+            .map_or(0, |h| h.beats)
+    }
+
+    /// Whether a heartbeat of worker session `worker` after its first
+    /// `after` left `key` out: the worker no longer holds that build.
+    pub(super) fn unlisted(&self, worker: u64, key: &str, after: u64) -> bool {
+        self.holding
+            .lock()
+            .unwrap()
+            .get(&worker)
+            .is_some_and(|h| h.beats > after && !h.keys.contains(key))
+    }
+
     /// Remember a departed worker's capabilities so a build for the
     /// platform it served waits for it to reconnect rather than
     /// declining at once.
@@ -289,69 +378,98 @@ impl HubState {
             .max()
     }
 
-    pub(super) async fn take_job(&self, caps: &WorkerCaps, worker: u64) -> Option<Job> {
+    /// The first queued job `caps`'s worker can take.
+    pub(super) async fn take_job(&self, caps: &WorkerCaps) -> Option<Job> {
         loop {
-            let job = {
+            let mut job = {
                 let mut queue = self.queue.lock().await;
-                let held = self.held.lock().unwrap();
-                let elsewhere = |key: &str| {
-                    held.iter()
-                        .any(|(id, keys)| *id != worker && keys.contains(key))
-                };
-                let pos = queue
-                    .iter()
-                    .position(|j| caps.serves(&j.req.system, &j.features) && !elsewhere(&j.key))?;
-                queue.remove(pos)?
+                let holding = self.holding.lock().unwrap();
+                // A held key goes to its holder by take_job_by_key, this
+                // worker included: a fresh take would count the loss its
+                // Resumed is about to clear.
+                let workers = self.worker_caps.lock().unwrap();
+                let pos = queue.iter().position(|j| {
+                    caps.serves(&j.req.system, &j.features) && !j.kept(&workers, &holding)
+                });
+                queue.remove(pos?)?
             };
             // Abandoned while queued (every attach client gone): drop it
             // here, at the moment it would have occupied a build slot.
-            if job.replay.has_subscribers().await {
-                return Some(job);
+            if !job.replay.has_subscribers().await {
+                tracing::info!(id = job.id, "dropping queued build: no client attached");
+                self.finish(&job).await;
+                continue;
             }
-            tracing::info!(id = job.id, "dropping queued build: no client attached");
-            self.finish(&job).await;
+            // Its last worker did not resume it: this starts it over.
+            if job.loss.take().is_some() {
+                let Some(j) = losses::count(self, job, true).await else {
+                    continue;
+                };
+                job = j;
+            }
+            return Some(job);
         }
     }
 
     /// Take a queued job `worker` can resume, regardless of its
     /// capacity. Each held key is honoured once.
     pub(super) async fn take_job_by_key(&self, worker: u64) -> Option<Job> {
-        let mut queue = self.queue.lock().await;
-        let mut held = self.held.lock().unwrap();
-        let keys = held.get_mut(&worker)?;
-        let pos = queue.iter().position(|j| keys.contains(&j.key))?;
-        let job = queue.remove(pos)?;
-        keys.remove(&job.key);
+        let mut job = {
+            let mut queue = self.queue.lock().await;
+            let mut holding = self.holding.lock().unwrap();
+            let held = holding.get_mut(&worker)?;
+            let pos = queue.iter().position(|j| held.holds(&j.key))?;
+            let job = queue.remove(pos)?;
+            held.taken.insert(job.key.clone());
+            job
+        };
+        // Held by a worker other than the one that lost it: that loss
+        // stands. The same worker's resume is settled by run_job.
+        let name = self
+            .worker_caps
+            .lock()
+            .unwrap()
+            .get(&worker)
+            .map(|c| c.name.clone());
+        if job
+            .loss
+            .as_ref()
+            .is_some_and(|r| Some(&r.worker) != name.as_ref())
+        {
+            job.loss = None;
+            job = losses::count(self, job, true).await?;
+        }
         Some(job)
     }
 
     /// Put a job back in the queue after its worker session died,
     /// telling attach clients to drop any half-streamed output NARs
-    /// (the next attempt re-streams them from the start).
+    /// (the next attempt re-streams them from the start), and leaving
+    /// their chunks to the cache while it waits, held or not.
     pub(super) async fn requeue(self: &Arc<Self>, mut job: Job) {
-        job.attempts += 1;
         job.queued_at = Instant::now();
         for path in job.req.outputs.values() {
             job.replay
                 .publish(attach_event::Event::OutputRestart(path.clone()))
                 .await;
         }
+        job.replay.unpin_outputs().await;
         self.queue.lock().await.push_back(job);
         self.notify.notify_waiters();
-        self.fail_unservable().await;
+        self.hold_unservable().await;
     }
 
-    /// Fail queued jobs nothing will serve, and re-run when the latest
-    /// expected worker is due.
-    pub(super) async fn fail_unservable(self: &Arc<Self>) {
-        let Some(mut due) = self.fail_unservable_now().await else {
+    /// Hold queued jobs no connected worker serves, telling their
+    /// clients, and re-run when the latest expected worker is due.
+    pub(super) async fn hold_unservable(self: &Arc<Self>) {
+        let Some(mut due) = self.hold_unservable_now().await else {
             return;
         };
         let state = self.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep_until((due + Duration::from_secs(1)).into()).await;
-                match state.fail_unservable_now().await {
+                match state.hold_unservable_now().await {
                     Some(next) => due = next,
                     None => break,
                 }
@@ -364,36 +482,57 @@ impl HubState {
         job.replay.finish().await;
     }
 
-    /// Returns the latest deadline a kept job is still waiting for.
-    async fn fail_unservable_now(&self) -> Option<Instant> {
-        let mut queue = self.queue.lock().await;
-        let mut kept = VecDeque::with_capacity(queue.len());
-        let mut failed = Vec::new();
+    /// Returns the latest deadline a queued job is still waiting for.
+    /// A job no worker is expected for stays queued until one
+    /// registers: its build is not the failure. Its client leaving
+    /// drops it, as at any other point in the queue.
+    async fn hold_unservable_now(&self) -> Option<Instant> {
         let mut due: Option<Instant> = None;
-        for j in queue.drain(..) {
+        let mut unservable = Vec::new();
+        for j in self.queue.lock().await.iter() {
             match self.servability(&j.req.system, &j.features) {
-                Servability::Now => kept.push_back(j),
-                Servability::ExpectedBy(at) => {
-                    due = Some(due.map_or(at, |d| d.max(at)));
-                    kept.push_back(j);
-                }
-                Servability::Never => failed.push(j),
+                Servability::Now => {}
+                Servability::ExpectedBy(at) => due = Some(due.map_or(at, |d| d.max(at))),
+                Servability::Never => unservable.push((
+                    j.id.clone(),
+                    j.replay.clone(),
+                    j.req.system.clone(),
+                    j.features.join(","),
+                )),
             }
         }
-        *queue = kept;
-        drop(queue);
-        for job in failed {
-            tracing::warn!(
-                id = job.id,
-                "failing queued build: last capable worker left"
+        // Outside the queue lock: both wait on the job's replay.
+        let mut abandoned = HashSet::new();
+        for (id, replay, system, features) in unservable {
+            if !replay.has_subscribers().await {
+                abandoned.insert(id);
+                continue;
+            }
+            let note = format!(
+                "tribuchet: no connected worker builds {system} [{features}]; waiting for one\n"
             );
-            job.replay
-                .publish(attach_event::Event::Error(format!(
-                    "no connected worker builds for system {}",
-                    job.req.system
-                )))
-                .await;
-            self.finish(&job).await;
+            if replay.tell_waiting(Wait::Worker, note).await {
+                tracing::warn!(
+                    id,
+                    system,
+                    features,
+                    "holding queued build: no capable worker"
+                );
+            }
+        }
+        if !abandoned.is_empty() {
+            let gone: Vec<Job> = {
+                let mut queue = self.queue.lock().await;
+                let (gone, kept) = queue
+                    .drain(..)
+                    .partition::<VecDeque<Job>, _>(|j| abandoned.contains(&j.id));
+                *queue = kept;
+                gone.into()
+            };
+            for job in gone {
+                tracing::info!(id = job.id, "dropping queued build: no client attached");
+                self.finish(&job).await;
+            }
         }
         due
     }

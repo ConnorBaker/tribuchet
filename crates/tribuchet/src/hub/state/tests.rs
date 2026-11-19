@@ -1,17 +1,97 @@
 use std::sync::mpsc as std_mpsc;
 use std::thread;
 
+use harmonia_store_remote::{ConnectionPool, PoolConfig};
 #[cfg(target_os = "linux")]
 use rustix::fs::{CWD, FileType, Mode, mknodat};
 
 use super::*;
 
 impl HubState {
+    /// No nix-daemon listens on its socket, whether or not the host
+    /// runs one, and its journal is not read: tests behave the same in
+    /// and out of the build sandbox, and each says what is read.
     pub(in crate::hub) fn for_test(worker_grace: Duration) -> Self {
         let dir = Box::leak(Box::new(tempfile::tempdir().unwrap()));
-        let cache = ChunkCache::open(dir.path().to_path_buf(), 1 << 20).unwrap();
-        Self::new(worker_grace, None, Arc::new(cache))
+        let cache = ChunkCache::open(dir.path().join("chunks"), 1 << 20).unwrap();
+        let mut state = Self::new(worker_grace, None, Arc::new(cache));
+        let socket = dir.path().join("no-daemon.sock");
+        state.daemon_pool = ConnectionPool::new(&socket, PoolConfig::default());
+        state.daemon_evidence = DaemonEvidence::Unread;
+        state
     }
+}
+
+fn queued(system: &str, replay: Arc<Replay>) -> Job {
+    Job {
+        id: "j1".into(),
+        key: "k1".into(),
+        req: BuildRequest {
+            system: system.into(),
+            ..Default::default()
+        },
+        tmp_dir_pack: Arc::new(Vec::new()),
+        features: vec![],
+        replay,
+        listing: Arc::default(),
+        attempts: 0,
+        resumed_losses: 0,
+        queued_at: Instant::now(),
+        loss: None,
+    }
+}
+
+#[tokio::test]
+async fn queued_job_survives_worker_restart_within_grace() {
+    let mut state = Arc::new(HubState::for_test(Duration::from_secs(30)));
+    Arc::get_mut(&mut state).unwrap().started_at =
+        Instant::now().checked_sub(Duration::from_mins(1)).unwrap();
+    let replay = Arc::new(Replay::default());
+    let _rx = replay.subscribe().await;
+    state
+        .queue
+        .lock()
+        .await
+        .push_back(queued("x86_64-linux", replay));
+    state.record_departed(caps("x86_64-linux", &[]));
+    state.hold_unservable().await;
+    assert_eq!(state.queue.lock().await.len(), 1);
+}
+
+/// A held job whose client left is dropped, as anywhere in the queue.
+#[tokio::test]
+async fn held_job_is_dropped_once_its_client_leaves() {
+    let state = Arc::new(HubState::for_test(Duration::ZERO));
+    let replay = Arc::new(Replay::default());
+    let rx = replay.subscribe().await;
+    state
+        .queue
+        .lock()
+        .await
+        .push_back(queued("x86_64-linux", replay.clone()));
+    state.hold_unservable().await;
+    assert_eq!(state.queue.lock().await.len(), 1);
+    drop(rx);
+    state.hold_unservable().await;
+    assert!(state.queue.lock().await.is_empty());
+}
+
+/// A requeued job's next attempt delivers its outputs anew: the last
+/// delivery's chunks are left to the cache while it waits, held there
+/// for as long as no worker serves it.
+#[tokio::test]
+async fn a_requeued_job_leaves_its_last_outputs_to_the_cache() {
+    let state = Arc::new(HubState::for_test(Duration::ZERO));
+    let replay = Arc::new(Replay::default());
+    let _rx = replay.subscribe().await;
+    let out = "/nix/store/00000000000000000000000000000000-out".to_owned();
+    let pin = state.chunks.pin(Vec::new());
+    let kept = KeptOutputs::new(state.chunks.clone(), vec![(out, Arc::default())], pin);
+    replay.keep_outputs(kept).await;
+    assert!(replay.outputs_pinned().await);
+    state.requeue(queued("x86_64-linux", replay.clone())).await;
+    assert_eq!(state.queue.lock().await.len(), 1, "not held");
+    assert!(!replay.outputs_pinned().await, "pinned while it waits");
 }
 
 fn caps(system: &str, features: &[&str]) -> WorkerCaps {

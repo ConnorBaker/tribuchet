@@ -4,21 +4,24 @@
 use std::collections::{BinaryHeap, HashMap, HashSet, VecDeque};
 use std::future::pending;
 use std::pin::Pin;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures_util::StreamExt as _;
 use futures_util::stream::FuturesUnordered;
 use harmonia_store_path::{StoreDir, StorePath};
-use harmonia_store_remote::DaemonStore as _;
-use tokio::sync::{Semaphore, mpsc};
+use harmonia_store_remote::{DaemonStore as _, UnkeyedValidPathInfo};
+use tokio::sync::{Semaphore, SemaphorePermit, mpsc};
 use tonic::Status;
 
+use super::daemon::DaemonWait;
 use super::send;
 use super::serve::{compute_recipe, serve_need};
 use crate::chunker::parse_hashes;
 use crate::chunkio;
 use crate::chunkstore::Hash;
-use crate::errors::{Result, err_ctx, err_msg};
+use crate::errors::{Result, err_msg};
 use crate::hub::chunkcache::Recipe;
 use crate::hub::state::{HubState, Job};
 use crate::proto::{
@@ -30,19 +33,42 @@ const KNOWN_CAP: usize = 1 << 18;
 
 /// Per worker session, shared by its jobs.
 pub(in crate::hub) struct WorkerSession {
-    /// One job serves chunks at a time so imports see earlier shared
-    /// inputs as valid and fetch only their delta.
-    pub(super) serving: Semaphore,
+    /// The worker's name, as it registered: for the log lines.
+    pub(super) worker: String,
+    /// One permit: the Need that sends the next chunk frame. A path is
+    /// asked for by one build only; the others wait on its claim
+    /// (spec/staging.qnt).
+    sends: Semaphore,
+    /// Times a Need asked for that permit.
+    #[cfg(test)]
+    asked: AtomicUsize,
     /// Store paths the worker reported having.
     pub(super) known: Mutex<HashSet<String>>,
 }
 
 impl WorkerSession {
-    pub(in crate::hub) fn new() -> Self {
+    pub(in crate::hub) fn new(worker: String) -> Self {
         Self {
-            serving: Semaphore::new(1),
+            worker,
+            sends: Semaphore::new(1),
+            #[cfg(test)]
+            asked: AtomicUsize::default(),
             known: Mutex::new(HashSet::new()),
         }
+    }
+
+    /// The right to send one chunk frame. tokio's Semaphore hands permits
+    /// out in the order asked, so a session's Needs send a frame each in
+    /// turn, and a small Need waits one frame per Need ahead of it.
+    pub(super) async fn send_permit(&self) -> SemaphorePermit<'_> {
+        #[cfg(test)]
+        self.asked.fetch_add(1, Ordering::Relaxed);
+        self.sends.acquire().await.expect("never closed")
+    }
+
+    #[cfg(test)]
+    pub(super) fn asked(&self) -> usize {
+        self.asked.load(Ordering::Relaxed)
     }
 }
 
@@ -97,7 +123,7 @@ impl<'a> Staging<'a> {
                 .cloned()
                 .collect()
         };
-        let infos = order_by_references(query_path_infos(&self.state.daemon_pool, &upfront).await?);
+        let infos = order_by_references(query_path_infos(self.state, self.job, &upfront).await?);
         let mut manifests: HashMap<String, Manifest> = HashMap::new();
         for info in infos {
             let Some(recipe) = self
@@ -117,7 +143,7 @@ impl<'a> Staging<'a> {
             .iter()
             .map(|p| {
                 manifests.remove(p).unwrap_or_else(|| Manifest {
-                    store_path: p.clone(),
+                    store_path: p.to_owned(),
                     ..Default::default()
                 })
             })
@@ -171,8 +197,7 @@ impl<'a> Staging<'a> {
         let sent = self.sent.clone();
         let out_tx = out_tx.clone();
         self.serving = Some(Box::pin(async move {
-            let _permit = sess.serving.acquire().await.expect("never closed");
-            serve_need(cache, job, &sent, needed, &out_tx).await?;
+            serve_need(cache, job, &sent, needed, &out_tx, sess).await?;
             send(
                 &out_tx,
                 hub_message::Msg::Chunk(ChunkFrame {
@@ -220,7 +245,7 @@ impl<'a> Staging<'a> {
             }
         }
         let cache = &self.state.chunks;
-        for info in order_by_references(query_path_infos(&self.state.daemon_pool, &new).await?) {
+        for info in order_by_references(query_path_infos(self.state, self.job, &new).await?) {
             self.tasks.push(Box::pin(async move {
                 let recipe = compute_recipe(cache, &info.store_path, &info.msg.nar_sha256).await?;
                 Ok((info, recipe))
@@ -334,52 +359,63 @@ pub(super) fn order_by_references(infos: Vec<Info>) -> Vec<Info> {
         .collect()
 }
 
-async fn query_path_info_chunk(
-    pool: &harmonia_store_remote::ConnectionPool,
-    paths: &[String],
-) -> Result<Vec<Info>> {
+/// Path info for `paths` from the hub's daemon. A path it does not
+/// have fails; its failing or not answering is DaemonWait's to settle.
+async fn query_path_info_chunk(state: &HubState, job: &Job, paths: &[String]) -> Result<Vec<Info>> {
     let store_dir = StoreDir::default();
-    let mut guard = pool
-        .acquire()
-        .await
-        .map_err(err_ctx("connecting to the local nix-daemon"))?;
-    let mut out = Vec::with_capacity(paths.len());
-    for p in paths {
-        let sp: StorePath = store_dir.parse(p)?;
-        let info = guard
-            .execute(|c| c.query_path_info(&sp))
-            .await
-            .map_err(err_ctx(format!("querying path info for {p}")))?
-            .ok_or_else(|| err_msg(format!("{p} is not a valid path in the local store")))?;
-        out.push(Info {
-            store_path: p.clone(),
-            msg: PathInfoMsg {
-                nar_sha256: info.nar_hash.digest_bytes().to_vec(),
-                nar_size: info.nar_size,
-                references: info
-                    .references
-                    .iter()
-                    .map(|r| store_dir.display(r).to_string())
-                    .collect(),
-                signatures: info.signatures.iter().map(ToString::to_string).collect(),
-                deriver: info
-                    .deriver
-                    .map(|d| store_dir.display(&d).to_string())
-                    .unwrap_or_default(),
-                ca: info.ca.map(|c| c.to_string()).unwrap_or_default(),
-            },
-        });
+    let mut wait = DaemonWait::new(job, state);
+    'attempt: loop {
+        let (mut guard, began) = wait.connect(&state.daemon_pool).await?;
+        let mut out = Vec::with_capacity(paths.len());
+        for p in paths {
+            let sp: StorePath = store_dir.parse(p)?;
+            let (failure, why) = match wait.ask(guard.execute(|c| c.query_path_info(&sp))).await? {
+                Ok(Some(info)) => {
+                    out.push(path_info(p, &store_dir, info));
+                    continue;
+                }
+                Ok(None) => {
+                    return Err(err_msg(format!(
+                        "{p} is not a valid path in the local store"
+                    )));
+                }
+                Err(failed) => failed,
+            };
+            // Its slot is free during the backoff.
+            drop(guard);
+            let what = format!("querying path info for {p}: {why}");
+            wait.failed(failure, began, p, &what).await?;
+            continue 'attempt;
+        }
+        return Ok(out);
     }
-    Ok(out)
+}
+
+fn path_info(p: &str, store_dir: &StoreDir, info: UnkeyedValidPathInfo) -> Info {
+    Info {
+        store_path: p.to_owned(),
+        msg: PathInfoMsg {
+            nar_sha256: info.nar_hash.digest_bytes().to_vec(),
+            nar_size: info.nar_size,
+            references: info
+                .references
+                .iter()
+                .map(|r| store_dir.display(r).to_string())
+                .collect(),
+            signatures: info.signatures.iter().map(ToString::to_string).collect(),
+            deriver: info
+                .deriver
+                .map(|d| store_dir.display(&d).to_string())
+                .unwrap_or_default(),
+            ca: info.ca.map(|c| c.to_string()).unwrap_or_default(),
+        },
+    }
 }
 
 /// Path info over the daemon protocol, not db.sqlite:
 /// harmonia-store-db opens the db with immutable=1, so WAL-only rows
 /// (freshly registered inputs, the common case) would be invisible.
-async fn query_path_infos(
-    pool: &harmonia_store_remote::ConnectionPool,
-    paths: &[String],
-) -> Result<Vec<Info>> {
+async fn query_path_infos(state: &HubState, job: &Job, paths: &[String]) -> Result<Vec<Info>> {
     const PARALLELISM: usize = 8;
     if paths.is_empty() {
         return Ok(Vec::new());
@@ -387,7 +423,7 @@ async fn query_path_infos(
     let chunk_size = paths.len().div_ceil(PARALLELISM).max(1);
     let chunks = paths
         .chunks(chunk_size)
-        .map(|chunk| query_path_info_chunk(pool, chunk));
+        .map(|chunk| query_path_info_chunk(state, job, chunk));
     let results = futures_util::future::try_join_all(chunks).await?;
     Ok(results.into_iter().flatten().collect())
 }
@@ -415,7 +451,6 @@ pub(super) async fn stream_tmp_dir(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
     use std::time::{Duration, Instant};
 
     use super::*;
@@ -433,7 +468,7 @@ mod tests {
         }
     }
 
-    fn info(path: &str, refs: &[&str]) -> Info {
+    pub(super) fn info(path: &str, refs: &[&str]) -> Info {
         sized(path, refs, 0)
     }
 
@@ -462,7 +497,7 @@ mod tests {
         assert_eq!(seq(&ordered), vec![dep, lib]);
     }
 
-    fn test_job() -> Job {
+    pub(super) fn test_job() -> Job {
         Job {
             id: "0123456789abcdef0123456789abcdef".into(),
             key: "k".into(),
@@ -470,9 +505,11 @@ mod tests {
             tmp_dir_pack: Arc::new(Vec::new()),
             features: vec![],
             replay: Arc::new(Replay::default()),
-            listing: Mutex::default(),
+            listing: Arc::default(),
             attempts: 0,
+            resumed_losses: 0,
             queued_at: Instant::now(),
+            loss: None,
         }
     }
 
@@ -483,7 +520,7 @@ mod tests {
     async fn manifest_survives_full_channel() {
         let state = HubState::for_test(Duration::from_secs(1));
         let job = test_job();
-        let sess = WorkerSession::new();
+        let sess = WorkerSession::new("w".into());
         let mut staging = Staging::new(&state, &job, &sess);
         let path = "/nix/store/00000000000000000000000000000000-x";
         staging.computing.insert(path.into());
@@ -524,3 +561,6 @@ mod tests {
         assert_eq!(ordered.len(), 2);
     }
 }
+
+#[cfg(test)]
+mod serving_tests;

@@ -22,7 +22,6 @@ async fn a_cached_output_chunk_is_read_off_the_runtime() {
     let mut src = ChunkSource {
         cache: &cache,
         needed: HashSet::new(),
-        _pin: cache.pin([hash]),
         in_rx: &mut in_rx,
     };
     let frame = src.get(&hash, data.len()).await.unwrap();
