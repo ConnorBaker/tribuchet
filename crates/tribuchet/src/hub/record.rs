@@ -24,7 +24,7 @@ use super::naming::named_output;
 use super::placement::{Build, History};
 use super::state::{HubState, Job};
 use crate::errors::{Result, err_msg};
-use crate::proto::BuildUsage;
+use crate::proto::{BuildProfile, BuildUsage};
 
 #[cfg(test)]
 #[path = "record/tests.rs"]
@@ -45,6 +45,15 @@ CREATE TABLE dispatch (at_ms INTEGER NOT NULL, id TEXT NOT NULL, key TEXT, worke
   cores REAL);
 PRAGMA user_version = 1;
 ";
+
+/// The table of build profiles, which a record of user_version 1 gains
+/// as a hub that writes them opens it: a hub that does not ignores it.
+/// A row per result row whose usage had one, by the result's at_ms and
+/// id; the others are JSON arrays of the profile's points, one column
+/// per list of BuildProfile in tribuchet.proto.
+const PROFILE: &str = "CREATE TABLE IF NOT EXISTS profile (at_ms INTEGER NOT NULL, \
+  id TEXT NOT NULL, running_usec TEXT NOT NULL, cpu_usec TEXT NOT NULL, runnable TEXT NOT NULL, \
+  memory TEXT NOT NULL);";
 
 /// A row for table `table`: its values, in the schema's column order.
 pub(in crate::hub) struct Row {
@@ -68,6 +77,24 @@ pub(in crate::hub) fn val<T: Into<Value>>(v: Option<T>) -> Value {
 /// An unsigned count as SQLite's signed integer, saturating.
 pub(in crate::hub) fn int(x: u64) -> Value {
     Value::Integer(i64::try_from(x).unwrap_or(i64::MAX))
+}
+
+/// The `profile` row of the result row at `at_ms` of build `id`.
+pub(in crate::hub) fn profile_row(at_ms: i64, id: &str, p: &BuildProfile) -> Row {
+    let json = |xs: Vec<String>| Value::from(format!("[{}]", xs.join(",")));
+    let list = |xs: &[u64]| json(xs.iter().map(u64::to_string).collect());
+    let values = vec![
+        Value::Integer(at_ms),
+        id.to_owned().into(),
+        list(&p.running_usec),
+        list(&p.cpu_usec),
+        json(p.runnable_milli.iter().map(u32::to_string).collect()),
+        list(&p.memory_bytes),
+    ];
+    Row {
+        table: "profile",
+        values,
+    }
 }
 
 /// What a `result` row holds beyond what history learns from.
@@ -281,6 +308,7 @@ fn take(path: &Path) -> Result<Option<(Connection, File, (History, u64))>> {
         conn.execute_batch(&format!("BEGIN EXCLUSIVE;{SCHEMA}COMMIT;"))?;
     }
     let folded = fold(&conn)?;
+    conn.execute_batch(PROFILE)?;
     let mode: String = conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
     if !mode.eq_ignore_ascii_case("wal") {
         return Err(err_msg(format!("journal_mode {mode}, not WAL")));
@@ -325,6 +353,7 @@ pub(in crate::hub) fn fold(conn: &Connection) -> rusqlite::Result<(History, u64)
             peak_memory_bytes: n(6)?,
             oom_killed: r.get(7)?,
             frozen_ms: n(8)?,
+            profile: None,
         };
         let build = Build {
             system: &system,

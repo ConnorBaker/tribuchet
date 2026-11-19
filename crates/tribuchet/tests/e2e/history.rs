@@ -101,6 +101,33 @@ fn a_learned_hot_one_goes_where_the_naps_are() {
     launch("nap", "nap-0", 10);
     assert_eq!([ended("hot-0", 120), ended("nap-0", 120)], ["0", "0"]);
     restart();
+    // Each run's profile, as its worker's arbiter sampled it, is in the
+    // record by its result: the hot build ran 2 threads, the nap none;
+    // the hot build's points' CPU times sum to its result's, and their
+    // running times to about its own.
+    let of = |drv: &str, value: &str, list: &str| {
+        let sql = format!(
+            "SELECT {value} FROM profile p JOIN result r USING (id), \
+             json_each(p.{list}) j WHERE r.drv = '{drv}'"
+        );
+        let out = succeed(Node::Hub, &format!("sqlite3 -readonly {RECORD} \"{sql}\""));
+        out.trim()
+            .parse::<i64>()
+            .unwrap_or_else(|_| panic!("{drv} {value}: {out:?}"))
+    };
+    let (hot, nap) = (
+        of("hot-0", "max(j.value)", "runnable"),
+        of("nap-0", "max(j.value)", "runnable"),
+    );
+    assert!(hot >= 1500 && nap <= 500, "profiles: hot {hot}, nap {nap}");
+    let unsummed = of("hot-0", "max(r.cpu_usec) - sum(j.value)", "cpu_usec");
+    assert_eq!(unsummed, 0, "hot-0's CPU points do not sum to its cpu_usec");
+    let ran = of("hot-0", "max(r.wall_ms - r.frozen_ms)", "running_usec");
+    let covered = of("hot-0", "sum(j.value) / 1000", "running_usec");
+    assert!(
+        covered * 10 >= ran * 8 && covered <= ran + 2000,
+        "hot-0's points cover {covered} ms of its {ran} ms"
+    );
     both_declared();
     // 120 s builds: the placements below take seconds, and each counts
     // the builds before it only while they run.

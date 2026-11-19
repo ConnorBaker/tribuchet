@@ -232,6 +232,36 @@ message BuildUsage {
   // Of wall_ms, the time the build was frozen (by the worker's CPU
   // arbiter, or anyone); 0 when unknown.
   uint64 frozen_ms = 5;
+  // How its parallelism and memory changed over its run; unset where the
+  // worker's CPU arbiter did not sample it (off, no cgroup, an older
+  // worker).
+  BuildProfile profile = 6;
+}
+
+// A build's run as the worker's CPU arbiter sampled it, about every
+// 200 ms, from when that worker began tracking it (a build adopted after
+// a worker restart has only its later part): at most 64 points, oldest
+// first, each of the same number of consecutive samples, the last
+// possibly fewer. The four lists are parallel, one entry per point.
+message BuildProfile {
+  // Running time the point covers, measured: the clock's advance less
+  // the build cgroup's own frozen time (cgroup.stat.local frozen_usec)
+  // over it. A point's share of the run, however late its samples came.
+  repeated uint64 running_usec = 1;
+  // CPU time the build's cgroup used over the point (cpu.stat
+  // usage_usec): cores used, its running time times its cores. The
+  // first point also holds what the cgroup used before tracking began,
+  // so the points sum to the cgroup's count, BuildUsage.cpu_usec.
+  repeated uint64 cpu_usec = 2;
+  // Mean runnable threads (running or waiting for a CPU: demand) over
+  // the point's samples taken while the build was not frozen, in
+  // thousandths; 0 where every one was frozen. Against cpu_usec over
+  // running_usec, what the build wanted against what it got.
+  repeated uint32 runnable_milli = 3;
+  // Largest memory.current of the build's cgroup as sampled over the
+  // point: a lower bound on its peak there. The run's own peak is
+  // BuildUsage.peak_memory_bytes (memory.peak).
+  repeated uint64 memory_bytes = 4;
 }
 
 // Local service between `tribuchet attach` and the hub, served on a unix

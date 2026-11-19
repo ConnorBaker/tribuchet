@@ -24,6 +24,8 @@ in
     virtualisation.cores = 2;
     # a record of its own, so that the test sees the setting used
     services.tribuchet-hub.settings.placement.record = "/var/lib/tt-history/record.sqlite";
+    # the test reads the record's profile rows
+    environment.systemPackages = [ pkgs.sqlite ];
     environment.etc."tt/hot.nix".text = ''
       { name, secs }:
       derivation {

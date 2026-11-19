@@ -70,6 +70,15 @@ fn stat_state(stat: &str) -> Option<char> {
     stat.rsplit_once(") ")?.1.chars().next()
 }
 
+/// `usage_usec` of a cgroup's cpu.stat: the CPU time it has used; None
+/// when it cannot be read (gone).
+pub(super) fn cpu_usec(dir: &Path) -> Option<u64> {
+    stat_field(
+        &fs::read_to_string(dir.join("cpu.stat")).ok()?,
+        "usage_usec",
+    )
+}
+
 /// `frozen_usec` of a cgroup's cgroup.stat.local: the time it spent
 /// between a freeze and the thaw. None when it cannot be read (the
 /// cgroup is gone).

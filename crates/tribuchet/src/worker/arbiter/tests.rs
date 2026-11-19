@@ -235,3 +235,62 @@ fn every_scenario_freezes_and_thaws_as_the_table_says() {
         }
     }
 }
+
+/// Each sample of a tracked build goes into its profile: the running
+/// time since the last, measured (a late sample covers its whole
+/// interval; the cgroup's frozen time over it is not running time), the
+/// CPU time its cgroup used over it, and, unless it was frozen, its
+/// runnable threads; a build whose cgroup reads no CPU time is not
+/// sampled. The report takes a last sample, so the CPU times sum to the
+/// cgroup's count, the result's cpu_usec.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_tracked_build_is_profiled_while_it_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut a = Arbiter::with_cpus(true, 4);
+    Arc::get_mut(&mut a).unwrap().memory = memory::Roots::under(dir.path());
+    let cg = busy_cgroup(dir.path(), "b", 3);
+    let set = |cpu: u64, frozen: u64, memory: u64| {
+        fs::write(
+            cg.join("cpu.stat"),
+            format!("usage_usec {cpu}\nuser_usec 0\n"),
+        )
+        .unwrap();
+        fs::write(
+            cg.join("cgroup.stat.local"),
+            format!("frozen_usec {frozen}\n"),
+        )
+        .unwrap();
+        fs::write(cg.join("memory.current"), format!("{memory}\n")).unwrap();
+    };
+    a.insert("b", "b", 0, Some(cg.clone()), None);
+    let t = Tracking {
+        arbiter: a.clone(),
+        key: "b".into(),
+        most_usec: AtomicU64::new(0),
+    };
+    let t0 = a.lock().builds["b"].last.0;
+    let ms = |n| t0 + Duration::from_millis(n);
+    let frozen = |f| a.lock().builds.get_mut("b").unwrap().frozen = f;
+    set(300_000, 0, 4096);
+    a.tick(ms(200));
+    frozen(true);
+    set(300_000, 150_000, 4096);
+    a.tick(ms(400));
+    frozen(false);
+    set(900_000, 150_000, 8192);
+    a.tick(ms(700));
+    fs::remove_file(cg.join("cpu.stat")).unwrap();
+    a.tick(ms(900));
+    set(950_000, 150_000, 8192);
+    let p = t.profile().expect("sampled");
+    assert_eq!(p.runnable_milli, vec![3000, 0, 3000, 0]);
+    assert_eq!(p.cpu_usec, vec![300_000, 0, 600_000, 50_000]);
+    assert_eq!(
+        p.cpu_usec.iter().sum::<u64>(),
+        950_000,
+        "not the cgroup's count"
+    );
+    assert_eq!(&p.running_usec[..3], &[200_000, 50_000, 300_000]);
+    assert_eq!(p.memory_bytes, vec![4096, 4096, 8192, 0]);
+}

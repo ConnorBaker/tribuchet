@@ -12,7 +12,7 @@ use rusqlite::types::Value;
 
 use super::Admission;
 use super::naming::drv_name;
-use super::record::{Recorder, Rest, Row, int, now_ms, result_row, val};
+use super::record::{Recorder, Rest, Row, int, now_ms, profile_row, result_row, val};
 use super::state::{HubState, Job};
 use crate::proto::{BuildUsage, Register};
 
@@ -108,7 +108,11 @@ impl Placement {
     pub(super) fn learn(&mut self, job: &Job, exit_code: i32, u: &BuildUsage, rest: Rest) {
         let build = build_of(job);
         self.history.record(&build, exit_code, u);
+        let profile = (u.profile.as_ref()).map(|p| profile_row(rest.at_ms, &rest.id, p));
         self.append(result_row(&build, exit_code, u, rest));
+        if let Some(row) = profile {
+            self.append(row);
+        }
     }
 
     /// Hand `row` to the record's writer, if there is one.

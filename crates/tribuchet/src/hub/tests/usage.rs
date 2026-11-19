@@ -9,7 +9,7 @@ use rusqlite::types::Value;
 
 use super::rank::{declare, sized_worker};
 use super::*;
-use crate::proto::{BuildResult, BuildUsage};
+use crate::proto::{BuildProfile, BuildResult, BuildUsage};
 
 /// A build's usage line names the worker whose session ran it, its
 /// system, and the scratch path of the output it is known by (see
@@ -218,6 +218,12 @@ async fn a_build_appends_a_dispatch_and_a_result_row() {
         peak_memory_bytes: 7,
         oom_killed: true,
         frozen_ms: 500,
+        profile: Some(BuildProfile {
+            running_usec: vec![400_000, 61_000],
+            cpu_usec: vec![400_000, 1_921_500],
+            runnable_milli: vec![1000, 31_500],
+            memory_bytes: vec![1 << 30, 7],
+        }),
     };
     let result = BuildResult {
         build_id: build_id.clone(),
@@ -266,8 +272,29 @@ async fn a_build_appends_a_dispatch_and_a_result_row() {
         dispatch,
         [format!("Text({build_id:?})"), r#"Text("k0")"#.to_owned()]
     );
-    let rows = text("SELECT (SELECT count(*) FROM result), (SELECT count(*) FROM dispatch)");
-    assert_eq!(rows, ["Integer(1)", "Integer(1)"], "one row each");
+    let rows = text(
+        "SELECT (SELECT count(*) FROM result), (SELECT count(*) FROM dispatch), \
+         (SELECT count(*) FROM profile)",
+    );
+    assert_eq!(
+        rows,
+        ["Integer(1)", "Integer(1)", "Integer(1)"],
+        "one row each"
+    );
+    // Its profile, by the result row's id and at_ms.
+    let profile = text(
+        "SELECT p.id, p.running_usec, p.cpu_usec, p.runnable, p.memory, p.at_ms = r.at_ms \
+         FROM profile p JOIN result r ON r.id = p.id",
+    );
+    let want = [
+        format!("Text({build_id:?})"),
+        r#"Text("[400000,61000]")"#.to_owned(),
+        r#"Text("[400000,1921500]")"#.to_owned(),
+        r#"Text("[1000,31500]")"#.to_owned(),
+        r#"Text("[1073741824,7]")"#.to_owned(),
+        "Integer(1)".to_owned(),
+    ];
+    assert_eq!(profile, want);
     for table in ["result", "dispatch"] {
         let at = text(&format!("SELECT at_ms FROM {table}"));
         let at: i64 = at[0]

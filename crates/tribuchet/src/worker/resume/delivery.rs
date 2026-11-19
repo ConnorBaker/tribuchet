@@ -16,7 +16,9 @@ use crate::chunker::parse_hashes;
 use crate::chunkstore::Hash;
 use crate::errors::{Result, chain, err_msg};
 use crate::fsutil::io_ctx;
-use crate::proto::{BuildResult, BuildUsage, ChunkFrame, Manifest, WorkerMessage, worker_message};
+use crate::proto::{
+    BuildProfile, BuildResult, BuildUsage, ChunkFrame, Manifest, WorkerMessage, worker_message,
+};
 use crate::worker::build::ActiveBuild;
 use crate::worker::logtail::LogTail;
 use crate::worker::{WorkerCtx, msg, remove_build_dir};
@@ -134,7 +136,7 @@ impl ResumableBuild {
 
 /// What a build used; all 0 when unknown (adopted after an agent restart,
 /// no cgroup, setup failure).
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(in crate::worker) struct Usage {
     pub(in crate::worker) wall_ms: u64,
     pub(in crate::worker) cpu_usec: u64,
@@ -143,6 +145,29 @@ pub(in crate::worker) struct Usage {
     /// Of wall_ms; absent from a delivery persisted before it was kept.
     #[serde(default)]
     pub(in crate::worker) frozen_ms: u64,
+    /// How it ran, as the arbiter sampled it; absent likewise.
+    #[serde(default)]
+    pub(in crate::worker) profile: Option<Profile>,
+}
+
+/// BuildProfile as the worker persists it with a delivery.
+#[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(in crate::worker) struct Profile {
+    running_usec: Vec<u64>,
+    cpu_usec: Vec<u64>,
+    runnable_milli: Vec<u32>,
+    memory_bytes: Vec<u64>,
+}
+
+impl From<BuildProfile> for Profile {
+    fn from(p: BuildProfile) -> Self {
+        Self {
+            running_usec: p.running_usec,
+            cpu_usec: p.cpu_usec,
+            runnable_milli: p.runnable_milli,
+            memory_bytes: p.memory_bytes,
+        }
+    }
 }
 
 impl From<sandbox_proto::agent::ExitNotice> for Usage {
@@ -153,6 +178,7 @@ impl From<sandbox_proto::agent::ExitNotice> for Usage {
             peak_memory_bytes: n.peak_memory_bytes,
             oom_killed: n.oom_killed,
             frozen_ms: n.frozen_ms,
+            profile: None,
         }
     }
 }
@@ -165,6 +191,12 @@ impl From<Usage> for BuildUsage {
             peak_memory_bytes: u.peak_memory_bytes,
             oom_killed: u.oom_killed,
             frozen_ms: u.frozen_ms,
+            profile: u.profile.map(|p| BuildProfile {
+                running_usec: p.running_usec,
+                cpu_usec: p.cpu_usec,
+                runnable_milli: p.runnable_milli,
+                memory_bytes: p.memory_bytes,
+            }),
         }
     }
 }
@@ -245,7 +277,7 @@ pub(in crate::worker) fn persist_finished(key: &str, build_id: &str, fin: &Finis
         dedupe_key: key.to_string(),
         build_id: build_id.to_string(),
         exit_code: fin.exit_code,
-        usage: fin.usage,
+        usage: fin.usage.clone(),
         error: fin.error.clone(),
         outputs: fin.outputs.clone(),
     };
@@ -292,7 +324,7 @@ fn deliver(
     out_tx.blocking_send(msg(worker_message::Msg::Result(BuildResult {
         build_id: build_id.into(),
         exit_code: fin.exit_code,
-        usage: Some(fin.usage.into()),
+        usage: Some(fin.usage.clone().into()),
         outputs: fin
             .outputs
             .iter()
