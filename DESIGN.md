@@ -479,7 +479,8 @@ reported at start, and nothing is frozen there.
 * A build's network is told from its output path, which build.json
   does not say the type of: a fixed-output build Nix runs at another
   path (`--check`, `--rebuild` or `--repair` of a valid output) or
-  under git hashing is not told fixed-output, and gets none.
+  under git hashing is not told fixed-output, and gets none; attach
+  says so in its log, where Nix reports the fetch or hash mismatch.
 * Input chunks are verified against the hub's manifest and the daemon
   checks the NAR hash the hub declared, but both come from the hub: the
   worker trusts the mTLS-authenticated hub for input content.

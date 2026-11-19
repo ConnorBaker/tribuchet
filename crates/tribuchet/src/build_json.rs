@@ -101,7 +101,7 @@ pub fn read_attrs(build_dir: &Path, has: bool) -> Option<serde_json::Value> {
 /// reaches its builder: its one output, `out`, is at that hash's store
 /// path (by outputHashAlgo, outputHashMode). No other derivation's output
 /// lands there, whatever its env says; one at another path, or hashed with
-/// git, is not told (Some(false)).
+/// git, is not told (Some(false)), and attach says so in its log.
 pub fn fixed_output<'a>(
     store_dir: &str,
     outputs: impl IntoIterator<Item = (&'a String, &'a String)>,

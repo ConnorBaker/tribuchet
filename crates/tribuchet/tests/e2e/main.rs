@@ -270,6 +270,13 @@ fn build_fod() {
 
     // 1) fetch via the hub's IP, isolated from the worker's loopback socket
     build_grep("/etc/tt/fod.nix", "hello-fod");
+    // 1a) --check runs it at another path, not told fixed-output: without
+    // network its output mismatches its hash, and its log says why.
+    let err = fail(Node::Hub, "nix-build /etc/tt/fod.nix --check 2>&1");
+    assert!(
+        err.contains("not at a path it derives from the outputHash"),
+        "{err}"
+    );
 
     // 1b) fod-network policy: denied port unreachable, allowed port works
     build_grep("/etc/tt/fod-policy.nix", "hello-fod");
