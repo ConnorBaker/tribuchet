@@ -133,6 +133,7 @@ pub(super) async fn lost(
     let before = job.loss.as_ref().map_or(Run::Unstarted, |l| l.run);
     if dispatch.staged && before == Run::Started {
         // Taken back by key and staged afresh: the run before is gone.
+        state.lost.mark(&job.key);
         job = count(state, job, Charge::Genuine).await?;
     }
     let run = dispatch.run(before);
@@ -147,6 +148,9 @@ pub(super) async fn lost(
         // Staged, the assignment unanswered, or the result's delivery cut.
         _ => Some(Charge::Transport),
     };
+    if charge == Some(Charge::Genuine) {
+        state.lost.mark(&job.key); // A started run ended, no cause known (D4).
+    }
     let mut job = match charge {
         Some(charge) => count(state, job, charge).await?,
         None => job,

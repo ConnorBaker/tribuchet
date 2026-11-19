@@ -25,6 +25,7 @@ mod clientless_farm;
 mod daemon;
 mod diverge;
 pub(super) mod fake_daemon;
+mod isolation;
 mod rank;
 mod reconnect;
 pub(crate) mod slow_link;

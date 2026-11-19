@@ -104,6 +104,17 @@ impl HubState {
             // under it; afresh on a rescan, which passes over again.
             let open = asker.map(|_| self.open_clientless()).unwrap_or_default();
             let mut rooms = asker.map(|id| self.placement.lock().unwrap().rooms_for(id, &open));
+            // A lost key's run never shares a worker (D4, I1): it goes only
+            // to one holding nothing, and one holding it takes nothing else.
+            let (busy, alone, draining) = asker.map_or((false, false, false), |id| {
+                let p = self.placement.lock().unwrap();
+                let (busy, alone) = p.residence(id);
+                (busy, alone, p.drain == Some(id))
+            });
+            if alone {
+                return None;
+            }
+            let mut wants_room = false;
             let mut wanted = Vec::new();
             let (taken, left) = {
                 let mut queue = self.queue.lock().await;
@@ -116,6 +127,13 @@ impl HubState {
                 let pos = queue.iter_mut().position(|j| {
                     let unfit = !caps.serves(&j.req.system, &j.features) || j.replay.held();
                     if unfit || j.kept(&workers, &holding) {
+                        return false;
+                    }
+                    if asker.is_some() && self.lost.has(&j.key) {
+                        wants_room |= busy;
+                        return !busy;
+                    }
+                    if draining {
                         return false;
                     }
                     let (system, features, first) =
@@ -134,6 +152,9 @@ impl HubState {
                 });
                 (pos.and_then(|p| queue.remove(p)), left)
             };
+            if let Some(id) = asker {
+                self.placement.lock().unwrap().drain_for(id, wants_room);
+            }
             for (s, id, replay) in wanted {
                 if let Some(s) = self.placement.lock().unwrap().sessions.get_mut(&s) {
                     s.wants.insert(id, replay);
@@ -149,6 +170,9 @@ impl HubState {
             if !left.is_empty() {
                 self.notify.notify_waiters();
             }
+            if taken.is_none() && draining && !wants_room {
+                continue; // Drained for a lost key no longer waiting.
+            }
             let mut job = taken?;
             // Abandoned while queued (every attach client gone): drop it
             // here, at the moment it would have occupied a build slot.
@@ -163,7 +187,7 @@ impl HubState {
             // transport. A loss before or after the run was counted as it
             // happened (losses::lost).
             if let Some(loss) = &job.loss {
-                self.given_up_on(loss);
+                self.given_up_on(loss, &job.key);
             }
             if let Some(loss) = job.loss.take().filter(|l| l.run == Run::Started) {
                 let back = {
@@ -171,6 +195,7 @@ impl HubState {
                     loss.back(&self.worker_caps.lock().unwrap(), &holding)
                 };
                 let charge = if back {
+                    self.lost.mark(&job.key); // Back without its started run (D4).
                     Some(Charge::Genuine)
                 } else {
                     (!loss.charged).then_some(Charge::Transport)
@@ -208,7 +233,7 @@ impl HubState {
             .get(&worker)
             .map(|c| c.name.clone());
         if let Some(loss) = (job.loss.as_ref()).filter(|r| Some(&r.worker) != name.as_ref()) {
-            self.given_up_on(loss);
+            self.given_up_on(loss, &job.key);
             let taken = job.loss.take();
             if taken.is_some_and(|l| l.run == Run::Started && !l.charged) {
                 job = losses::count(self, job, Charge::Transport).await?;

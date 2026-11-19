@@ -20,6 +20,7 @@ use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use super::admin::AdminSvc;
 use super::chunkcache::ChunkCache;
 use super::known::Known;
+use super::lost::Lost;
 use super::metrics;
 use super::record;
 use super::runs::Runs;
@@ -153,6 +154,7 @@ async fn run_async(cfg: HubConfig) -> Result<()> {
     let path = cfg.placement.record.clone().unwrap_or_else(default_record);
     state.runs = Runs::open(&path.with_file_name("run-epoch"));
     state.known = Known::open(&path.with_file_name("known-workers"));
+    state.lost = Lost::open(&path.with_file_name("lost-keys"));
     let state = Arc::new(state);
     let opened = tokio::task::spawn_blocking(move || record::open(&path))
         .await
