@@ -55,8 +55,12 @@ GC by per-build temp roots. The worker must be a trusted daemon user
    no worker is expected for it: `worker-grace-secs` after the hub's
    start or after the last worker serving it left. A fixed-output build
    is never declined, since a local build would run in the hub host's
-   network: it waits for a worker, and its clients are told. Otherwise
-   submitters block and Nix's max-jobs bounds parallelism.
+   network. A client whose Nix cannot build it, every fixed-output
+   build's among them, waits for a worker, told why, while a known
+   worker (one that registered and was not decommissioned since) serves
+   it; if none does, it is refused once no worker is expected for it
+   (`hub/known.rs`). Otherwise submitters block and Nix's max-jobs
+   bounds parallelism.
 3. Staging: the assignment carries the input closure, with a manifest
    (Nix db metadata plus chunk list) inline for paths the hub has
    chunked before and does not know the worker to have. The worker asks
@@ -143,9 +147,8 @@ Reference implementations: `nix/src/libstore/unix/build/` and
   store path of the content hash the derivation declares. An `__impure`
   one gets none. A worker gives it a network of its own only on Linux
   with `/dev/net/tun`, so no current macOS worker advertises
-  `tribuchet-network` (one refuses such a build): a darwin one waits,
-  its clients told, until such a worker registers or the client gives
-  up.
+  `tribuchet-network` (one refuses such a build), and the hub answers
+  such a build as step 2 says.
 
 Accepted tradeoffs: no recursive-nix, sandbox parity is ours to maintain,
 trusted worker pool assumed (output authenticity rests on the
@@ -262,10 +265,12 @@ than the waiting builds can use, counted hub-wide
 (`hub/state/clientless.rs`). None that a worker holds from before a hub
 restart is given up: it runs to completion.
 
-The hub's own nix-daemon fails a build, naming the cause, once a
-failure of class c has repeated θ(c) times in a row on the same
-request, as that build counts them; otherwise the build waits and its
-clients are told once (`hub/relay/daemon.rs`):
+Each failure of the hub's own nix-daemon is counted by class c and
+request, as the build counts them; short of θ(c) the build waits, its
+clients told once (`hub/relay/daemon.rs`). At θ(c) each client whose
+Nix builds it is declined. The others fail, naming the cause, if c is a
+fact about the hub (θ 1, the hub's verdict, `hub/losses.rs`); otherwise
+they wait on, as below θ:
 
 | class | θ |
 |---|---|
@@ -273,6 +278,11 @@ clients are told once (`hub/relay/daemon.rs`):
 | a message the hub cannot read | 2 |
 | a request the daemon drops as its journal says a worker crashed | 3 |
 | anything else: a drop or close with no such word in the journal, no answer within a minute, a silent daemon's included | ∞ |
+
+An input the hub's store lacks (its daemon knows no such path) is no
+verdict either: the clients whose Nix builds it are declined, and the
+build is held for the others until a client of its key joins, whose
+Nix had that input as it submitted (`hub/state/hold.rs`).
 
 ## Placement
 

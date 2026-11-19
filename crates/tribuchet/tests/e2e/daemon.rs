@@ -64,22 +64,25 @@ fn a_case_that_fails_puts_its_daemon_back() {
 }
 
 /// Asks for tt-`name` as root on the store itself (the daemon may refuse
-/// root), submitted as the unit `name`.
-fn ask(name: &str) {
+/// root), submitted as the unit `name`. It requires a feature the worker
+/// has; unless `can_local`, this client's store lacks it, so its Nix
+/// cannot build it, and the case cannot pass by the hub building it.
+fn ask(name: &str, can_local: bool) {
     let expr = format!(
         r#"derivation {{
   name = "tt-{name}";
   system = "x86_64-linux";
+  requiredSystemFeatures = [ "big-parallel" ];
   builder = builtins.storePath "{bash}" + "/bin/bash";
   args = [ "-c" "read -r x < ${{builtins.toFile "input-{name}" "{name}"}}; echo $x > $out" ];
 }}"#,
         bash = bash(),
     );
     write_file(Node::Hub, &format!("/root/{name}.nix"), &expr);
-    submit(
-        name,
-        &format!("NIX_REMOTE=local nix-build /root/{name}.nix --no-out-link"),
-    );
+    let features = (!can_local).then_some("?system-features=uid-range");
+    let store = format!("local{}", features.unwrap_or_default());
+    let build = format!("nix-build /root/{name}.nix --no-out-link --store \"{store}\"");
+    submit(name, &build);
 }
 
 /// Its exit status and output, once it ended.
@@ -88,13 +91,13 @@ fn outcome(name: &str, secs: u64) -> (String, String) {
     (rc, succeed(Node::Hub, &format!("cat /tmp/{name}.out")))
 }
 
-/// A daemon that refuses the hub's user, root (allowed-users and
-/// trusted-users without it), closes each new connection before the
-/// handshake: the build fails, told what the daemon's journal says. Once
-/// root is let in, the next build succeeds: each build judges its own.
-/// The daemon's workers go too (KillMode=process keeps them across a
-/// restart): one left from an earlier case serves the hub's pooled
-/// connection as before, and the build succeeded through it.
+/// A daemon refusing the hub's user, root, closes each new connection
+/// before the handshake: a client whose Nix cannot build it fails, told
+/// what the daemon's journal says. Once root is let in, the next build
+/// succeeds: each build judges its own. The daemon's workers go too
+/// (KillMode=process keeps them across a restart): one left from an
+/// earlier case served the hub's pooled connection, and the build
+/// succeeded through it.
 #[test]
 fn refused_user() {
     let dropin = "/run/systemd/system/nix-daemon.service.d";
@@ -111,7 +114,7 @@ fn refused_user() {
             "rm {dropin}/refuse.conf && systemctl daemon-reload && systemctl restart nix-daemon"
         ),
     );
-    ask("refused");
+    ask("refused", false);
     let (rc, log) = outcome("refused", 300);
     assert_ne!(rc, "0", "refused succeeded: {log}");
     assert!(
@@ -125,7 +128,7 @@ fn refused_user() {
     );
 
     drop(refusing);
-    ask("fixed");
+    ask("fixed", false);
     let (rc, log) = outcome("fixed", 180);
     assert_eq!(rc, "0", "{log}");
 }
@@ -155,7 +158,7 @@ fn forkless() {
     succeed(Node::Hub, &format!("pkill -KILL -P {pid} || true"));
     let unrefused = "names no refusal of the hub.s user root: waiting";
     let waits = count(Node::Hub, "tribuchet-hub", unrefused);
-    ask("forkless");
+    ask("forkless", true);
     succeed(Node::Hub, "sleep 170");
     assert_ne!(
         run(Node::Hub, "test -e /tmp/forkless.rc").code,

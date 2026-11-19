@@ -2,10 +2,10 @@
 //! failures in a row of class c on request r that end the wait's
 //! attempts: a failure of another class, or at another request, starts
 //! it again, and so does a failure waited on, a drop the journal does
-//! not explain among them. The build fails, naming the cause, once
-//! run(c, r) reaches θ(c) for a fact about the hub; for a count (an unknown
-//! message, crashes) the clients whose Nix builds it are declined there and
-//! the others wait. Otherwise it waits, its clients told once,
+//! not explain among them. Once run(c, r) reaches θ(c), the clients whose
+//! Nix builds it are declined, and the others fail, naming the cause, for a
+//! fact about the hub (losses.rs `hub_cannot`), or wait, for a count (an
+//! unknown message, crashes). Otherwise it waits, its clients told once,
 //! and no wait is a loss of its worker, for every failure waiting can
 //! clear. θ is 1 for a refusal of the request, a handshake the hub
 //! cannot speak, and a new connection the daemon closes before the
@@ -229,9 +229,11 @@ impl<'a> DaemonWait<'a> {
     }
 
     /// The attempt that began at `began` (Unix seconds) failed at
-    /// `request` with `what`, which `failure` classes: fail the build
-    /// once the run reaches θ, else tell the clients, warn, and back off
-    /// before the next attempt, unless the build is given up meanwhile.
+    /// `request` with `what`, which `failure` classes: at θ, the hub's
+    /// verdict for a fact about the hub (Err), and for a count the clients
+    /// whose Nix builds it declined; then, short of a verdict, tell the
+    /// clients, warn, and back off before the next attempt, unless the
+    /// build is given up meanwhile.
     pub(in crate::hub) async fn failed(
         &mut self,
         failure: Failure,
