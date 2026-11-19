@@ -241,9 +241,9 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 .get(&key)
                 .cloned();
             if let Some(replay) = existing {
-                tracing::info!(key, "deduplicating build submission");
                 let sys = (req.system.as_str(), features.as_slice());
                 let client = self.state.shadow.submit(&key, sys, can_local);
+                tracing::info!(key, client = client.id, "deduplicating build submission");
                 break replay.subscribe_as(client).await;
             }
             let id = new_id();
@@ -262,6 +262,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
             };
             let sys = (req.system.as_str(), features.as_slice());
             let client = self.state.shadow.submit(&key, sys, can_local);
+            let first = client.id;
             let rx = replay.subscribe_as(client).await;
             let mut job = Job {
                 id,
@@ -281,6 +282,8 @@ impl attach_hub_server::AttachHub for AttachSvc {
             job.expected = self.state.placement.lock().unwrap().expect(&job);
             tracing::info!(
                 id = job.id,
+                key = job.key,
+                client = first,
                 system = job.req.system,
                 drv = drv_name(&job.req).unwrap_or_default(),
                 "queueing build"
