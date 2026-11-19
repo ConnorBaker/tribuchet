@@ -246,7 +246,7 @@ impl HubState {
             worker_caps: StdMutex::default(),
             next_worker_id: atomic::AtomicU64::default(),
             worker_grace,
-            started_at: Instant::now(),
+            started_at: tokio::time::Instant::now().into_std(),
             departed: StdMutex::default(),
             holding: StdMutex::default(),
             caps_changed: Notify::default(),
@@ -305,7 +305,7 @@ impl HubState {
     /// platform it served waits for it to reconnect rather than
     /// declining at once.
     pub(super) fn record_departed(&self, caps: WorkerCaps) {
-        let now = Instant::now();
+        let now = tokio::time::Instant::now().into_std();
         let mut departed = self.departed.lock().unwrap();
         // Prune here: expected_deadline() only runs for unservable
         // submissions, so a healthy fleet would otherwise accumulate
@@ -331,7 +331,7 @@ impl HubState {
     }
 
     fn expected_deadline(&self, system: &str, features: &[String]) -> Option<Instant> {
-        let now = Instant::now();
+        let now = tokio::time::Instant::now().into_std();
         // During the startup window no worker has re-registered yet, so
         // every platform is awaited; afterwards only one a worker served
         // until it dropped within the reconnect window (reload/crash).

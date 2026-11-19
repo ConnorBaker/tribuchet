@@ -88,7 +88,7 @@ impl Loss {
         workers: &HashMap<u64, WorkerCaps>,
         holding: &HashMap<u64, Holding>,
     ) -> bool {
-        Instant::now() < self.until && !self.back(workers, holding)
+        tokio::time::Instant::now().into_std() < self.until && !self.back(workers, holding)
     }
 
     /// Its worker is back. Taken fresh, the build is held by none: that
@@ -154,7 +154,7 @@ pub(super) async fn lost(
     job.loss = Some(Loss {
         worker,
         session,
-        until: Instant::now() + grace,
+        until: tokio::time::Instant::now().into_std() + grace,
         run,
     });
     Some(job)

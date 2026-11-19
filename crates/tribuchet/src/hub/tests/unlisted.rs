@@ -40,7 +40,7 @@ async fn a_resumed_build_its_worker_stops_listing_is_requeued() {
     assert!(
         lost.loss
             .as_ref()
-            .is_some_and(|r| r.until <= Instant::now())
+            .is_some_and(|r| r.until <= tokio::time::Instant::now().into_std())
     );
     drop(queue);
     w.hub.abort();

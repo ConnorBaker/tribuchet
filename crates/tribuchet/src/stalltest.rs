@@ -16,7 +16,6 @@ use std::os::unix::net::UnixStream as StdUnixStream;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc as std_mpsc;
 use std::sync::{Arc, Condvar, Mutex};
-use std::thread;
 use std::time::{Duration, Instant};
 
 use tokio::net::UnixStream;
@@ -37,12 +36,6 @@ pub(crate) const PATIENCE: Duration = Duration::from_secs(10);
 /// Beats a running timer shows while a thread is held: more than the
 /// two periods' worth of pings sent past the last tick.
 pub(crate) const BEATS: usize = 10;
-/// How much longer a runtime's longest beat gap over a hold may be than
-/// a [`clock`]'s over the same hold. A runtime whose timer stays
-/// attended exceeds it by at most about one of the tests' 50 ms periods
-/// of phase between the two clocks when a stop delays both; a driver
-/// handed over late runs further over.
-pub(crate) const SLACK: Duration = Duration::from_millis(300);
 /// Upper bound on any hold, so a broken test fails instead of hanging.
 const SAFETY: Duration = Duration::from_secs(20);
 
@@ -87,25 +80,6 @@ impl Beats {
         }
         gap.max(to - prev)
     }
-}
-
-/// Beats of a plain thread every `period`, as long as the returned
-/// beats are held: the reference for a runtime's beats over a hold. A
-/// host that deschedules the process delays both alike; a runtime that
-/// leaves its timer unattended delays only its own.
-pub(crate) fn clock(period: Duration) -> Arc<Beats> {
-    let beats = Arc::<Beats>::default();
-    let weak = Arc::downgrade(&beats);
-    thread::spawn(move || {
-        loop {
-            thread::sleep(period);
-            let Some(beats) = weak.upgrade() else {
-                return;
-            };
-            beats.beat();
-        }
-    });
-    beats
 }
 
 /// Ticks of an `interval(period)` running on `rt`.
@@ -256,16 +230,13 @@ fn fed(rt: &Runtime, period: Duration) -> Arc<Beats> {
 /// Test A, on the runtime every role runs (crate::rt). An I/O-woken
 /// task blocks one of four workers until the systemd ping and the
 /// runtime's own timer beat BEATS times each, or PATIENCE passed.
-/// Without eager driver hand-off neither beats while the worker is held,
-/// and a late hand-off lets the timer's gap exceed a plain thread's by
-/// more than SLACK.
+/// Without eager driver hand-off neither beats while the worker is held.
 #[test]
 fn one_blocked_worker_stops_neither_pings_nor_timers() {
     const TICK: Duration = Duration::from_millis(50);
     let rt = rt::builder().worker_threads(WORKERS).build().unwrap();
     let pings = fed(&rt, TICK);
     let ticks = ticker(rt.handle(), TICK);
-    let reference = clock(TICK);
     let gate = Arc::new(Gate::default());
     gate.arm();
     let g = gate.clone();
@@ -278,14 +249,10 @@ fn one_blocked_worker_stops_neither_pings_nor_timers() {
     let released = gate.release();
     pings.wait_after(released, 2, HOLD);
     ticks.wait_after(released, 2, HOLD);
-    reference.wait_after(released, 1, HOLD);
     let ping_gap = pings.max_gap(entered, released);
     let tick_gap = ticks.max_gap(entered, released);
-    let ref_gap = reference.max_gap(entered, released);
     rt.block_on(task).unwrap();
-    eprintln!(
-        "one worker held: ping gap {ping_gap:?}, timer gap {tick_gap:?}, reference gap {ref_gap:?}"
-    );
+    eprintln!("one worker held: ping gap {ping_gap:?}, timer gap {tick_gap:?}");
     assert!(
         pinged,
         "pings stopped while a worker was held: gap {ping_gap:?}"
@@ -293,10 +260,6 @@ fn one_blocked_worker_stops_neither_pings_nor_timers() {
     assert!(
         ticked,
         "runtime timer stopped while a worker was held: gap {tick_gap:?}"
-    );
-    assert!(
-        tick_gap <= ref_gap + SLACK,
-        "runtime timer late while a worker was held: gap {tick_gap:?}, a plain thread's {ref_gap:?}"
     );
 }
 

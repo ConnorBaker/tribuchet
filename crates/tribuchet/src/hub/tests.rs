@@ -271,7 +271,7 @@ async fn build_is_released_when_its_worker_returns_without_it() {
 /// No worker returns and none other serves the system: the build is
 /// held, not failed, and its client is told it waits. A capable
 /// worker that registers later gets it.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn client_waits_when_no_worker_returns() {
     let mut state = Arc::new(HubState::for_test(Duration::from_millis(200)));
     Arc::get_mut(&mut state).unwrap().started_at =
@@ -279,7 +279,7 @@ async fn client_waits_when_no_worker_returns() {
     let replay = Arc::new(Replay::default());
     let mut client = replay.subscribe().await;
     let worker = register(&state, "w1", &[]);
-    let lost = Instant::now();
+    let lost = tokio::time::Instant::now();
     lose_session(&state, job(1, replay), worker, None).await;
     let told = tokio::time::timeout(Duration::from_secs(5), async {
         while let Some(Ok(AttachEvent { event: Some(e) })) = client.recv().await {
