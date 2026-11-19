@@ -226,23 +226,24 @@ const SCENARIOS: &[&str] = &[
     "has | assign:old open running cancel:old cancelled:old | adopt running k, kill running k, cleanup finished k, other finished k",
     // Its agent no longer has it: dropped, its state, then its key, then
     // its dir: not after 7 s, nor its key first; its agent handed back.
-    "lost | fill assign:old open gone idle removed | adopt running k",
+    "lost | assign:old open gone idle removed | adopt running k",
     // ... its agent handed back while its log replay waits on a session
-    // that takes nothing; a cancel then leaves no flag, nor does the
-    // replay keep its state (which fails its removal: "directory not
-    // empty").
-    "lost cap1 | fill log:1638400 assign:old open gone idle cancel:old drain:old removed noflag | adopt running k",
+    // that takes nothing; a cancel then leaves no flag, and its dir stays
+    // until the replay stops (one removed meanwhile could fail: "directory
+    // not empty").
+    "lost cap1 | log:1638400 assign:old open gone idle cancel:old dir drain:old removed noflag | adopt running k",
     // Its state.json staying: killed if its agent has it, its key kept, no takeover.
     "has | assign:old cancel:old cancelled:old jam open killed idle running cancel:old refused:new noflag unjam | adopt running k, kill running k, cleanup running k, other running k",
     "lost | assign:old jam open idle running cancel:old refused:new noflag unjam | adopt running k",
     // Cancelled and its agent without it: its key goes after its state,
-    // and its teardown leaves a new run of the key alone.
-    "lost | fill assign:old cancel:old open gone dir anew idle removed running | adopt running k",
+    // and its teardown (held by its log replay until the session drains)
+    // leaves a new run of the key alone.
+    "lost cap1 | assign:old cancel:old cancelled:old log:1638400 replayed:8192 open gone dir anew idle drain:old removed running | adopt running k",
     // ... while its log replay waits on a session that takes nothing, its
     // agent is handed back and its state goes, not after the drain, and the
     // replay is stopped before its dir goes, not left to write an offset
     // there meanwhile ("directory not empty").
-    "lost cap1 | fill assign:old cancel:old cancelled:old log:1638400 replayed:8192 open gone idle unrecorded drain:old removed stopped:old | adopt running k",
+    "lost cap1 | assign:old cancel:old cancelled:old log:1638400 replayed:8192 open gone idle unrecorded drain:old removed stopped:old | adopt running k",
 ];
 
 /// Each held build's scenario, all at once (each waits on its agent).
@@ -325,7 +326,6 @@ fn run(row: &str) -> Result<()> {
             "unrecorded" => until(&format!("{step}: {row}"), || {
                 !build.join("state.json").exists()
             }),
-            "fill" => fill(build, "top/build")?,
             "jam" => fs::set_permissions(build, fs::Permissions::from_mode(0o500))?,
             "unjam" => fs::set_permissions(build, fs::Permissions::from_mode(0o700))?,
             // The run logs n bytes; until n were replayed; session s takes
