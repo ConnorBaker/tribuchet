@@ -29,7 +29,10 @@ use crate::proto::{
     worker_message,
 };
 
+mod caps;
+use caps::CapsGuard;
 mod chunkcache;
+mod known;
 mod link;
 #[cfg(test)]
 pub(crate) use chunkcache::ChunkCache;
@@ -76,36 +79,6 @@ struct WorkerSvc {
     state: Arc<HubState>,
     auth: Arc<PeerAuth>,
     pending: Pending,
-}
-
-/// Registers the worker's capabilities while alive; removes them on
-/// drop so admission control tracks actual capacity.
-struct CapsGuard {
-    state: Arc<HubState>,
-    id: u64,
-    caps: WorkerCaps,
-}
-
-impl CapsGuard {
-    fn new(state: Arc<HubState>, caps: WorkerCaps) -> Self {
-        let id = state.next_worker_id.fetch_add(1, Ordering::Relaxed);
-        state.worker_caps.lock().unwrap().insert(id, caps.clone());
-        // Wake submissions waiting for a capable worker to appear.
-        state.caps_changed.notify_waiters();
-        state.regen_nix_config();
-        Self { state, id, caps }
-    }
-}
-
-impl Drop for CapsGuard {
-    fn drop(&mut self) {
-        self.state.worker_caps.lock().unwrap().remove(&self.id);
-        self.state.holding.lock().unwrap().remove(&self.id);
-        self.state.regen_nix_config();
-        // Remember the platform so a build for it briefly waits for the
-        // worker to reconnect instead of declining immediately.
-        self.state.record_departed(self.caps.clone());
-    }
 }
 
 /// What a build's Inbox is fed by: control, never waited on, and output

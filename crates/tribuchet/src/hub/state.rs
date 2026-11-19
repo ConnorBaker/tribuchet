@@ -12,6 +12,7 @@ use tokio::sync::{Mutex, Notify, mpsc, watch};
 use tonic::Status;
 
 use super::chunkcache::ChunkCache;
+use super::known::Known;
 use super::losses::{self, Loss};
 use super::metrics::Metrics;
 use super::placement::{Expected, Placement};
@@ -25,6 +26,8 @@ use crate::proto::{AttachEvent, BuildRequest, attach_event};
 
 #[path = "state/clientless.rs"]
 mod clientless;
+#[path = "state/hold.rs"]
+mod hold;
 #[path = "state/inflight.rs"]
 mod inflight;
 #[path = "state/replay.rs"]
@@ -165,6 +168,8 @@ pub(super) struct HubState {
     pub(super) runs: Runs,
     /// The semantic core beside the hub, logging where they differ.
     pub(super) shadow: Arc<Shadow>,
+    /// Every worker that registered, across restarts (L11).
+    pub(super) known: Known,
 }
 
 #[derive(Clone)]
@@ -254,6 +259,7 @@ impl HubState {
             placement: StdMutex::default(),
             runs: Runs::default(),
             shadow: Arc::default(),
+            known: Known::default(),
         }
     }
 
@@ -360,82 +366,9 @@ impl HubState {
         self.hold_unservable().await;
     }
 
-    /// Hold queued jobs no connected worker serves, telling their
-    /// clients, and re-run when the latest expected worker is due.
-    pub(super) async fn hold_unservable(self: &Arc<Self>) {
-        let Some(mut due) = self.hold_unservable_now().await else {
-            return;
-        };
-        let state = self.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep_until((due + Duration::from_secs(1)).into()).await;
-                match state.hold_unservable_now().await {
-                    Some(next) => due = next,
-                    None => break,
-                }
-            }
-        });
-    }
-
     pub(super) async fn finish(&self, job: &Job) {
         job.unlist();
         job.replay.finish().await;
-    }
-
-    /// Returns the latest deadline a queued job is still waiting for.
-    /// A job no worker is expected for stays queued until one
-    /// registers: its build is not the failure. Its client leaving
-    /// drops it, as at any other point in the queue.
-    async fn hold_unservable_now(&self) -> Option<Instant> {
-        let mut due: Option<Instant> = None;
-        let mut unservable = Vec::new();
-        for j in self.queue.lock().await.iter() {
-            match self.servability(&j.req.system, &j.features) {
-                Servability::Now => {}
-                Servability::ExpectedBy(at) => due = Some(due.map_or(at, |d| d.max(at))),
-                Servability::Never => unservable.push((
-                    j.id.clone(),
-                    j.replay.clone(),
-                    j.req.system.clone(),
-                    j.features.join(","),
-                )),
-            }
-        }
-        // Outside the queue lock: both wait on the job's replay.
-        let mut abandoned = HashSet::new();
-        for (id, replay, system, features) in unservable {
-            if !replay.has_subscribers().await {
-                abandoned.insert(id);
-                continue;
-            }
-            let note = format!(
-                "tribuchet: no connected worker builds {system} [{features}]; waiting for one\n"
-            );
-            if replay.tell_waiting(Wait::Worker, note).await {
-                tracing::warn!(
-                    id,
-                    system,
-                    features,
-                    "holding queued build: no capable worker"
-                );
-            }
-        }
-        if !abandoned.is_empty() {
-            let gone: Vec<Job> = {
-                let mut queue = self.queue.lock().await;
-                let (gone, kept) = queue
-                    .drain(..)
-                    .partition::<VecDeque<Job>, _>(|j| abandoned.contains(&j.id));
-                *queue = kept;
-                gone.into()
-            };
-            for job in gone {
-                tracing::info!(id = job.id, "dropping queued build: no client attached");
-                self.finish(&job).await;
-            }
-        }
-        due
     }
 }
 

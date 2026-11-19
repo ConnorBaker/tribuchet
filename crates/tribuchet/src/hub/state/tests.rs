@@ -6,6 +6,8 @@ use harmonia_store_remote::{ConnectionPool, PoolConfig};
 use rustix::fs::{CWD, FileType, Mode, mknodat};
 
 use super::*;
+use crate::hub::shadow::Client;
+use crate::proto::DECLINE_EXIT_CODE;
 
 impl HubState {
     /// No nix-daemon listens on its socket, whether or not the host
@@ -43,10 +45,63 @@ pub(super) fn queued(system: &str, replay: Arc<Replay>) -> Job {
     }
 }
 
+/// A hub, past its startup grace with no worker connected, that knows a
+/// worker for x86_64-linux iff `known`.
+pub(super) fn hub_knowing(known: bool) -> Arc<HubState> {
+    let state = HubState::for_test(Duration::ZERO);
+    if known {
+        state.known.learn(&WorkerCaps {
+            name: "away".into(),
+            connected_at: Instant::now(),
+            systems: [("x86_64-linux".to_owned(), HashSet::new())].into(),
+            max_jobs: 1,
+        });
+    }
+    Arc::new(state)
+}
+
+/// A queued build no connected worker serves, none expected back, waits
+/// while a known worker serves it, its clients told why. Else it ends,
+/// each client answered as a new one would be (L11′): declined if its Nix
+/// builds the key, refused if not.
+#[tokio::test]
+async fn a_queued_build_no_worker_serves_is_answered_per_client() {
+    for (local, known) in [
+        (vec![true, false], true),
+        (vec![true, false], false),
+        (vec![true], false),
+        (vec![false], false),
+    ] {
+        let held = known;
+        let state = hub_knowing(known);
+        let replay = Arc::new(Replay::default());
+        let mut rxs = Vec::new();
+        for l in &local {
+            rxs.push((*l, replay.subscribe_as(Client::untracked(*l)).await));
+        }
+        let job = queued("x86_64-linux", replay.clone());
+        state.queue.lock().await.push_back(job);
+        state.hold_unservable().await;
+        let row = (&local, known);
+        assert_eq!(state.queue.lock().await.len(), usize::from(held), "{row:?}");
+        for (l, mut rx) in rxs {
+            let ev = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await;
+            let ev = ev.unwrap().unwrap().unwrap().event.unwrap();
+            let (said, want) = match &ev {
+                attach_event::Event::ExitCode(c) => (*c == DECLINE_EXIT_CODE, l && !known),
+                attach_event::Event::Log(note) => (note.ends_with(b"waiting for one\n"), held),
+                attach_event::Event::Error(e) => (e.contains("x86_64-linux"), !l && !known),
+                ev => panic!("{row:?}: {ev:?}"),
+            };
+            assert!(said && want, "{row:?}, canLocal {l}: {ev:?}");
+        }
+    }
+}
+
 /// A held job whose client left is dropped, as anywhere in the queue.
 #[tokio::test]
 async fn held_job_is_dropped_once_its_client_leaves() {
-    let state = Arc::new(HubState::for_test(Duration::ZERO));
+    let state = hub_knowing(true);
     let replay = Arc::new(Replay::default());
     let rx = replay.subscribe().await;
     state
@@ -66,7 +121,7 @@ async fn held_job_is_dropped_once_its_client_leaves() {
 /// for as long as no worker serves it.
 #[tokio::test]
 async fn a_requeued_job_leaves_its_last_outputs_to_the_cache() {
-    let state = Arc::new(HubState::for_test(Duration::ZERO));
+    let state = hub_knowing(true);
     let replay = Arc::new(Replay::default());
     let _rx = replay.subscribe().await;
     let out = "/nix/store/00000000000000000000000000000000-out".to_owned();
