@@ -25,6 +25,12 @@ use sandbox_proto::framing;
 
 use crate::errors::{Result, err_ctx, err_msg};
 use crate::sockpath;
+use std::time::Duration;
+
+/// How long the worker waits on an agent call it bounds (Adopt, Status,
+/// Shutdown): a worker starting up does not wait on a stopped agent
+/// (unbounded, startup stayed unregistered 30.4 s and 71.4 s in VM runs).
+pub(super) const AGENT_ANSWER: Duration = Duration::from_secs(7);
 
 /// SBPL string literal escaping: a quote or backslash in an
 /// interpolated path must not terminate the literal and inject
@@ -157,6 +163,9 @@ pub(super) struct AgentBuild {
     conn: UnixStream,
     pub(super) pid: i32,
     pub(super) scratch_dir: PathBuf,
+    /// The build's cgroup.freeze, write-only, where it has a cgroup: the
+    /// arbiter's to freeze and thaw it with while the lease lasts.
+    pub(super) freeze: Option<fs::File>,
 }
 
 impl AgentBuild {
@@ -174,7 +183,7 @@ impl AgentBuild {
             call::Call::Start(Box::new(req.clone())),
             &[tmp_pack.as_raw_fd(), log.as_raw_fd()],
         )?;
-        let (reply, _fds) = framing::recv_reply(&conn)?;
+        let (reply, fds) = framing::recv_reply(&conn)?;
         let reply::Reply::Start(reply) = reply else {
             return Err(err_msg(format!("unexpected agent reply {reply:?}")));
         };
@@ -182,11 +191,13 @@ impl AgentBuild {
             conn,
             pid: reply.pid,
             scratch_dir: PathBuf::from(reply.scratch_dir),
+            freeze: fds.into_iter().next().map(fs::File::from),
         })
     }
 
     /// Reattach to a build a previous worker generation started.
     /// Returns the build plus its exit code if it already finished.
+    /// unreachable.
     pub(super) fn adopt(socket: &Path, build_id: &str) -> Result<(Self, Option<i32>)> {
         let conn = connect(socket)?;
         framing::send_call(
@@ -196,7 +207,7 @@ impl AgentBuild {
             }),
             &[],
         )?;
-        let (reply, _fds) = framing::recv_reply(&conn)?;
+        let (reply, fds) = framing::recv_reply(&conn)?;
         let reply::Reply::Adopt(reply) = reply else {
             return Err(err_msg(format!("unexpected agent reply {reply:?}")));
         };
@@ -204,6 +215,7 @@ impl AgentBuild {
             conn,
             pid: reply.pid,
             scratch_dir: PathBuf::from(reply.scratch_dir),
+            freeze: fds.into_iter().next().map(fs::File::from),
         };
         Ok((build, reply.exit_code))
     }

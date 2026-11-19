@@ -143,9 +143,14 @@ in
         type = lib.types.bool;
         default = true;
         description = ''
-          Patch Nix so uid-range derivations reach the external builder
-          and so a declined build (no worker for the system) falls back
-          to a local build instead of failing.
+          Patch Nix so uid-range derivations reach the external builder,
+          so a declined build (no worker for the system) falls back to a
+          local build instead of failing, and so a build's `timeout` and
+          `max-silent-time` reach the worker, which counts only running
+          time toward them. Set false, `nixPackage` must carry all three
+          patches (nix/patches) itself: without the timeouts one, Nix
+          counts a build's timeouts by the wall clock from its start, and
+          so kills builds the CPU arbiter froze for time they did not run.
         '';
       };
       recursiveNix = lib.mkOption {
@@ -237,6 +242,7 @@ in
             lib.optionals hub.externalBuilders.patchNix [
               ./patches/external-builders-uid-range.patch
               ./patches/external-builders-decline-fallback.patch
+              ./patches/external-builders-timeouts.patch
             ]
             ++ lib.optional hub.externalBuilders.recursiveNix ./patches/recursive-nix-external-builders.patch;
         in

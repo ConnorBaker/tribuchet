@@ -103,9 +103,18 @@ async fn read_submission(
     }
 }
 
-/// Hash of the whole request plus the tmp dir pack. prost maps are
-/// BTreeMaps, so the encoding is deterministic.
+/// Hash of the whole request but its client's limits, plus the tmp dir
+/// pack. prost maps are BTreeMaps, so the encoding is deterministic.
 pub(super) fn dedupe_key(req: &BuildRequest, tmp_dir_pack: &[u8]) -> String {
+    // The build, not its client's limits: a client asking other limits joins
+    // the build in flight, which keeps those of the request that dispatched
+    // it, as Nix's own path locks do. Zero fields are not encoded, so keys
+    // are those from before the limits were sent.
+    let req = BuildRequest {
+        timeout_secs: 0,
+        max_silent_secs: 0,
+        ..req.clone()
+    };
     let mut h = Sha256::new();
     let buf = req.encode_to_vec();
     h.update((buf.len() as u64).to_le_bytes());
@@ -275,9 +284,7 @@ mod tests {
             input_paths: vec![format!("/nix/store/{H}-dep")],
             tmp_dir_in_sandbox: "/build".into(),
             store_dir: "/nix/store".into(),
-            fixed_output: false,
-            required_features: vec![],
-            local_networking: false,
+            ..Default::default()
         }
     }
 
@@ -337,6 +344,12 @@ mod tests {
         req.env.insert("X".into(), "1".into());
         assert_ne!(a, dedupe_key(&req, b""));
         assert_ne!(a, dedupe_key(&base_request(), b"other .attrs.sh"));
+        let req = BuildRequest {
+            timeout_secs: 600,
+            max_silent_secs: 60,
+            ..base_request()
+        };
+        assert_eq!(a, dedupe_key(&req, b""));
     }
 
     /// A hub with one x86_64-linux worker registered.

@@ -241,6 +241,43 @@ clients are told once (`hub/relay/daemon.rs`):
 | a request the daemon drops as its journal says a worker crashed | 3 |
 | anything else: a drop or close with no such word in the journal, no answer within a minute, a silent daemon's included | ∞ |
 
+## CPU arbitration
+
+The worker's CPU arbiter (`worker/arbiter.rs`) is always on; nothing
+turns it off: where parallel builds each fill every CPU, it finishes
+the leader, and the builds on average, earlier, on less CPU. While the
+oldest parallel build (by its start, persisted with it, so the same
+after a worker restart; ties by key) keeps every CPU busy, the other
+parallel builds are frozen. A frozen build is thawed at the first
+200 ms sample at which the leader leaves a CPU spare or has ended, when
+the memory rule below needs the room, when its lease ends, or when the
+freeze is not reached within 5 s; nothing bounds how long it may stay
+frozen otherwise. An earlier bound (no build frozen more than 10 s in
+any 30 s, so that a follower ran at least two thirds of the time) is
+not kept, by decision of 2026-11-07. Measured on synthetic workloads
+before it was added (2026-10-27), arbitration finished builds 7.1-8.2%
+earlier on average and the oldest 33-34% earlier; re-measured with it,
+the mean gain was gone and the oldest finished 18-21% earlier, and a
+later run with it on a 4-vCPU mix of small builds found no measurable
+benefit, a harness that could not test oversubscription. The workloads
+differed between those runs, so how much of the loss was the bound's
+is not cleanly attributed. Builds stay frozen only while
+what they pin together (each its memory.current less its page cache;
+swap is no room) fits each capped cgroup's headroom and the host's
+MemAvailable (`worker/arbiter/memory.rs`). The worker freezes and thaws
+a build only through the write-only handle on its cgroup.freeze that
+the build's agent hands over with the lease; the file is the agent's
+(mode 0644), so neither the worker nor any build can open it to write.
+The agent thaws its build when the lease ends, however the worker ended
+it, and the worker unit's ExecStopPost thaws every build as root once
+the worker has exited, should an agent not. Frozen time, by the
+cgroup's own count, counts toward neither `build-timeout-secs` nor
+`max-silent-time-secs`, nor a client's `timeout` and `max-silent-time`,
+which reach the worker through Nix's build.json (patched Nix) and the
+hub, the lesser of the two applying.
+A kernel without that count (`frozen_usec`, before Linux 6.18) is
+reported at start, and nothing is frozen there.
+
 ## Known limitations (MVP)
 
 * Workers run up to `max-jobs` concurrent builds over one session.
@@ -262,6 +299,31 @@ clients are told once (`hub/relay/daemon.rs`):
   stays connected but reads nothing keeps its stream until it exits.
 * An output delivery fails its build when the hub's chunk cache cannot
   store or read back a chunk of it.
+* A freeze still counts against wall-clock timers the worker does not
+  own. A build's own (test drivers, watchdogs): one whose tests time
+  out by the wall clock fails if it is frozen longer than their slack.
+  A frozen fixed-output build's connections: the remote side's send or
+  idle timeout, and presto-pasta's reclaim of a flow with no traffic
+  either way for 3 min (a stalled transfer keeps its flow alive with
+  zero-window probes, so the remote's send timeout is the likelier
+  end). A Nix client's `timeout` and `max-silent-time` where Nix is
+  not patched to leave them to the external builder: such a client
+  counts both by the wall clock, and a frozen build writes no log, so
+  its max-silent-time can end the attach during a freeze, and the
+  clientless rule may then give the build up. Each build's frozen time
+  is recorded with its exit code (`frozen_ms` and `exit_code` on the
+  hub's `build usage` line), so the failure rate of frozen builds is
+  measured on the farm.
+* With no bound on frozen time, a follower waits on the parallel
+  builds older than it. A leader that hangs while spinning on every
+  CPU holds every younger parallel build on its worker frozen until
+  its own running-time timeout ends it (`build-timeout-secs`, 24 h by
+  default, or its client's lesser one); the next oldest then leads. The
+  wait is bounded, since a build started later never leads over an
+  older one, but can reach that timeout once for each older parallel
+  build.
+* The frozen builds' memory rule is a margin, not a bound: a leader that
+  grows faster than one 200 ms sample can still fill a capped slice.
 * Dedupe attaches duplicates to the first attempt, so a transient
   failure propagates to all attached submitters (same as Buck2's RE
   dedupe behaviour).

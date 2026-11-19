@@ -383,6 +383,7 @@ in
         "TT_SSH_CONFIG": "${pkgs.systemd}/lib/systemd/ssh_config.d/20-systemd-ssh-proxy.conf",
         "TT_HUB_SOCK": str(hub.vsock_host),
         "TT_WORKER_SOCK": str(worker.vsock_host),
+        "TT_SHARED": str(hub.shared_dir),
         "TT_BASH": "${pkgs.bash}",
     })
     e2e = "${tribuchet.e2eTests}/bin/tribuchet-e2e"

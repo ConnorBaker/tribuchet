@@ -21,8 +21,10 @@
 // struct's `timed_out` field reads naturally despite the lint.
 #![allow(clippy::too_many_lines, clippy::struct_field_names)]
 
+mod arbiter;
 mod daemon;
 mod harness;
+mod pairs;
 
 use std::time::Instant;
 

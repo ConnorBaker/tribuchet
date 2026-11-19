@@ -66,6 +66,8 @@ pub(super) async fn run_job(
             inputs,
             required_features: job.features.clone(),
             local_networking: req.local_networking,
+            timeout_secs: req.timeout_secs,
+            max_silent_secs: req.max_silent_secs,
         }),
     )
     .await?;
@@ -134,6 +136,7 @@ pub(super) async fn run_job(
                         cpu_usec = u.cpu_usec,
                         peak_memory_bytes = u.peak_memory_bytes,
                         oom_killed = u.oom_killed,
+                        frozen_ms = u.frozen_ms,
                         "build usage"
                     );
                 }

@@ -217,7 +217,15 @@ pub(super) struct ResumeState {
     /// Agent-side pid of the builder (Linux: its setup stage).
     pub(super) pid: i32,
     pub(super) spec: sandbox::SandboxSpec,
+    /// When its builder started, Unix seconds, by which the arbiter's
+    /// oldest build leads; absent from a state persisted before it, 0.
+    #[serde(default)]
+    pub(super) started_unix: u64,
     pub(super) deadline_unix: u64,
+    /// The client's max-silent-time (BuildAssignment's); absent from a
+    /// state persisted before it, 0.
+    #[serde(default)]
+    pub(super) max_silent_secs: u64,
     /// Socket of the agent that owns the build, for re-adoption.
     pub(super) agent_socket: PathBuf,
 }
@@ -261,6 +269,7 @@ mod tests {
             cpu_usec: 2_000_000,
             peak_memory_bytes: 1 << 30,
             oom_killed: true,
+            ..Default::default()
         };
         let st = BuildState::Finished {
             dedupe_key: "k".into(),
@@ -289,6 +298,8 @@ mod tests {
             spec: sandbox::SandboxSpec::default(),
             deadline_unix: 7,
             agent_socket: PathBuf::from("/run/agent.sock"),
+            started_unix: 0,
+            max_silent_secs: 0,
         };
         st.persist(dir.path()).unwrap();
         let json = fs::read_to_string(dir.path().join("state.json")).unwrap();
