@@ -95,8 +95,6 @@ pub enum Event {
         run: Run,
     },
     /// The operator retires `worker` (U4); suspecting it is the policy's.
-    /// The hub has no such command yet.
-    #[cfg(test)]
     Decommission {
         worker: Worker,
     },
@@ -354,9 +352,12 @@ pub fn step(hub: &mut Hub, ev: Event) -> Vec<Command> {
                 hub.leave(key, client);
             }
         }
+        // Only to clients whose Nix cannot build the key: one that can is
+        // deferred first (§2, policy order).
         Event::Refuse { key } => {
             if let Some(b) = hub.builds.get(&key)
                 && !hub.workers.values().any(|s| s.contains(&b.sys))
+                && !b.clients.values().any(|&can_local| can_local)
             {
                 hub.answer(key, Answer::Refuse, None, &mut out);
             }
@@ -377,7 +378,6 @@ pub fn step(hub: &mut Hub, ev: Event) -> Vec<Command> {
                 hub.drop_run(run, &mut out);
             }
         }
-        #[cfg(test)]
         Event::Decommission { worker } => _ = hub.workers.remove(&worker),
     }
     out

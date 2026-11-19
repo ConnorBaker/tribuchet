@@ -236,6 +236,7 @@ async fn a_resume_keeps_the_run_and_the_absence() {
         session: 1,
         until,
         run: losses::Run::Started,
+        charged: false,
     });
     let _again = state.list_dispatch(&j, 2);
     let resumed = state.dispatched.lock().unwrap()[&j.id].started;

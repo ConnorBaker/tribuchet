@@ -17,7 +17,9 @@ use rustix::process::umask;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 
+use super::admin::AdminSvc;
 use super::chunkcache::ChunkCache;
+use super::known::Known;
 use super::metrics;
 use super::record;
 use super::runs::Runs;
@@ -28,7 +30,7 @@ use crate::config::{Auth, HubConfig, default_chunk_cache_dir, default_record};
 use crate::errors::{Result, chain, err_ctx, err_msg};
 use crate::fsutil::io_ctx;
 use crate::proto::worker_hub_server::WorkerHubServer;
-use crate::proto::{MAX_MSG_SIZE, attach_hub_server};
+use crate::proto::{MAX_MSG_SIZE, attach_hub_server, hub_admin_server};
 use crate::{chunkio, rt, sd};
 
 /// Bind the attach socket ourselves (no socket activation).
@@ -147,9 +149,10 @@ async fn run_async(cfg: HubConfig) -> Result<()> {
         chunks,
     );
     // The record is folded into the history before the hub serves. The run
-    // epoch is kept beside it: both are the hub's state.
+    // epoch and the known workers are kept beside it: all are the hub's state.
     let path = cfg.placement.record.clone().unwrap_or_else(default_record);
     state.runs = Runs::open(&path.with_file_name("run-epoch"));
+    state.known = Known::open(&path.with_file_name("known-workers"));
     let state = Arc::new(state);
     let opened = tokio::task::spawn_blocking(move || record::open(&path))
         .await
@@ -215,6 +218,9 @@ async fn run_async(cfg: HubConfig) -> Result<()> {
             .max_decoding_message_size(MAX_MSG_SIZE)
             .max_encoding_message_size(MAX_MSG_SIZE),
         )
+        .add_service(hub_admin_server::HubAdminServer::new(AdminSvc {
+            state: state.clone(),
+        }))
         .serve_with_incoming(UnixListenerStream::new(uds));
 
     if let Some(metrics_addr) = cfg.metrics_listen.clone() {

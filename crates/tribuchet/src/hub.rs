@@ -29,7 +29,12 @@ use crate::proto::{
     worker_message,
 };
 
+mod admin;
+pub use admin::decommission;
+mod caps;
+use caps::CapsGuard;
 mod chunkcache;
+mod known;
 mod link;
 #[cfg(test)]
 pub(crate) use chunkcache::ChunkCache;
@@ -76,36 +81,6 @@ struct WorkerSvc {
     state: Arc<HubState>,
     auth: Arc<PeerAuth>,
     pending: Pending,
-}
-
-/// Registers the worker's capabilities while alive; removes them on
-/// drop so admission control tracks actual capacity.
-struct CapsGuard {
-    state: Arc<HubState>,
-    id: u64,
-    caps: WorkerCaps,
-}
-
-impl CapsGuard {
-    fn new(state: Arc<HubState>, caps: WorkerCaps) -> Self {
-        let id = state.next_worker_id.fetch_add(1, Ordering::Relaxed);
-        state.worker_caps.lock().unwrap().insert(id, caps.clone());
-        // Wake submissions waiting for a capable worker to appear.
-        state.caps_changed.notify_waiters();
-        state.regen_nix_config();
-        Self { state, id, caps }
-    }
-}
-
-impl Drop for CapsGuard {
-    fn drop(&mut self) {
-        self.state.worker_caps.lock().unwrap().remove(&self.id);
-        self.state.holding.lock().unwrap().remove(&self.id);
-        self.state.regen_nix_config();
-        // Remember the platform so a build for it briefly waits for the
-        // worker to reconnect instead of declining immediately.
-        self.state.record_departed(self.caps.clone());
-    }
 }
 
 /// What a build's Inbox is fed by: control, never waited on, and output
@@ -551,13 +526,11 @@ async fn supervise_job(
         // key runs it already: cancel that.
         let _ = cancel(&out_tx, &job).await;
         if job.replay.has_subscribers().await {
-            tracing::warn!(id = job.id, "build failed before dispatch: {err}");
-            Metrics::inc(&state.metrics.failed);
-            job.fail(&state, "before dispatch", None, err).await;
+            losses::hub_cannot(&state, job, ("before dispatch", None), err).await;
         } else {
             tracing::info!(id = job.id, "dropping build before dispatch: {err}");
+            state.finish(&job).await;
         }
-        state.finish(&job).await;
         return;
     }
     // A dead session is no build verdict: requeue so this worker (by
@@ -571,14 +544,11 @@ async fn supervise_job(
         Metrics::inc(&state.metrics.requeued);
         state.requeue(job).await;
     } else {
-        tracing::warn!(id = job.id, "build failed: {err}");
-        Metrics::inc(&state.metrics.failed);
         // The session is still up and may hold a half-staged or
         // running build for this id. Cancel frees that slot.
         let _ = cancel(&out_tx, &job).await;
-        job.fail(&state, "hub-side error", dispatch.run.as_ref(), err)
-            .await;
-        state.finish(&job).await;
+        let at = ("hub-side error", dispatch.run.as_ref());
+        losses::hub_cannot(&state, job, at, err).await;
     }
 }
 

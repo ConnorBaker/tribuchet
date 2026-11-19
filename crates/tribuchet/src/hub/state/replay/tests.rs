@@ -8,12 +8,14 @@ use super::*;
 use crate::chunkstore::io_hook;
 use crate::hub::model;
 use crate::hub::state::HubState;
+use crate::hub::state::queue_tests::hub_knowing;
 use crate::hub::tests::job;
 use Step::{
     Attach, Corrupt, Exit0, Exit1, Fill, Finish, Keep, Log, Out, Read1, ReadAll, Requeue, Tick,
     Wait,
 };
 
+mod hold;
 mod laws;
 mod schedules;
 
@@ -29,6 +31,117 @@ impl Replay {
     pub(in crate::hub) fn id(&self) -> &str {
         &self.id
     }
+}
+
+/// A declined client (SEMANTICS-7 L12) is sent the log up to its decline,
+/// the restart of an output it had part of included, so its Nix finds no
+/// half-written output, then exit 222, and nothing after; a client whose
+/// Nix cannot build the key reads on.
+#[tokio::test(start_paused = true)]
+async fn a_declined_client_drops_its_partial_outputs_and_others_read_on() {
+    let replay = Arc::new(Replay::default());
+    let mut local = replay.subscribe_as(Client::untracked(true)).await;
+    let mut remote = replay.subscribe_as(Client::untracked(false)).await;
+    let path = "/nix/store/o".to_owned();
+    let chunk = OutputNar {
+        store_path: path.clone(),
+        zstd_nar_chunk: vec![1],
+        eof: false,
+    };
+    let output = attach_event::Event::Output(chunk);
+    replay.publish(output.clone()).await;
+    let next = |rx: &mut mpsc::Receiver<_>| {
+        rx.try_recv()
+            .map(|e: Result<AttachEvent, _>| e.unwrap().event)
+    };
+    tokio::task::yield_now().await;
+    assert_eq!(next(&mut local), Ok(Some(output.clone())));
+    assert_eq!(next(&mut remote), Ok(Some(output)));
+    let restart = attach_event::Event::OutputRestart(path);
+    replay.publish(restart.clone()).await;
+    assert_eq!(replay.decline_local().await, (vec![0], 1));
+    let after = attach_event::Event::Log(b"after".to_vec());
+    replay.publish(after.clone()).await;
+    let mut seen = Vec::new();
+    while let Some(Ok(AttachEvent { event: Some(ev) })) = local.recv().await {
+        seen.push(ev);
+    }
+    let declined = attach_event::Event::ExitCode(DECLINE_EXIT_CODE);
+    assert_eq!(seen, [restart.clone(), declined]);
+    for ev in [restart, after] {
+        assert_eq!(remote.recv().await.unwrap().unwrap().event, Some(ev));
+    }
+    assert_eq!(replay.can_local(), [false]);
+}
+
+/// A log capped at 64 KiB, its canLocal client stalled with a full
+/// channel and declined, after a restart of its output if `restart`.
+async fn declined_stalled(
+    restart: bool,
+) -> (Arc<Replay>, mpsc::Receiver<Result<AttachEvent, Status>>) {
+    let replay = Replay::new("b".into());
+    replay.inner.try_lock().unwrap().cap = Some(64 * 1024);
+    let replay = Arc::new(replay);
+    let local = replay.subscribe_as(Client::untracked(true)).await;
+    for k in 0..SUB_CHANNEL_SLACK + 10 {
+        let line = format!("{k}\n").into_bytes();
+        replay.publish(attach_event::Event::Log(line)).await;
+    }
+    tokio::task::yield_now().await;
+    if restart {
+        let path = "/nix/store/o".to_owned();
+        replay
+            .publish(attach_event::Event::OutputRestart(path))
+            .await;
+    }
+    assert_eq!(replay.decline_local().await.0.len(), 1);
+    (replay, local)
+}
+
+/// What `client` was sent last before its stream ended, and before that.
+async fn last_two(client: &mut mpsc::Receiver<Result<AttachEvent, Status>>) -> Vec<String> {
+    let mut seen = Vec::new();
+    while let Some(ev) = client.recv().await {
+        seen.push(format!("{:?}", ev.map(|e| e.event).map_err(|s| s.code())));
+    }
+    seen.split_off(seen.len().saturating_sub(2))
+}
+
+/// A declined client so far behind that the log forgot where it was gets
+/// its outputs' restarts and exit 222 (SEMANTICS-7 L12), not a refusal,
+/// while the build goes on for others.
+#[tokio::test(start_paused = true)]
+async fn a_declined_client_the_log_forgot_is_still_declined() {
+    let (replay, mut local) = declined_stalled(true).await;
+    for k in 0..4000 {
+        let to = format!("w{k}");
+        replay.publish(attach_event::Event::Dispatched(to)).await;
+    }
+    let restart = r#"Ok(Some(OutputRestart("/nix/store/o")))"#;
+    assert_eq!(
+        last_two(&mut local).await,
+        [restart, "Ok(Some(ExitCode(222)))"]
+    );
+}
+
+/// A declined client whose log before its decline was trimmed is sent
+/// nothing published after it, not even the build's verdict.
+#[tokio::test(start_paused = true)]
+async fn a_declined_client_is_sent_nothing_after_its_decline() {
+    let (replay, mut local) = declined_stalled(false).await;
+    replay
+        .publish(attach_event::Event::Error("boom".into()))
+        .await;
+    for k in 0..2000 {
+        let line = format!("after {k} {}\n", "x".repeat(64)).into_bytes();
+        replay.publish(attach_event::Event::Log(line)).await;
+    }
+    let got = last_two(&mut local).await;
+    assert_eq!(
+        got.last().map(String::as_str),
+        Some("Ok(Some(ExitCode(222)))")
+    );
+    assert!(!got.iter().any(|e| e.contains("boom")), "{got:?}");
 }
 
 /// A client that does not read holds up neither publish nor a client that
@@ -155,7 +268,8 @@ impl Run {
         let replay = Replay::new("b1".into());
         replay.inner.try_lock().unwrap().cap = Some(CAP);
         Self {
-            state: Arc::new(HubState::for_test(Duration::ZERO)),
+            // A worker is known that builds it: a requeue holds it (L11′).
+            state: hub_knowing(true),
             replay: Arc::new(replay),
             clients: Vec::new(),
             frames: Vec::new(),
