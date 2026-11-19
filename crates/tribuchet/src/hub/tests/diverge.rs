@@ -2,7 +2,8 @@
 //! client differently there is a warning, and where they agree none.
 
 use super::*;
-use crate::proto::{BuildResult, DECLINE_EXIT_CODE, HeldRun, RunId, Started};
+use crate::proto::{BuildResult, ChunkFrame, DECLINE_EXIT_CODE, HeldRun, Manifest, RunId, Started};
+use state::FLOOR;
 
 fn request(system: &str, can_local: Option<bool>) -> BuildRequest {
     BuildRequest {
@@ -319,6 +320,100 @@ async fn a_resubmission_joins_the_run_its_left_build_kept() {
     shadow.fetched(&j, Some(&run));
     let bad = "shadow divergence";
     assert_eq!(log.count(bad), 0, "{}", log.line(bad));
+}
+
+/// A clientless build whose run finished is not given up while its outputs
+/// come: a client back past FLOOR joins it (L9). Before, it was unlisted,
+/// and the key built anew diverged at both fetches (the hub, 2026-11-17,
+/// 10 keys). One given up before its result came does not fetch it.
+#[test]
+fn a_finished_build_is_not_given_up_while_its_outputs_come() {
+    for result_first in [true, false] {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .start_paused(true)
+            .build()
+            .unwrap()
+            .block_on(left_then(result_first));
+    }
+}
+
+/// A build's client leaves after its run started; its result comes before
+/// or after FLOOR, and then a client of its key.
+async fn left_then(result_first: bool) {
+    let log = Captured;
+    let _guard = log.install();
+    let state = Arc::new(HubState::for_test(Duration::from_secs(30)));
+    let mut w = connect(&state, "w1", 1, &[]);
+    keep_alive(&w.to_hub);
+    let first = submit(&state, request("x86_64-linux", None)).await;
+    w.to_hub.send(request_job(1, Some(0))).await.unwrap();
+    let BuildAssignment { build_id, run, .. } = w.assignment().await.expect("not assigned");
+    let id = build_id.clone();
+    w.send(worker_message::Msg::Started(Started { build_id, run }))
+        .await;
+    drop(first);
+    let _wanting = wanting_a_slot(&state, 9).await;
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let data = b"the build's output";
+    let hash = blake3::hash(data).as_bytes().to_vec();
+    let manifest = Manifest {
+        store_path: format!("/nix/store/{H}-tt-shadow"),
+        hashes: hash.clone(),
+        sizes: vec![data.len() as u64],
+        ..Default::default()
+    };
+    let (build_id, outputs) = (id.clone(), vec![manifest]);
+    let result = BuildResult {
+        build_id,
+        outputs,
+        run,
+        ..Default::default()
+    };
+    let (zero, past) = (Duration::ZERO, 2 * FLOOR);
+    let (before, after) = if result_first {
+        (zero, past)
+    } else {
+        (past, zero)
+    };
+    tokio::time::sleep(before).await;
+    w.send(worker_message::Msg::Result(result)).await;
+    tokio::time::sleep(after).await;
+    let mut next = submit(&state, request("x86_64-linux", None)).await;
+    let queued = state.queue.lock().await.len();
+    let frame = zstd::bulk::compress(data, 3).unwrap();
+    for (zstd, hash, eof) in [(frame, hash, false), (vec![], vec![], true)] {
+        let build_id = id.clone();
+        let c = ChunkFrame {
+            build_id,
+            hash,
+            zstd,
+            eof,
+        };
+        w.send(worker_message::Msg::Chunk(c)).await;
+    }
+    let mut exit = None;
+    while let Ok(Ok(Some(ev))) = tokio::time::timeout(Duration::from_mins(1), next.message()).await
+    {
+        if let Some(attach_event::Event::ExitCode(c)) = ev.event {
+            exit = Some(c);
+        }
+    }
+    let mut fetched = false;
+    while let Ok(Ok(HubMessage { msg })) = w.from_hub.try_recv() {
+        fetched |= matches!(msg, Some(hub_message::Msg::Need(_)));
+    }
+    w.hub.abort();
+    let bad = "shadow divergence";
+    assert_eq!(log.count(bad), 0, "{}", log.line(bad));
+    let joined = (1, Some(0), true);
+    let anew = (2, None, false);
+    let want = if result_first { joined } else { anew };
+    assert_eq!(
+        (queued, exit, fetched),
+        want,
+        "result first: {result_first}"
+    );
 }
 
 /// A panic in the core turns the shadow off; the hub answers on.
