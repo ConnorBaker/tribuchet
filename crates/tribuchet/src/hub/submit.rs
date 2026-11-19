@@ -14,8 +14,8 @@ use super::metrics::Metrics;
 use super::naming::drv_name;
 use super::state::{HubState, Inflight, Job, Replay, Servability, unserved};
 use crate::proto::{
-    AttachEvent, BuildMessage, BuildRequest, DECLINE_EXIT_CODE, attach_event, attach_hub_server,
-    build_message,
+    AttachEvent, BuildMessage, BuildRequest, DECLINE_EXIT_CODE, NETWORK, attach_event,
+    attach_hub_server, build_message,
 };
 use crate::store::{STORE_DIR, valid_store_path};
 
@@ -198,7 +198,12 @@ impl attach_hub_server::AttachHub for AttachSvc {
         let tmp_dir_pack = Arc::new(tmp_dir_pack);
         let key = dedupe_key(&req, &tmp_dir_pack);
 
-        let features = req.required_features.clone();
+        // A build with network goes only to a worker that gives it a
+        // network of its own; one that does not would refuse it.
+        let mut features = req.required_features.clone();
+        if req.fixed_output {
+            features.push(NETWORK.to_owned());
+        }
         // Declined, a build with network would run on this host's own
         // daemon, in its network, outside every fod-network policy: it
         // waits for a worker, queued and its clients told (hold_unservable).
@@ -430,6 +435,32 @@ mod tests {
         let told = String::from_utf8(told).unwrap();
         assert!(told.contains("waiting for one"), "{told}");
         assert_eq!(state.queue.lock().await.len(), 1);
+    }
+
+    /// A build with network goes only to a worker that gives it a network
+    /// of its own, as it advertises: one that does not, though it serves
+    /// the build's system, would refuse it, failing its clients.
+    #[tokio::test]
+    async fn a_build_with_network_goes_only_to_a_worker_that_gives_it_one() {
+        let state = hub();
+        let fod = BuildRequest {
+            fixed_output: true,
+            ..base_request()
+        };
+        let _events = submit(&state, fod).await;
+        let without = state.worker_caps.lock().unwrap()[&1].clone();
+        assert!(
+            state.take_job(&without).await.is_none(),
+            "handed to a worker without network"
+        );
+        let with = WorkerCaps {
+            systems: [("x86_64-linux".to_owned(), [NETWORK.to_owned()].into())].into(),
+            ..without
+        };
+        assert!(
+            state.take_job(&with).await.is_some(),
+            "not handed to one with"
+        );
     }
 
     /// A build that requires recursive-nix, which no worker serves,
