@@ -27,11 +27,13 @@ impl CapsGuard {
 
 impl Drop for CapsGuard {
     fn drop(&mut self) {
+        // Remember the platform so a build for it briefly waits for the
+        // worker to reconnect instead of declining immediately. Before it
+        // leaves the connected set, so a decommission, refused while it is
+        // connected, comes after and forgets it (U4).
+        self.state.record_departed(self.caps.clone());
         self.state.worker_caps.lock().unwrap().remove(&self.id);
         self.state.holding.lock().unwrap().remove(&self.id);
         self.state.regen_nix_config();
-        // Remember the platform so a build for it briefly waits for the
-        // worker to reconnect instead of declining immediately.
-        self.state.record_departed(self.caps.clone());
     }
 }

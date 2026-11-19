@@ -1,3 +1,4 @@
+use std::thread;
 use std::time::{Duration, Instant};
 
 use tokio::net::UnixListener;
@@ -9,7 +10,7 @@ use tonic::transport::Server;
 use super::*;
 use crate::errors::chain;
 use crate::hub::shadow::Client;
-use crate::hub::state::Replay;
+use crate::hub::state::{Replay, Servability};
 use crate::hub::tests::{job, register};
 use crate::proto::hub_admin_server::HubAdminServer;
 use crate::proto::{AttachEvent, DECLINE_EXIT_CODE, attach_event};
@@ -86,4 +87,25 @@ async fn a_build_only_a_decommissioned_worker_served_is_answered() {
     let refused = first(&mut remote).await;
     let said = |e: &str| e.contains("no worker this hub knows builds x86_64-linux");
     assert!(matches!(&refused, Some(attach_event::Event::Error(e)) if said(e)));
+}
+
+/// U4: a worker decommissioned as its session ends is not awaited. Here
+/// the session's end is held at the builds it held from before (holding),
+/// after it leaves the connected set; before, it recorded its departure
+/// only after, undoing the decommission, and the hub awaited the retired
+/// worker its grace.
+#[test]
+fn a_decommission_as_a_session_ends_stands() {
+    let (rt, state) = (Runtime::new().unwrap(), hub());
+    let guard = register(&state, "w", &[]);
+    let (id, holding) = (guard.id, state.holding.lock().unwrap());
+    let ending = thread::spawn(move || drop(guard));
+    while state.worker_caps.lock().unwrap().contains_key(&id) {
+        thread::yield_now();
+    }
+    assert_eq!(rt.block_on(retire(&state, "w")), Ok(()));
+    drop(holding);
+    ending.join().unwrap();
+    let never = matches!(state.servability("x86_64-linux", &[]), Servability::Never);
+    assert!(never, "a retired worker is awaited");
 }
