@@ -100,6 +100,18 @@
               fi
               touch $out
             '';
+          # a NixOS VM test of `file` with this flake's package and module
+          vmTest =
+            file: args:
+            pkgs.testers.runNixOSTest (
+              import file (
+                {
+                  tribuchet = self.packages.x86_64-linux.default;
+                  nixosModule = self.nixosModules.default;
+                }
+                // args
+              )
+            );
         in
         prefix "package" self.packages.${system}
         // prefix "devshell" self.devShells.${system}
@@ -115,6 +127,21 @@
             }) (builtins.removeAttrs inputs [ "self" ])
           );
         }
+        // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") (
+          # nix/test.nix's phases
+          nixpkgs.lib.listToAttrs (
+            map
+              (phase: nixpkgs.lib.nameValuePair "nixos-test-${phase}" (vmTest ./nix/test.nix { inherit phase; }))
+              [
+                "builds"
+                "nspawn"
+                "lifecycle"
+                "arbiter"
+                "pairs"
+                "daemon"
+              ]
+          )
+        )
         // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
           # Inductive proofs of the Quint models. Linux only: Apalache
           # binds a fixed port, which unsandboxed darwin builds share.
@@ -122,45 +149,11 @@
           spec-protocol = specCheck "protocol";
           spec-refute-hubBlock = specRefute "hubBlock";
           spec-refute-hubDrop = specRefute "hubDrop";
-          nixos-test-builds = pkgs.testers.runNixOSTest (
-            import ./nix/test.nix {
-              tribuchet = self.packages.x86_64-linux.default;
-              nixosModule = self.nixosModules.default;
-              phase = "builds";
-            }
-          );
-
-          nixos-test-nspawn = pkgs.testers.runNixOSTest (
-            import ./nix/test.nix {
-              tribuchet = self.packages.x86_64-linux.default;
-              nixosModule = self.nixosModules.default;
-              phase = "nspawn";
-            }
-          );
-
-          nixos-test-lifecycle = pkgs.testers.runNixOSTest (
-            import ./nix/test.nix {
-              tribuchet = self.packages.x86_64-linux.default;
-              nixosModule = self.nixosModules.default;
-              phase = "lifecycle";
-            }
-          );
-
-          nixos-test-container = pkgs.testers.runNixOSTest (
-            import ./nix/container-test.nix {
-              tribuchet = self.packages.x86_64-linux.default;
-              workerImage = self.packages.x86_64-linux.worker-image;
-              seccompProfile = self.packages.x86_64-linux.seccomp-profile;
-              nixosModule = self.nixosModules.default;
-            }
-          );
-
-          nixos-test-tailscale = pkgs.testers.runNixOSTest (
-            import ./nix/test-tailscale.nix {
-              tribuchet = self.packages.x86_64-linux.default;
-              nixosModule = self.nixosModules.default;
-            }
-          );
+          nixos-test-container = vmTest ./nix/container-test.nix {
+            workerImage = self.packages.x86_64-linux.worker-image;
+            seccompProfile = self.packages.x86_64-linux.seccomp-profile;
+          };
+          nixos-test-tailscale = vmTest ./nix/test-tailscale.nix { };
 
           # Evaluation-only check of the darwin module (the launchd plist
           # and activation script); building a darwin system needs a mac.
