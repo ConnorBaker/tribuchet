@@ -4,10 +4,22 @@
 //! scoped subscriber per test lost events: as the only dispatcher, it
 //! let tracing-core cache a callsite's interest from the default of the
 //! thread that hit it first (callsite.rs, Rebuilder::JustOne).
+//!
+//! The global one has a window of its own: set_global_default registers
+//! the subscriber (Dispatch::new, which rebuilds every callsite's
+//! interest) before it is the global default, and a callsite another
+//! thread reaches first in between asks get_default, finds none, and
+//! keeps "never" (tracing-core 0.1.36). `go_global` rebuilds after the
+//! set. That narrows the race, not closes it: a registration that began
+//! before the set (callsite.rs:318-320) can store its "never" after that
+//! rebuild (:490-506), so every install rebuilds again, repairing it
+//! before that capture reads.
 
 use std::cell::RefCell;
 use std::io;
 use std::sync::Once;
+
+use tracing::Dispatch;
 
 thread_local! {
     static SINK: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -29,6 +41,22 @@ impl io::Write for Writer {
 #[derive(Default)]
 pub(super) struct Captured;
 
+/// The subscriber that writes to each thread's SINK, registered.
+fn capture() -> Dispatch {
+    let subscriber = tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_writer(|| Writer)
+        .finish();
+    Dispatch::new(subscriber)
+}
+
+/// Make `d`, registered already, the global default, then rebuild what
+/// callsites reached in between cached (the module doc).
+fn go_global(d: Dispatch) {
+    tracing::dispatcher::set_global_default(d).expect("tests install no other global subscriber");
+    tracing::callsite::rebuild_interest_cache();
+}
+
 /// Clears the thread's captured lines when the capture ends.
 pub(super) struct Guard;
 
@@ -42,14 +70,9 @@ impl Captured {
     /// Capture this thread's events from now until the guard drops.
     pub(super) fn install(&self) -> Guard {
         static GLOBAL: Once = Once::new();
-        GLOBAL.call_once(|| {
-            let subscriber = tracing_subscriber::fmt()
-                .with_ansi(false)
-                .with_writer(|| Writer)
-                .finish();
-            tracing::subscriber::set_global_default(subscriber)
-                .expect("tests install no other global subscriber");
-        });
+        GLOBAL.call_once(|| go_global(capture()));
+        // See the module doc: a "never" stored after go_global's rebuild.
+        tracing::callsite::rebuild_interest_cache();
         SINK.with(|s| s.borrow_mut().clear());
         Guard
     }
@@ -85,7 +108,7 @@ mod tests {
     use super::*;
 
     #[test]
-    #[ignore = "run alone, in its own process, by the test below"]
+    #[ignore = "run alone, in its own process, by a test below"]
     fn probe_alone() {
         let log = Captured::default();
         let _guard = log.install();
@@ -101,8 +124,31 @@ mod tests {
     /// may be live and hide it.
     #[test]
     fn a_callsite_another_thread_reaches_first_is_still_captured() {
+        passes_alone("probe_alone");
+    }
+
+    #[test]
+    #[ignore = "run alone, in its own process, by a test below"]
+    fn window_alone() {
+        let d = capture();
+        let probe = || tracing::info!(window = 1, "testlog window");
+        thread::spawn(probe).join().unwrap();
+        go_global(d);
+        probe();
+        assert!(Captured.line("testlog window").contains("window=1"));
+    }
+
+    /// A callsite another thread reaches first between the capture's
+    /// registration and its set as the global default is captured after.
+    #[test]
+    fn a_callsite_reached_before_the_capture_is_global_is_still_captured() {
+        passes_alone("window_alone");
+    }
+
+    /// Run the ignored test `name` alone in a process of its own: it passes.
+    fn passes_alone(name: &str) {
         let out = Command::new(env::current_exe().unwrap())
-            .args(["--exact", "hub::testlog::tests::probe_alone"])
+            .args(["--exact", &format!("hub::testlog::tests::{name}")])
             .args(["--ignored", "--test-threads=1"])
             .output()
             .unwrap();
