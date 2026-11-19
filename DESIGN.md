@@ -109,7 +109,9 @@ Reference implementations: `nix/src/libstore/unix/build/` and
   network gets user-mode NAT into its namespace (the embedded
   [presto-pasta](https://github.com/Mic92/presto-pasta) datapath, run
   in a thread of the build's agent), never the host's network; a
-  worker without `/dev/net/tun` refuses such a build. Loopback,
+  worker without `/dev/net/tun` refuses such a build, and does not
+  advertise the `tribuchet-network` feature that the hub requires of
+  a worker for one, so it is sent none. Loopback,
   unspecified and the worker's own addresses are refused before any
   rule; other non-public destinations, among them any on the worker's
   own networks, unless a rule allows them; and the sandbox has IPv6
@@ -139,8 +141,11 @@ Reference implementations: `nix/src/libstore/unix/build/` and
   chose for its one output, `out`, never from the environment it sets
   for itself (`build_json.rs`): fixed-output where that path is the
   store path of the content hash the derivation declares. An `__impure`
-  one gets none. It gets the network above on Linux; a macOS worker,
-  with no network of its own to give it, refuses it.
+  one gets none. A worker gives it a network of its own only on Linux
+  with `/dev/net/tun`, so no current macOS worker advertises
+  `tribuchet-network` (one refuses such a build): a darwin one waits,
+  its clients told, until such a worker registers or the client gives
+  up.
 
 Accepted tradeoffs: no recursive-nix, sandbox parity is ours to maintain,
 trusted worker pool assumed (output authenticity rests on the
@@ -195,23 +200,29 @@ runtime's own timer fires (`sd.rs`), and tokio's eager driver hand-off
 keeps one blocked worker from stopping that timer (`rt.rs`).
 
 Hub restarts cancel nothing, without any state handoff: on SIGTERM the
-hub exits immediately and the replacement reconstructs its state from
-the edges. Workers re-register and announce the dedupe keys of builds
-they still hold (running, or finished but undelivered); attach clients
-reconnect and resubmit the identical request, whose deterministic
-dedupe key routes it back to the worker holding the build, which
-resumes (or just re-delivers the finished result) instead of building
-again.
+hub commits what is queued to its build record and exits, and the
+replacement reconstructs its state from the edges and that record. Workers re-register
+and announce the dedupe keys of builds they still hold (running, or
+finished but undelivered); attach clients reconnect and resubmit the
+identical request, whose deterministic dedupe key routes it back to the
+worker holding the build, which resumes (or just re-delivers the
+finished result) instead of building again.
 
 Worker redeploys are plain unit restarts: builds run under the
 per-uid agent services, which hold the log and exit status until a
 worker collects them, and resume state is persisted in the build
 dir of each run (`builds/<id>.<ns>`, one per run of a build, which no
-other run removes). The replacement worker re-adopts running builds
+other run removes but the launch that displaces its result). The replacement worker re-adopts running builds
 from their agents, supervises them to completion and redelivers finished
-results. A worker runs min(`max-jobs`, reachable agents) builds; a
-running build whose agent does not answer keeps its key, its slot and
-its agent until the agent answers, and its clients are told it waits.
+results. A build leases a slot and its agent together, only while fewer
+than min(`max-jobs`, reachable agents) leases are held; a build that runs
+already when it starts (adopted, held, an orphan's cleanup) leases its
+own agent past that, until it ends, and takes a slot
+from the pool even when that agent is outside it. A running build whose
+agent does not answer keeps its key and its lease until the agent
+answers, and its clients are told it waits. A build whose agent did not
+answer its start keeps a lease with no agent (its agent set down), its
+clients told, until another agent is free or the build is cancelled.
 An agent answers Adopt and Status at once whatever Kill or Finish it runs
 (each on a thread of its own; Kill, Finish and Cleanup take turns, so no
 kill sweep kills another's helper), and once a Start has registered its
@@ -231,8 +242,9 @@ stop behaves the same way: builds keep running, and their results
 wait on disk until a worker starts again (or expire undelivered).
 A queued build that no connected worker can serve stays queued until
 one registers, and its clients are told so. A loss the worker resumes costs a build nothing; the fourth
-genuine loss (followed by a start-over) fails it, and so does the
-thirteenth loss on a resume (`hub/losses.rs`).
+genuine loss (a run that started, its worker back without it) fails
+it, and the thirteenth loss in transport (every other loss) hands it
+back to its clients' Nix (`hub/losses.rs`).
 The hub knows a reconnecting worker by name: the hostname it reports
 (not anything in its certificate), or with `auth = "tailscale"` its
 tailscale node's short name. No two workers may share a name, nor two
@@ -261,6 +273,120 @@ clients are told once (`hub/relay/daemon.rs`):
 | a message the hub cannot read | 2 |
 | a request the daemon drops as its journal says a worker crashed | 3 |
 | anything else: a drop or close with no such word in the journal, no answer within a minute, a silent daemon's included | ∞ |
+
+## Placement
+
+A queued build goes to the least full worker with an idle agent that
+serves it, by what it and the builds already there are expected to use
+against what the worker has (`hub/placement/rank.rs`). Fullness is the
+larger of the expected cores of the worker's unsettled builds, this one
+counted, over its cores, and their expected memory over the memory its
+builds may use. Each worker reports both when it registers
+(`worker/caps.rs`): the CPUs its own affinity and CPU quota allow, which
+its agents are taken to share, and the lowest `memory.max` of its own
+cgroup and those above it (a container's limit), its agents' slice, and
+MemTotal; hub.toml holds no table of workers. Memory counts in a
+comparison only where every worker compared reported it, and a worker
+that reported no cores is counted by its agents, as a worker older than
+this field is during a rolling upgrade; a worker counts as one core at
+least: one that registered none, as it may with no agents yet, can have
+idle agents later, and as no cores it would be infinitely full, or NaN
+(which sorts first on x86). Both are as registered, for the session: one
+that registered no cores and `max_jobs` 0 counts as one core until it
+registers again. Memory has no such floor: a worker that
+reports 0 bytes for its builds is infinitely full by memory, and is not
+chosen where memory is compared. A build counts against its worker from
+its dispatch, just after the worker takes it from the queue, until it
+settles: a worker that asks in between ranks without it. After a hub
+restart the builds still running count against no worker until each is
+submitted again by its client and resumed by its worker; a worker
+registering again does not count them.
+
+What a build is expected to use comes from what builds of its key used
+on this farm (`hub/placement/history.rs`): its system and pname, the
+name up to its version or a hash. Each key keeps its last 8 runs that
+succeeded or were OOM-killed, as the workers measured them: the largest
+peak memory among them (an OOM-killed run's peak is a lower bound), and
+the medians of cores (CPU time over running time, frozen time not
+counted) and running time over the runs that succeeded. A failed run
+teaches nothing. A key with no run takes the longest dash-prefix of its
+pname that has one, then its class (its system and whether it declares
+`big-parallel`), then a fixed prior. A `big-parallel` declaration picks
+the class (its runs, and the cores a key without a succeeded run takes)
+and the prior; nothing else. Placement ranks by memory and cores only:
+the running time, the OOM kills and where an expectation came from are
+learned and logged at dispatch, for a replay of the journal to weigh,
+and unused. A run with no running time (a worker can report none)
+teaches no timing. Keys are never dropped. A build's expectation is
+taken once, as it is first queued; a requeued build keeps it.
+
+The history is the fold of the hub's build record (`hub/record.rs`), a
+SQLite database at [placement] `record`, by default
+`$XDG_STATE_HOME/tribuchet/record.sqlite` (`/var/lib/tribuchet` under
+the NixOS module, its StateDirectory): state, not cache, as it is the
+only copy. It has two tables, appended to and never changed: `result`,
+a row per worker result that carries usage (the "build usage" line's
+fields, and whether the build declares `big-parallel`), and `dispatch`,
+a row per dispatch (the "dispatching build" line's values, unrounded).
+Other processes may query it while the hub runs (`sqlite3 -readonly`):
+it is in WAL mode, where readers and the one writer do not wait for each
+other. As the hub starts, before it serves, it folds every `result`
+row, in rowid order, into an empty history ("build record folded", with
+the rows read and the keys and entries learned); after, each result is
+learned and handed to the record in one step under the placement lock,
+so the history is the fold of the record's rows and those queued to it.
+A result row with no system (an imported build queued before its
+journal began) teaches nothing.
+
+One thread writes the record, all the rows waiting in one transaction;
+handing a row to it never waits, so no runtime thread does the record's
+file I/O. Each commit is durable (`synchronous=FULL`): a crash loses the
+rows handed over and not yet committed, never a committed row nor part
+of one. A commit that fails (a full disk, an I/O error) is logged as an
+error and its rows kept, to be committed with the next rows; at SIGTERM,
+or when its servers fail, the hub stops handing rows over and exits once
+the writer has committed what it holds, or logged as lost what it could
+not. The metrics show `tribuchet_hub_record_writing` (0 where the hub
+records nothing), `tribuchet_hub_record_uncommitted_rows` and
+`tribuchet_hub_record_failed_commits_total`. The retry has no bound:
+while commits fail, the rows held, and each attempt's work, grow with
+every row learned, so alert on `tribuchet_hub_record_uncommitted_rows`. One hub writes a record: it
+holds `record.sqlite.lock` while it runs, and a second hub, finding it
+held, folds what it reads and records nothing, logged as an error. A
+record that is not a SQLite database, or not one of a schema the hub
+knows (`user_version` 1 and the two tables), leaves the hub with an
+empty history, recording nothing, logged as an error; the file is left
+byte for byte as it is. A missing record, and its directory, are
+created. The hub serves either way: placement then falls back on its
+priors, and builds are not held for the record. The fold's cost at
+start is measured, not bounded: 338,559 rows, 116 MB, took 249 ms of
+CPU (release build, one run, 2026-11-08).
+
+The record replaces `placement-history.json` ([placement] `history`),
+which nothing reads now: a hub.toml that still sets `history` fails to
+load (an unknown field). The file's runs were
+not carried over: the farm's journal of 2026-10-29..11-08 was imported
+into the record once instead, by a command removed since, before the
+first hub that keeps a record started. Its rows are the record's first;
+those of builds queued before that journal began have no system.
+
+The worker that asks takes the first queued build it can, unless
+another connected worker that serves it has an idle agent (a free slot,
+not the one build a worker stages ahead while every slot is busy) and
+would be less full with it, or the asker has only that lookahead. That
+worker is woken, and takes it when it asks; the asker goes on to the
+next build. A tie stays with the asker. A build is passed over for at
+most 2 s from the first time, then the next worker that asks takes it,
+so none waits on another worker's ask.
+
+Nothing holds a build back for memory. A dispatch whose worker's
+expected memory, this build counted, is more than the worker's memory
+is logged as such ("placed over predicted memory"), and its dispatch
+line carries the worker's expected load and size. Holding builds for
+memory was replayed on an earlier model of this code and left out: no
+build in the copy of the hub's journal the figures come from
+(`hub/placement/history.rs`) was OOM-killed, and the holds delayed the
+builds they held.
 
 ## CPU arbitration
 
@@ -373,6 +499,14 @@ command line. `nixosModules.default` ships hub and worker services
 socket-activated, the worker unit delegates its cgroup subtree for
 per-build limits and restarts on package bumps and settings changes
 while running builds keep going (KillMode=process plus re-adoption).
+Workers are upgraded before or with the hub: a hub sends a
+fixed-output build only to a worker advertising `tribuchet-network`,
+which workers older than it never do, even with `/dev/net/tun`, so
+until an upgraded worker with `/dev/net/tun` registers every
+fixed-output build waits.
+Every agent and its builds run in `system-tribuchet\x2dagent.slice`,
+where a host may cap their memory; the worker reports the slice's
+memory.max, when lower than MemTotal, as its memory.
 The e2e test consumes the same module. macOS hosts use the
 `darwinModules.default` nix-darwin module, which ships both services:
 the hub adopts its listeners from launchd (`launch_activate_socket`,

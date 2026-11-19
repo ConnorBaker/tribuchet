@@ -31,10 +31,27 @@ message WorkerMessage {
     // store lacks. The first Need answers the assignment and lists
     // every missing input path. May repeat any number of times.
     Need need = 8;
+    // The build is staged and its run starts: sent before its builder is
+    // spawned, so before anything else of the run. A Resumed stands for
+    // it on a resume.
+    Started started = 9;
+    // Answer to a Need for output chunks of a result the worker no longer
+    // has, or cannot read: it has dropped the result.
+    ResultGone result_gone = 10;
   }
 }
 
+message ResultGone {
+  string build_id = 1;
+}
+
 message Resumed {
+  string build_id = 1;
+  // The run has finished: what follows is its result.
+  bool finished = 2;
+}
+
+message Started {
   string build_id = 1;
 }
 
@@ -44,6 +61,10 @@ message RequestJob {
   // `capacity`. The hub takes off the ones it sent since. Unset by
   // workers predating the field.
   optional uint64 assignments = 2;
+  // Of `capacity`, the slots no build holds: capacity less the one
+  // build staged ahead while every slot is busy. Unset by workers
+  // predating the field.
+  optional uint32 free_slots = 3;
 }
 
 message HubMessage {
@@ -112,7 +133,7 @@ message PathInfoMsg {
 // "kvm" from the host.
 message SystemCaps {
   string system = 1;            // e.g. "x86_64-linux"
-  repeated string features = 2; // e.g. "kvm", "big-parallel"
+  repeated string features = 2; // e.g. "kvm", "big-parallel", "tribuchet-network"
 }
 
 message Register {
@@ -126,6 +147,13 @@ message Register {
   // Advisory capacity, summed across workers to size the max-jobs of
   // the generated nix.conf fragment. Not the RequestJob dispatch path.
   uint32 max_jobs = 4;
+  // What its builds may use, which the hub's placement weighs builds
+  // against: CPUs (the worker's own affinity and quota, its agents'
+  // taken to be the same), and bytes of memory (MemTotal, or less where
+  // the agents' slice or a cgroup above the worker's caps it). Unset
+  // where the worker cannot tell, and by workers predating the fields.
+  optional uint32 cores = 5;
+  optional uint64 build_memory = 6;
 }
 
 message Heartbeat {

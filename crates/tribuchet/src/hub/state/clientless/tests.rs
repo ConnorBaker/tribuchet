@@ -5,9 +5,17 @@ use std::time::Duration;
 use std::time::Instant as Now;
 
 use super::*;
+use crate::hub::Admission;
+use crate::hub::losses::{self, Loss};
+use crate::hub::placement::Size;
 use crate::hub::tests::job;
-use crate::hub::{Admission, Loss};
 use Queued::{Clientless, Held, Waiting};
+
+/// A worker's size, which the decider here does not read.
+const SIZE: Size = Size {
+    cores: 1.0,
+    memory: None,
+};
 
 /// A build dispatched to worker `on`, `ran` seconds ago; its clients
 /// gone `away` seconds ago (None: it has one).
@@ -121,7 +129,7 @@ async fn decided(workers: &[(u32, bool)], runs: &[Run], queued: &[Queued]) -> Ve
             .placement
             .lock()
             .unwrap()
-            .open(id, Arc::new(StdMutex::new(free)));
+            .open(id, Arc::new(StdMutex::new(free)), SIZE);
     }
     let mut clients = Vec::new();
     for (n, q) in queued.iter().enumerate() {
@@ -186,6 +194,7 @@ async fn a_resume_keeps_the_run_and_the_absence() {
         worker: "w".into(),
         session: 1,
         until,
+        run: losses::Run::Started,
     });
     let _again = state.list_dispatch(&j, 2);
     let resumed = state.dispatched.lock().unwrap()[&j.id].started;

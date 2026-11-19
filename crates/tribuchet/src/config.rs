@@ -102,6 +102,20 @@ pub struct HubConfig {
     /// Cache directory override. Defaults to XDG_CACHE_HOME/tribuchet.
     #[serde(default)]
     pub chunk_cache_dir: Option<PathBuf>,
+    /// What placement learns.
+    #[serde(default)]
+    pub placement: PlacementConfig,
+}
+
+/// The `[placement]` table.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct PlacementConfig {
+    /// The build record, whose fold is what placement learns (state,
+    /// not cache: the only copy). Defaults to
+    /// XDG_STATE_HOME/tribuchet/record.sqlite.
+    #[serde(default)]
+    pub record: Option<PathBuf>,
 }
 
 fn default_chunk_cache_bytes() -> u64 {
@@ -120,6 +134,16 @@ fn cache_dir() -> PathBuf {
 /// XDG_CACHE_HOME/tribuchet/chunks.
 pub fn default_chunk_cache_dir() -> PathBuf {
     cache_dir().join("chunks")
+}
+
+/// XDG_STATE_HOME/tribuchet/record.sqlite, with the usual
+/// ~/.local/state fallback.
+pub fn default_record() -> PathBuf {
+    env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+        .unwrap_or_else(|| PathBuf::from("/var/lib"))
+        .join("tribuchet/record.sqlite")
 }
 
 /// A hub-maintained nix.conf fragment. A local nix.conf `include`s the

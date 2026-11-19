@@ -45,6 +45,25 @@ fn sandbox_defaults_off() {
     assert!(parse("sandbox = true").sandbox);
 }
 
+/// [placement] takes only the record's path: a hub.toml that still
+/// sets an arm, worker profiles or the retired history file fails to
+/// load.
+#[test]
+fn placement_takes_only_the_record_path() {
+    let cfg: HubConfig = toml::from_str("[placement]\nrecord = \"/x.sqlite\"").unwrap();
+    assert_eq!(cfg.placement.record, Some(PathBuf::from("/x.sqlite")));
+    for gone in [
+        "history = \"/x.json\"",
+        "arm = \"fcfs\"",
+        "arm-file = \"/run/x\"",
+        "admission = \"estimate\"",
+        "[placement.workers.a]\ncores = 32",
+    ] {
+        let err = toml::from_str::<HubConfig>(&format!("[placement]\n{gone}")).unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{gone}: {err}");
+    }
+}
+
 /// An unknown key fails the load, the removed holds, arbiter and
 /// recursive-nix keys among them: none is read, nothing turns the CPU
 /// arbiter off, and no worker seems to serve recursive Nix.
@@ -55,7 +74,6 @@ fn unknown_keys_are_rejected() {
         "max-jobs = 2",
         "cancel-grace-secs = 10",
         "clientless-hold-secs = 2002",
-        "placement = {}",
         "max-job-attempts = 5",
         "max-resumed-losses = 20",
     ] {

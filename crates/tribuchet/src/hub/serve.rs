@@ -19,10 +19,11 @@ use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 
 use super::chunkcache::ChunkCache;
 use super::metrics;
+use super::record;
 use super::state::HubState;
 use super::submit::AttachSvc;
 use super::{PeerAuth, WorkerSvc};
-use crate::config::{Auth, HubConfig, default_chunk_cache_dir};
+use crate::config::{Auth, HubConfig, default_chunk_cache_dir, default_record};
 use crate::errors::{Result, chain, err_ctx, err_msg};
 use crate::fsutil::io_ctx;
 use crate::proto::worker_hub_server::WorkerHubServer;
@@ -145,6 +146,13 @@ async fn run_async(cfg: HubConfig) -> Result<()> {
         chunks,
     ));
 
+    // The record is folded into the history before the hub serves.
+    let path = cfg.placement.record.clone().unwrap_or_else(default_record);
+    let opened = tokio::task::spawn_blocking(move || record::open(&path))
+        .await
+        .map_err(err_ctx("opening the build record"))?;
+    let writer = opened.install(&state);
+
     let (tls, peer_auth) = configure_auth(&cfg, config_dir)?;
 
     // Listeners come from systemd socket activation when available
@@ -165,17 +173,11 @@ async fn run_async(cfg: HubConfig) -> Result<()> {
         .await
         .map_err(err_ctx("binding worker listen address"))?,
     };
-    let mut builder = Server::builder();
+    let mut builder = chunkio::session_server();
     if let Some(tls) = tls {
         builder = builder.tls_config(tls)?;
     }
     let worker_server = builder
-        // Detect dead/half-open worker connections instead of relying on
-        // the workers' own traffic.
-        .http2_keepalive_interval(Some(Duration::from_secs(30)))
-        .http2_keepalive_timeout(Some(Duration::from_secs(20)))
-        .initial_stream_window_size(Some(chunkio::H2_STREAM_WINDOW))
-        .initial_connection_window_size(Some(chunkio::H2_CONNECTION_WINDOW))
         .add_service(
             WorkerHubServer::new(WorkerSvc {
                 state: state.clone(),
@@ -232,15 +234,19 @@ async fn run_async(cfg: HubConfig) -> Result<()> {
     };
     // No drain on SIGTERM: hub state is reconstructed by the
     // replacement instance from worker re-registration (resumable
-    // build keys) and attach resubmission (deterministic dedupe
-    // keys), so exiting immediately cancels nothing.
-    tokio::select! {
+    // build keys), attach resubmission (deterministic dedupe keys) and
+    // the build record, whose queued rows are committed here, so
+    // exiting cancels nothing.
+    let res = tokio::select! {
         res = servers => res.map(|_| ()),
         () = sd::stop_requested() => {
             tracing::info!("SIGTERM: exiting, builds resume against the replacement instance");
             Ok(())
         }
-    }
+    };
+    let held = state.clone();
+    let _ = tokio::task::spawn_blocking(move || record::close(&held, writer)).await;
+    res
 }
 
 fn open_chunk_cache(cfg: &HubConfig) -> Result<Arc<ChunkCache>> {

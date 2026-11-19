@@ -14,10 +14,9 @@ use harmonia_store_path::StoreDir;
 use harmonia_store_remote::{DaemonClient, DaemonStore};
 
 use super::build::supervise_agent;
+use super::lease::Lease;
 use super::logtail::LogTail;
-use super::{
-    DaemonConn, Slot, WorkerCtx, agent_sockets_in, agents, msg, remove_build_dir, sandbox,
-};
+use super::{DaemonConn, WorkerCtx, agent_sockets_in, agents, msg, remove_build_dir, sandbox};
 use crate::errors::{Result, chain};
 use crate::fsutil::io_ctx;
 use crate::proto::{BuildResult, worker_message};
@@ -31,8 +30,8 @@ pub(super) const CANCELLED: &str = "build cancelled";
 
 pub(super) use delivery::{
     FinishedBuild, OutChunk, PackedOutput, ResumableBuild, Usage, ack_delivery,
-    execute_to_finished, persist_finished, record_finished, serve_chunks, spawn_resumable_reaper,
-    try_deliver,
+    execute_to_finished, persist_finished, record_finished, release, serve_chunks,
+    spawn_resumable_reaper, try_deliver,
 };
 
 /// Pick up builds a previous worker instance left behind: still
@@ -52,10 +51,7 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>) {
             continue; // already swept by sweep_state_dir
         };
         match serde_json::from_str::<BuildState>(&s) {
-            Ok(BuildState::Running(st)) => match st.spec.unconfined() {
-                Some(why) => kill_unconfined(ctx, *st, dir, why),
-                None => running.push((dir, st)),
-            },
+            Ok(BuildState::Running(st)) => running.push((dir, st)),
             Ok(BuildState::Finished {
                 dedupe_key,
                 build_id,
@@ -84,10 +80,7 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>) {
     let asked: Vec<_> = thread::scope(|s| {
         let calls: Vec<_> = running
             .iter()
-            .map(|(_, st)| {
-                ctx.agents.reserve(&st.agent_socket);
-                s.spawn(|| agents::AgentBuild::adopt(&st.agent_socket, &st.build_id))
-            })
+            .map(|(_, st)| s.spawn(|| agents::AgentBuild::adopt(&st.agent_socket, &st.build_id)))
             .collect();
         calls
             .into_iter()
@@ -109,7 +102,10 @@ async fn settle(
     answer: Result<(agents::AgentBuild, Option<i32>)>,
 ) {
     match answer {
-        Ok((build, _)) => adopt(ctx, st, dir, build, ctx.try_slot()).await,
+        Ok((build, _)) => {
+            let lease = ctx.agents.lease_this(&st.agent_socket);
+            adopt(ctx, st, dir, build, lease).await;
+        }
         Err(e) if agents::unreachable(&e) => {
             tracing::warn!(
                 id = st.build_id,
@@ -125,48 +121,59 @@ async fn settle(
                 "re-adopting build from its agent: {}",
                 chain(&e)
             );
-            ctx.agents.release(st.agent_socket.clone());
+            ctx.agents.probe_up(&st.agent_socket);
             remove_build_dir(&dir);
         }
     }
 }
 
-/// A running build an older worker left whose spec this one does not run
-/// (SandboxSpec::unconfined): killed, never adopted, as a held build the
-/// hub cancelled is once its agent answers, its agent and a slot kept
-/// until then. Its key is not offered, so the hub runs the build again,
-/// confined. A worker stopped meanwhile leaves an orphan its agent's
-/// next sweep kills (sweep_orphaned_agent_builds).
-fn kill_unconfined(ctx: &Arc<WorkerCtx>, st: ResumeState, dir: PathBuf, why: &'static str) {
-    tracing::warn!(id = st.build_id, "killing a build its agent runs {why}");
-    let slot = ctx.reserve(&st.agent_socket);
-    let ctx = ctx.clone();
-    tokio::task::spawn_blocking(move || {
-        let build = answered(&st, || {}).ok().map(|(build, _)| build);
-        kill_held(&ctx, st, &dir, build, None, slot);
-    });
-}
+/// How a run (key?, dir, lease, log tailer) ends, in this order: its
+/// state.json goes (if it stays, so do its key and dir); its key, if its
+/// entry is still in `dir` and nothing reads its result; the run is killed
+/// (`build`); its lease handed back; its tailer stopped; its dir removed.
+pub(super) struct Ending(Option<String>, PathBuf, Option<Lease>, Option<LogTail>);
 
-/// Kill the held build `st` if its agent answered with it (`build`): its
-/// state.json goes before the kill, so a worker stopped meanwhile has
-/// nothing to adopt; its log tailer `tail`, which drains up to the end of
-/// the log the run still writes, stops after it, and its dir with it.
-/// Its agent and `slot`, handed back, end the teardown.
-fn kill_held(
-    ctx: &WorkerCtx,
-    st: ResumeState,
-    dir: &Path,
-    build: Option<agents::AgentBuild>,
-    tail: Option<LogTail>,
-    slot: Option<Slot>,
-) {
-    if let Some(build) = build {
-        unrecord(dir);
-        kill(&st, build);
+impl Ending {
+    /// Blocking.
+    pub(super) fn end(self, ctx: &WorkerCtx, build: Option<(ResumeState, agents::AgentBuild)>) {
+        let Self(key, dir, lease, tail) = self;
+        let mut gone = unrecord(&dir);
+        if !gone {
+            tracing::warn!("keeping {}: its state.json stays", dir.display());
+        }
+        if let Some(key) = key.filter(|_| gone) {
+            let mut map = ctx.resumable.lock().unwrap();
+            let ours = map.get(&key).filter(|e| e.dir == dir);
+            let fin = ours.and_then(|e| e.finished.as_ref());
+            let read =
+                ours.is_some_and(|e| e.delivering) || fin.is_some_and(|f| Arc::strong_count(f) > 1);
+            gone = !read;
+            if gone && ours.is_some() {
+                map.remove(&key);
+            }
+        }
+        if let Some((st, build)) = build {
+            let socket = &st.agent_socket;
+            if let Err(e) = agents::kill(socket, &st.build_id) {
+                tracing::warn!(id = st.build_id, "killing the build: {}", chain(&e));
+            }
+            if let Err(e) = build.wait_exit() {
+                tracing::warn!(
+                    id = st.build_id,
+                    "waiting for the killed build: {}",
+                    chain(&e)
+                );
+            }
+            agents::retire(socket, &st.build_id, "agent cleanup");
+        }
+        drop(lease);
+        if let Some(t) = tail {
+            t.stop();
+        }
+        if gone {
+            remove_build_dir(&dir);
+        }
     }
-    remove_state(tail, dir);
-    ctx.agents.release(st.agent_socket);
-    drop(slot);
 }
 
 /// Ask `st`'s agent to adopt its build every AGENT_RETRY until it
@@ -182,13 +189,13 @@ fn answered(st: &ResumeState, meanwhile: impl Fn()) -> Result<(agents::AgentBuil
     }
 }
 
-/// Supervise an adopted build to its end in `slot`, then record it.
+/// Supervise an adopted build to its end in `lease`, then record it.
 async fn adopt(
     ctx: &Arc<WorkerCtx>,
     st: ResumeState,
     dir: PathBuf,
     build: agents::AgentBuild,
-    slot: Option<Slot>,
+    lease: Lease,
 ) {
     tracing::info!(id = st.build_id, pid = st.pid, "adopted running build");
     let socket = st.agent_socket.clone();
@@ -211,10 +218,8 @@ async fn adopt(
         let ctx = task_ctx;
         let key = st.dedupe_key.clone();
         let fin = supervise_agent(&ctx, &st, dir, &socket, build);
-        ctx.agents.release(socket);
         // Roots live until the outputs are packed.
-        drop(gc_roots);
-        drop(slot);
+        drop((gc_roots, lease));
         record_finished(&ctx, &key, fin);
     });
 }
@@ -233,82 +238,49 @@ fn wait_for_agent(ctx: &Arc<WorkerCtx>, st: ResumeState, dir: PathBuf) {
         e.adopting = true;
     }
     ctx.wait_for_agent(&key, true);
-    let slot = ctx.try_slot();
+    let lease = ctx.agents.lease_this(&st.agent_socket);
     let ctx = ctx.clone();
     let rt = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
         let answer = answered(&st, || fail_cancelled(&ctx, &key));
         fail_cancelled(&ctx, &key);
         ctx.wait_for_agent(&key, false);
-        // A cancelled build leaves the registry now, with its log tailer
-        // and any cancel taken since fail_cancelled, so no assignment
-        // takes the dying run over and no flag outlives it.
+        // Held no more. One that ends takes its log tailer and any cancel
+        // taken since fail_cancelled; no cancel or assignment takes it after.
         let (cancelled, tail) = {
             let mut map = ctx.resumable.lock().unwrap();
-            if map.get(&key).is_some_and(|e| e.cancelled) {
+            let e = map.get_mut(&key);
+            let ends = answer.is_err() || e.as_ref().is_some_and(|e| e.cancelled);
+            if ends {
                 ctx.cancelled.lock().unwrap().remove(&key);
-                (true, map.remove(&key).and_then(|e| e.log_tail))
-            } else {
-                if let Some(e) = map.get_mut(&key) {
-                    // No longer held: a cancel now kills it, as any run.
-                    e.adopting = false;
-                }
-                (false, None)
             }
+            let tail = e.and_then(|e| {
+                (e.adopting, e.cancelled) = (false, ends);
+                ends.then(|| e.log_tail.take()).flatten()
+            });
+            (ends, tail)
         };
         match answer {
-            Ok((build, _)) if cancelled => kill_held(&ctx, st, &dir, Some(build), tail, slot),
-            Ok((build, _)) => rt.block_on(adopt(&ctx, st, dir, build, slot)),
-            Err(e) => {
-                tracing::warn!(
-                    id = st.build_id,
-                    "its agent answered at last, without the build: {}",
-                    chain(&e)
-                );
-                if cancelled {
-                    remove_state(tail, &dir);
-                } else {
-                    drop_held(&ctx, &key, &dir);
+            Ok((build, _)) if !cancelled => rt.block_on(adopt(&ctx, st, dir, build, lease)),
+            answer => {
+                if let Err(e) = &answer {
+                    let e = chain(e);
+                    let why = "its agent answered at last, without the build";
+                    tracing::warn!(id = st.build_id, "{why}: {e}");
                 }
-                ctx.agents.release(st.agent_socket);
+                let build = answer.ok().map(|(build, _)| (st, build));
+                Ending(Some(key), dir, Some(lease), tail).end(&ctx, build);
             }
         }
     });
 }
 
-/// Drop the held build keyed `key` that its agent no longer has: its
-/// state goes before its key, since the hub, told by the next heartbeat
-/// without the key, runs the build again under the same build id, which
-/// a worker adopting from that state would take for this run. A cancel
-/// taken meanwhile goes with the key: it has no run left, and would kill
-/// the key's next run here.
-fn drop_held(ctx: &WorkerCtx, key: &str, dir: &Path) {
-    let tail = ctx
-        .resumable
-        .lock()
-        .unwrap()
-        .get_mut(key)
-        .and_then(|e| e.log_tail.take());
-    remove_state(tail, dir);
-    let mut map = ctx.resumable.lock().unwrap();
-    map.remove(key);
-    ctx.cancelled.lock().unwrap().remove(key);
-}
-
 /// Remove `dir`'s state.json, which a restarted worker adopts its build
-/// from; the rest of the dir can go later.
-pub(super) fn unrecord(dir: &Path) {
+/// from; the rest of the dir can go later. False if it is still there.
+pub(super) fn unrecord(dir: &Path) -> bool {
     // Whatever fails here fails the removal of the rest, which warns.
-    let _ = fs::remove_file(dir.join("state.json"));
-}
-
-/// Remove a build dir once `tail`, its log tailer, has stopped: the
-/// offset it writes there meanwhile would fail the removal.
-fn remove_state(tail: Option<LogTail>, dir: &Path) {
-    if let Some(t) = tail {
-        t.stop();
-    }
-    remove_build_dir(dir);
+    let gone = fs::remove_file(dir.join("state.json"));
+    gone.map_or_else(|e| e.kind() == io::ErrorKind::NotFound, |()| true)
 }
 
 /// If the hub cancelled the held build keyed `key`, fail it to the hub
@@ -340,23 +312,6 @@ fn fail_cancelled(ctx: &WorkerCtx, key: &str) {
     }
 }
 
-/// Kill an adopted build `st` that the hub cancelled, and have its agent
-/// clean it up.
-fn kill(st: &ResumeState, build: agents::AgentBuild) {
-    let socket = &st.agent_socket;
-    if let Err(e) = agents::kill(socket, &st.build_id) {
-        tracing::warn!(id = st.build_id, "killing a cancelled build: {}", chain(&e));
-    }
-    if let Err(e) = build.wait_exit() {
-        tracing::warn!(
-            id = st.build_id,
-            "waiting for a cancelled build: {}",
-            chain(&e)
-        );
-    }
-    agents::retire(socket, &st.build_id, "agent cleanup");
-}
-
 /// Clean up agent builds without an on-disk record, left by a Start
 /// that raced the previous worker's shutdown. They fail every later
 /// Start on their agent with Busy. Runs after adoption, so adopted
@@ -371,7 +326,7 @@ pub(super) fn sweep_orphaned_agent_builds(ctx: &Arc<WorkerCtx>, sockets: Vec<Pat
                 if let Err(e) = agents::shutdown(&socket) {
                     tracing::warn!("agent shutdown {}: {}", socket.display(), chain(&e));
                 }
-                ctx.agents.release(socket);
+                ctx.agents.probe_up(&socket);
                 continue;
             }
             Err(e) if agents::unreachable(&e) => {
@@ -388,13 +343,11 @@ pub(super) fn sweep_orphaned_agent_builds(ctx: &Arc<WorkerCtx>, sockets: Vec<Pat
         tracing::warn!(id, "cleaning up an orphaned agent build");
         // Cleanup is slow. Run it in the background, with the agent
         // reserved, so the hub connection is not delayed.
-        let slot = ctx.reserve(&socket);
-        let ctx = ctx.clone();
+        let lease = ctx.agents.lease_this(&socket);
         tokio::task::spawn_blocking(move || {
-            let _slot = slot;
             let _ = agents::kill(&socket, &id);
             agents::retire(&socket, &id, "orphaned build cleanup");
-            ctx.agents.release(socket);
+            drop(lease);
         });
     }
 }
@@ -422,14 +375,7 @@ fn rescan_agents(ctx: &Arc<WorkerCtx>, dir: Option<&Path>) {
             Err(e) => tracing::warn!("agent-sockets-dir {}: {e}", dir.display()),
         }
     }
-    let before = ctx.agents.usable();
     sweep_orphaned_agent_builds(ctx, ctx.agents.down_sockets());
-    let usable = ctx.agents.usable();
-    if usable > before {
-        tracing::info!(usable, "build agents joined");
-        // The session hands out the new slots and re-declares capacity.
-        ctx.slot_freed.notify_one();
-    }
 }
 
 /// Take fresh temp roots for an adopted build's inputs on a new daemon
@@ -524,4 +470,44 @@ impl ResumeState {
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use super::*;
+
+    mod lifecycle;
+
+    #[test]
+    fn a_finished_state_written_before_usage_existed_still_loads() {
+        let old = r#"{"phase":"finished","dedupe_key":"k","build_id":"b","exit_code":0,"error":"","outputs":[]}"#;
+        let Ok(BuildState::Finished {
+            usage, exit_code, ..
+        }) = serde_json::from_str(old)
+        else {
+            panic!("old finished state did not load");
+        };
+        assert_eq!((exit_code, usage), (0, Usage::default()));
+    }
+
+    #[test]
+    fn a_finished_state_keeps_its_usage() {
+        let u = Usage {
+            wall_ms: 1500,
+            cpu_usec: 2_000_000,
+            peak_memory_bytes: 1 << 30,
+            oom_killed: true,
+            frozen_ms: 500,
+        };
+        let st = BuildState::Finished {
+            dedupe_key: "k".into(),
+            build_id: "b".into(),
+            exit_code: 1,
+            usage: u,
+            error: String::new(),
+            outputs: vec![],
+        };
+        let json = serde_json::to_string(&st).unwrap();
+        let Ok(BuildState::Finished { usage, .. }) = serde_json::from_str(&json) else {
+            panic!("finished state did not round trip");
+        };
+        assert_eq!(usage, u);
+    }
+}

@@ -16,9 +16,10 @@ use tokio::sync::mpsc;
 use tonic::Status;
 
 use super::cancel;
-use super::losses::Dispatch;
+use super::losses::{Dispatch, Run};
 use super::metrics::Metrics;
 use super::naming::drv_name;
+use super::record::Rest;
 use super::state::{HubState, Job, Replay};
 use crate::errors::{Error, Result, err_msg};
 use crate::proto::{
@@ -111,11 +112,20 @@ pub(super) async fn run_job(
         match m {
             // The worker already holds this build (it survived a hub
             // restart). Its result arrives like any other.
-            worker_message::Msg::Resumed(_) => {
-                dispatch.resumed = true;
+            worker_message::Msg::Resumed(r) => {
+                let run = if r.finished {
+                    Run::Finished
+                } else {
+                    Run::Started
+                };
+                (dispatch.reached, dispatch.resumed) = (dispatch.reached.max(run), true);
                 resumed_after = Some(state.heartbeats(session));
                 tracing::info!(id = job.id, "worker resumed an in-flight build");
             }
+            worker_message::Msg::Started(_) => {
+                dispatch.reached = dispatch.reached.max(Run::Started);
+            }
+            worker_message::Msg::ResultGone(_) => return Err(Error::ResultGone),
             worker_message::Msg::Log(l) => {
                 job.replay.publish(attach_event::Event::Log(l.data)).await;
             }
@@ -126,10 +136,19 @@ pub(super) async fn run_job(
             worker_message::Msg::Result(res) => {
                 if let Some(u) = &res.usage {
                     state.metrics.observe_usage(&job.req.system, u);
+                    let rest = Rest::of(job, worker);
+                    let out_path = rest.out_path.clone();
+                    state
+                        .placement
+                        .lock()
+                        .unwrap()
+                        .learn(job, res.exit_code, u, rest);
                     tracing::info!(
                         id = job.id,
                         key = job.key,
+                        system = job.req.system,
                         drv = drv_name(&job.req).unwrap_or_default(),
+                        out_path = out_path.as_deref().unwrap_or_default(),
                         worker,
                         exit_code = res.exit_code,
                         wall_ms = u.wall_ms,
@@ -143,6 +162,7 @@ pub(super) async fn run_job(
                 if res.exit_code != 0 {
                     return publish_worker_failure(state, out_tx, job, &res).await;
                 }
+                dispatch.reached = Run::Finished;
                 let outputs = verify_set(res.outputs, &job.req.outputs)?;
                 deliver_outputs(state, job, out_tx, &mut in_rx, outputs).await?;
                 finish_relay(state, out_tx, &job.replay, job).await;
@@ -161,7 +181,7 @@ pub(super) async fn run_job(
 /// Log/error-safe name of a worker message variant. The messages embed
 /// peer-controlled bytes (NAR chunks, log data); Debug-formatting them
 /// into error strings would balloon logs and replay buffers.
-pub(super) fn msg_name(msg: &worker_message::Msg) -> &'static str {
+pub(crate) fn msg_name(msg: &worker_message::Msg) -> &'static str {
     match msg {
         worker_message::Msg::Register(_) => "Register",
         worker_message::Msg::Heartbeat(_) => "Heartbeat",
@@ -171,6 +191,8 @@ pub(super) fn msg_name(msg: &worker_message::Msg) -> &'static str {
         worker_message::Msg::Chunk(_) => "ChunkFrame",
         worker_message::Msg::RequestJob(_) => "RequestJob",
         worker_message::Msg::Resumed(_) => "Resumed",
+        worker_message::Msg::Started(_) => "Started",
+        worker_message::Msg::ResultGone(_) => "ResultGone",
     }
 }
 

@@ -12,7 +12,7 @@ use tonic::Status;
 use super::{msg_name, recv, send};
 use crate::chunker::{Recipe, decode_chunk, parse_recipe};
 use crate::chunkstore::Hash;
-use crate::errors::{Result, err_ctx, err_msg};
+use crate::errors::{Error, Result, err_ctx, err_msg};
 use crate::hub::chunkcache::ChunkCache;
 use crate::hub::state::{HubState, Job, KeptOutputs};
 use crate::proto::{
@@ -88,6 +88,7 @@ impl ChunkSource<'_> {
     async fn receive(&mut self, hash: &Hash) -> Result<Vec<u8>> {
         let c = match recv(self.in_rx).await? {
             worker_message::Msg::Chunk(c) if !c.eof => c,
+            worker_message::Msg::ResultGone(_) => return Err(Error::ResultGone),
             other => {
                 return Err(err_msg(format!(
                     "expected output chunk, got {}",
@@ -104,6 +105,7 @@ impl ChunkSource<'_> {
     async fn finish(self) -> Result<()> {
         match recv(self.in_rx).await? {
             worker_message::Msg::Chunk(c) if c.eof => Ok(()),
+            worker_message::Msg::ResultGone(_) => Err(Error::ResultGone),
             other => Err(err_msg(format!(
                 "expected end of output chunks, got {}",
                 msg_name(&other)

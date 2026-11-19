@@ -26,7 +26,9 @@ mod daemon;
 mod fod_ipv6;
 mod harness;
 mod held;
+mod history;
 mod pairs;
+mod spread;
 
 use std::time::Instant;
 

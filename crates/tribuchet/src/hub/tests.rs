@@ -14,8 +14,8 @@ use testlog::Captured;
 use crate::config::NixConfig;
 use crate::proto::attach_hub_client::AttachHubClient;
 use crate::proto::{
-    AttachEvent, BuildAssignment, BuildMessage, BuildRequest, Heartbeat, SystemCaps, TmpDirChunk,
-    attach_hub_server, build_message,
+    AttachEvent, BuildAssignment, BuildMessage, BuildRequest, Heartbeat, Resumed, SystemCaps,
+    TmpDirChunk, attach_hub_server, build_message,
 };
 
 mod attempts;
@@ -24,7 +24,9 @@ mod clientless_chain;
 mod clientless_farm;
 mod daemon;
 pub(super) mod fake_daemon;
+mod rank;
 mod reconnect;
+mod slow_link;
 mod unlisted;
 mod usage;
 
@@ -103,12 +105,12 @@ async fn heartbeat_updates_the_advertised_capacity() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("nix.conf");
     let mut state = HubState::for_test(Duration::ZERO);
-    state.nix_config = Some(NixConfig {
+    state.nix_config = Some(HubState::nix_config_writer(NixConfig {
         path: path.clone(),
         attach_program: "/attach".into(),
         oversubscribe_percent: 100,
         max_jobs_cap: 256,
-    });
+    }));
     let state = Arc::new(state);
     let caps = WorkerCaps {
         name: "w".into(),
@@ -116,7 +118,18 @@ async fn heartbeat_updates_the_advertised_capacity() {
         systems: HashMap::new(),
         max_jobs: 2,
     };
+    // Written on a blocking thread: the registration's rendering, then,
+    // once the heartbeat is routed, its own.
+    let conf = || fs::read_to_string(&path).unwrap_or_default();
+    let written = async |jobs: u32| {
+        let line = format!("max-jobs = {jobs}\n");
+        for _ in (0..1000).take_while(|_| !conf().contains(&line)) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        conf().contains(&line)
+    };
     let guard = CapsGuard::new(state.clone(), caps);
+    assert!(written(2).await, "{}", conf());
     let id = guard.id;
     let (tx, rx) = mpsc::channel(4);
     tx.send(heartbeat(Some(3))).await.unwrap();
@@ -126,12 +139,7 @@ async fn heartbeat_updates_the_advertised_capacity() {
     route_loop(rx, Router::default(), admission, state.clone(), id).await;
     let jobs = state.worker_caps.lock().unwrap()[&id].max_jobs;
     assert_eq!(jobs, 3);
-    // Written on a blocking thread, after the heartbeat is routed.
-    let conf = || fs::read_to_string(&path).unwrap_or_default();
-    for _ in (0..1000).take_while(|_| !conf().contains("max-jobs = 3\n")) {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(conf().contains("max-jobs = 3\n"), "{}", conf());
+    assert!(written(3).await, "{}", conf());
 }
 
 fn caps(name: &str) -> WorkerCaps {
@@ -167,9 +175,11 @@ pub(super) fn job(n: usize, replay: Arc<Replay>) -> Job {
         replay,
         listing: Arc::default(),
         attempts: 0,
-        resumed_losses: 0,
+        transport_losses: 0,
         queued_at: Instant::now(),
         loss: None,
+        deferred: None,
+        expected: placement::Expected::prior(false),
     }
 }
 
@@ -180,11 +190,11 @@ async fn lose_session(
     state: &Arc<HubState>,
     job: Job,
     worker: CapsGuard,
-    said: Option<worker_message::Msg>,
+    said: impl IntoIterator<Item = worker_message::Msg>,
 ) {
     let router = Router::default();
     let in_rx = router.register(&job.id);
-    if let Some(m) = said {
+    for m in said {
         let tx = router.builds.lock().unwrap()[&job.id].clone();
         tx.send(m).await.unwrap();
     }
@@ -207,6 +217,12 @@ async fn lose_session(
     .await;
 }
 
+/// The worker says it holds a run of build `build_id`, `finished` or not.
+fn resumed(build_id: &str, finished: bool) -> worker_message::Msg {
+    let build_id = build_id.into();
+    worker_message::Msg::Resumed(Resumed { build_id, finished })
+}
+
 #[tokio::test]
 async fn restarted_worker_gets_its_build_back() {
     let state = Arc::new(HubState::for_test(Duration::from_secs(30)));
@@ -215,11 +231,11 @@ async fn restarted_worker_gets_its_build_back() {
     let _client = replay.subscribe().await;
     lose_session(&state, job(1, replay), register(&state, "w1", &[]), None).await;
     assert!(
-        state.take_job(&caps("w2")).await.is_none(),
+        state.take_job(&caps("w2"), None).await.is_none(),
         "build handed to another worker while its own reconnects"
     );
     let back = register(&state, "w1", &["k1"]);
-    assert!(state.take_job(&caps("w2")).await.is_none());
+    assert!(state.take_job(&caps("w2"), None).await.is_none());
     // Not counted: the dispatch to the worker that lost it settles it.
     let resumed = state.take_job_by_key(back.id).await;
     assert_eq!(
@@ -235,9 +251,9 @@ async fn build_goes_elsewhere_once_the_grace_ends() {
     let replay = Arc::new(Replay::default());
     let _client = replay.subscribe().await;
     lose_session(&state, job(1, replay), register(&state, "w1", &[]), None).await;
-    assert!(state.take_job(&caps("w2")).await.is_none());
+    assert!(state.take_job(&caps("w2"), None).await.is_none());
     tokio::time::sleep(Duration::from_millis(1100)).await;
-    assert!(state.take_job(&caps("w2")).await.is_some());
+    assert!(state.take_job(&caps("w2"), None).await.is_some());
 }
 
 /// The worker came back without the build (it was still staging):
@@ -250,7 +266,7 @@ async fn build_is_released_when_its_worker_returns_without_it() {
     let _client = replay.subscribe().await;
     lose_session(&state, job(1, replay), register(&state, "w1", &[]), None).await;
     let _back = register(&state, "w1", &[]);
-    assert!(state.take_job(&caps("w2")).await.is_some());
+    assert!(state.take_job(&caps("w2"), None).await.is_some());
 }
 
 /// No worker returns and none other serves the system: the build is
@@ -286,7 +302,7 @@ async fn client_waits_when_no_worker_returns() {
     assert!(waited >= 1200, "told after {waited} ms");
     let _back = register(&state, "w2", &[]);
     assert!(
-        state.take_job(&caps("w2")).await.is_some(),
+        state.take_job(&caps("w2"), None).await.is_some(),
         "the held build was not handed out"
     );
 }
@@ -305,6 +321,7 @@ fn request_job(capacity: u32, assignments: Option<u64>) -> WorkerMessage {
         msg: Some(worker_message::Msg::RequestJob(RequestJob {
             capacity,
             assignments,
+            free_slots: None,
         })),
     }
 }
@@ -326,6 +343,7 @@ pub(super) fn connect(state: &Arc<HubState>, name: &str, slots: u32, held: &[&st
         }],
         resumable_keys: held.iter().map(|k| (*k).to_owned()).collect(),
         max_jobs: slots,
+        ..Register::default()
     };
     let (out_tx, from_hub) = mpsc::channel(256);
     let (to_hub, in_rx) = mpsc::channel(64);
@@ -440,6 +458,7 @@ fn a_declaration_leaves_free_what_the_worker_has_not_been_sent() {
         a.declare(&RequestJob {
             capacity,
             assignments,
+            free_slots: None,
         });
         assert_eq!(
             a.free, free,
@@ -559,8 +578,8 @@ async fn a_worker_advertising_recursive_nix_gets_no_build_requiring_it() {
             system: "x86_64-linux".into(),
             features: features.to_vec(),
         }],
-        resumable_keys: vec![],
         max_jobs: 2,
+        ..Register::default()
     };
     let (out_tx, mut from_hub) = mpsc::channel(256);
     let (to_hub, in_rx) = mpsc::channel(64);

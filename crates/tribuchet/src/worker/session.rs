@@ -1,20 +1,25 @@
 //! Hub session: connect, register, and drive the per-build message loop.
 
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, VecDeque};
 use std::fs;
+use std::future::poll_fn;
+use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
+use tokio_util::sync::PollSender;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint, Identity};
 
-use super::build::{ActiveBuild, StagingStatus, Wake, validate_assignment};
-use super::caps::system_caps;
+use super::build::{ActiveBuild, Negotiation, StagingStatus, Wake, validate_assignment};
+use super::caps::{build_memory, cores, own_cgroup, system_caps};
+use super::lease::Lease;
 use super::resume::{
-    CANCELLED, ResumableBuild, ack_delivery, execute_to_finished, record_finished, serve_chunks,
-    try_deliver,
+    CANCELLED, ResumableBuild, ack_delivery, execute_to_finished, record_finished, release,
+    serve_chunks, try_deliver,
 };
 use super::{WorkerCtx, hostname, loadavg1, msg};
 use crate::chunkio;
@@ -22,7 +27,7 @@ use crate::config::{Auth, WorkerConfig};
 use crate::errors::{Error, Result, chain, err_ctx, err_msg};
 use crate::proto::{
     BuildAssignment, BuildResult, CancelBuild, Heartbeat, HubMessage, MAX_MSG_SIZE, Need, Register,
-    RequestJob, Resumed, WorkerMessage, hub_message, worker_hub_client::WorkerHubClient,
+    Resumed, Started, WorkerMessage, hub_message, worker_hub_client::WorkerHubClient,
     worker_message,
 };
 use crate::sd;
@@ -43,14 +48,7 @@ pub(super) async fn session(opts: &WorkerConfig, ctx: &Arc<WorkerCtx>) -> Result
             ));
         endpoint = endpoint.tls_config(tls)?;
     }
-    let channel = endpoint
-        // Detect a silently dead hub connection instead of waiting on a
-        // half-open TCP session forever.
-        .http2_keep_alive_interval(Duration::from_secs(30))
-        .keep_alive_timeout(Duration::from_secs(20))
-        .keep_alive_while_idle(true)
-        .initial_stream_window_size(Some(chunkio::H2_STREAM_WINDOW))
-        .initial_connection_window_size(Some(chunkio::H2_CONNECTION_WINDOW))
+    let channel = chunkio::session_endpoint(endpoint)
         .connect()
         .await
         .map_err(err_ctx("connecting to hub"))?;
@@ -66,7 +64,13 @@ pub(super) async fn session(opts: &WorkerConfig, ctx: &Arc<WorkerCtx>) -> Result
             worker_name: hostname(),
             caps: system_caps(opts, ctx),
             resumable_keys: ctx.resumable_keys(),
-            max_jobs: u32::try_from(ctx.jobs()).unwrap_or(u32::MAX),
+            max_jobs: u32::try_from(ctx.agents.room().capacity).unwrap_or(u32::MAX),
+            cores: cores(),
+            build_memory: build_memory(
+                Path::new("/sys/fs/cgroup"),
+                Path::new("/proc/meminfo"),
+                &own_cgroup().unwrap_or_default(),
+            ),
         })))
         .await?;
 
@@ -91,6 +95,7 @@ pub(super) async fn session(opts: &WorkerConfig, ctx: &Arc<WorkerCtx>) -> Result
     for (_, build) in active.drain() {
         build.abort().await;
     }
+    release(ctx, &out_tx);
     result
 }
 
@@ -106,35 +111,59 @@ async fn session_loop(
         out_tx,
         build_timeout,
         assignments: AtomicU64::default(),
+        outbox: Outbox::default(),
     };
     // Builds staged to completion but waiting for a free slot.
     let mut ready: VecDeque<String> = VecDeque::new();
-    let mut heartbeat = tokio::time::interval(Duration::from_secs(30));
+    let mut heartbeat = tokio::time::interval(chunkio::HEARTBEAT);
+    let mut sender = PollSender::new(out_tx.clone());
     let (wake_tx, mut wake_rx) = mpsc::unbounded_channel::<Wake>();
-    declare_capacity(active, &ready, &env).await?;
+    // Negotiations with the daemon, off the loop: it reads the hub meanwhile.
+    let mut negotiations = tokio::task::JoinSet::<Negotiation>::new();
+    env.outbox.declare.set(true);
     loop {
         let m = tokio::select! {
-            () = ctx.slot_freed.notified() => {
+            room = poll_fn(|cx| sender.poll_reserve(cx)), if env.outbox.pending() => {
+                let lost = |_| err_msg("hub connection lost");
+                room.map_err(lost)?;
+                let queued = env.outbox.queue.borrow_mut().pop_front();
+                let (m, sent) = queued.unwrap_or_else(|| {
+                    if env.outbox.declare.take() {
+                        (capacity(active, &ready, &env), None)
+                    } else {
+                        env.outbox.beat.set(false);
+                        (beat(active, ctx), None)
+                    }
+                });
+                sender.send_item(m).map_err(lost)?;
+                if let Some(sent) = sent {
+                    let _ = sent.send(());
+                }
+                continue;
+            }
+            () = ctx.agents.changed.notified() => {
                 grant_slots(active, &mut ready, &env);
-                declare_capacity(active, &ready, &env).await?;
+                env.outbox.declare.set(true);
                 continue;
             }
             _ = heartbeat.tick() => {
-                let staging = active.values().filter(|b| b.slot.is_some()).count();
-                let running = ctx.held.lock().unwrap().saturating_sub(staging);
-                out_tx.send(msg(worker_message::Msg::Heartbeat(Heartbeat {
-                    running_jobs: u32::try_from(running).unwrap_or(u32::MAX),
-                    load1: loadavg1(),
-                    resumable_keys: ctx.resumable_keys(),
-                    max_jobs: u32::try_from(ctx.jobs()).ok(),
-                }))).await?;
-                declare_capacity(active, &ready, &env).await?;
+                env.outbox.beat.set(true);
+                env.outbox.declare.set(true);
                 continue;
             }
             Some(w) = wake_rx.recv() => {
                 if let Some(build) = active.get_mut(&w.build_id) {
                     let res = build.woken(&w.path);
-                    advance_staging(active, &mut ready, &w.build_id, res, &env).await?;
+                    advance_staging(active, &mut ready, &w.build_id, res, &env).await;
+                }
+                continue;
+            }
+            Some(done) = negotiations.join_next() => {
+                let (id, dir, checked) = done?;
+                // Not cancelled, nor its id assigned again, meanwhile.
+                if let Some(build) = active.get_mut(&id).filter(|b| b.dir == dir) {
+                    let res = build.negotiated(checked);
+                    advance_staging(active, &mut ready, &id, res, &env).await;
                 }
                 continue;
             }
@@ -146,36 +175,35 @@ async fn session_loop(
         match m {
             hub_message::Msg::Assignment(a) => {
                 env.assignments.fetch_add(1, Ordering::Relaxed);
-                if let Some(id) = handle_assignment(a, active, &wake_tx, out_tx, ctx).await? {
-                    let res = active.get_mut(&id).unwrap().negotiate().await;
-                    advance_staging(active, &mut ready, &id, res, &env).await?;
+                if let Some(id) = handle_assignment(a, active, &wake_tx, &env).await {
+                    negotiations.spawn(active[&id].negotiation());
                 }
-                declare_capacity(active, &ready, &env).await?;
+                env.outbox.declare.set(true);
             }
             hub_message::Msg::TmpDir(t) => {
                 let id = t.build_id.clone();
                 if let Some(build) = active.get_mut(&id) {
                     let res = build.feed_tmp_dir(t).await.map(|s| (None, s));
-                    advance_staging(active, &mut ready, &id, res, &env).await?;
+                    advance_staging(active, &mut ready, &id, res, &env).await;
                 }
             }
             hub_message::Msg::Manifest(m) => {
                 let id = m.build_id.clone();
                 if let Some(build) = active.get_mut(&id) {
                     let res = build.feed_manifest(&m);
-                    advance_staging(active, &mut ready, &id, res, &env).await?;
+                    advance_staging(active, &mut ready, &id, res, &env).await;
                 }
             }
             hub_message::Msg::Chunk(c) => {
                 let id = c.build_id.clone();
                 if let Some(build) = active.get_mut(&id) {
                     let res = build.feed_chunk(&c);
-                    advance_staging(active, &mut ready, &id, res, &env).await?;
+                    advance_staging(active, &mut ready, &id, res, &env).await;
                 }
             }
             hub_message::Msg::Cancel(c) => {
-                handle_cancel(c, active, out_tx, ctx).await?;
-                declare_capacity(active, &ready, &env).await?;
+                handle_cancel(c, active, &env.outbox, ctx).await;
+                env.outbox.declare.set(true);
             }
             hub_message::Msg::Need(n) => {
                 serve_chunks(ctx, n.build_id, &n.hashes, out_tx.clone());
@@ -190,21 +218,60 @@ async fn session_loop(
 /// Free slots, plus one lookahead build staged while every slot is
 /// busy so a finishing build hands over without a round trip. None
 /// with no agent reachable.
-async fn declare_capacity(
+fn capacity(
     active: &HashMap<String, ActiveBuild>,
     ready: &VecDeque<String>,
     env: &LaunchEnv<'_>,
-) -> Result<()> {
-    let lookahead =
-        env.ctx.jobs() > 0 && ready.is_empty() && active.values().all(|b| b.slot.is_some());
-    let capacity = env.ctx.free_slots() + usize::from(lookahead);
-    env.out_tx
-        .send(msg(worker_message::Msg::RequestJob(RequestJob {
-            capacity: u32::try_from(capacity).unwrap_or(u32::MAX),
-            assignments: Some(env.assignments.load(Ordering::Relaxed)),
-        })))
-        .await?;
-    Ok(())
+) -> WorkerMessage {
+    let lookahead = ready.is_empty() && active.values().all(|b| b.lease.is_some());
+    let assignments = env.assignments.load(Ordering::Relaxed);
+    let asked = env.ctx.agents.room().request(lookahead, assignments);
+    msg(worker_message::Msg::RequestJob(asked))
+}
+
+/// The worker's heartbeat: its state now.
+fn beat(active: &HashMap<String, ActiveBuild>, ctx: &WorkerCtx) -> WorkerMessage {
+    let staging = active.values().filter(|b| b.lease.is_some()).count();
+    let room = ctx.agents.room();
+    let running = room.leases.saturating_sub(staging);
+    msg(worker_message::Msg::Heartbeat(Heartbeat {
+        running_jobs: u32::try_from(running).unwrap_or(u32::MAX),
+        load1: loadavg1(),
+        resumable_keys: ctx.resumable_keys(),
+        max_jobs: u32::try_from(room.capacity).ok(),
+    }))
+}
+
+/// What session_loop sends, held until the session channel has room.
+/// Outputs can fill the channel for minutes on a slow link; a loop
+/// waiting there would stop reading the hub, whose messages are what
+/// keeps the worker's keepalive from PINGing behind those outputs.
+#[derive(Default)]
+pub(super) struct Outbox {
+    /// Sent in order, each told to its waiter (if any) once in the channel.
+    queue: RefCell<VecDeque<(WorkerMessage, Option<oneshot::Sender<()>>)>>,
+    /// A capacity declaration, a heartbeat due. Each is read as it is
+    /// sent: it says the worker's state, so the latest is all that counts.
+    declare: Cell<bool>,
+    beat: Cell<bool>,
+}
+
+impl Outbox {
+    fn send(&self, m: WorkerMessage) {
+        self.queue.borrow_mut().push_back((m, None));
+    }
+
+    /// Queue `m`; the receiver hears once it is in the session channel,
+    /// or errs if the session ends first.
+    fn send_told(&self, m: WorkerMessage) -> oneshot::Receiver<()> {
+        let (tx, rx) = oneshot::channel();
+        self.queue.borrow_mut().push_back((m, Some(tx)));
+        rx
+    }
+
+    fn pending(&self) -> bool {
+        self.declare.get() || self.beat.get() || !self.queue.borrow().is_empty()
+    }
 }
 
 /// Act on a staging step: forward a Need, launch, or abort.
@@ -214,15 +281,16 @@ async fn advance_staging(
     id: &str,
     res: Result<(Option<Need>, StagingStatus)>,
     env: &LaunchEnv<'_>,
-) -> Result<()> {
+) {
     let status = match res {
         Err(e) => {
-            abort_active(active, id, env.out_tx, &e).await?;
-            return declare_capacity(active, ready, env).await;
+            abort_active(active, id, &env.outbox, &e).await;
+            env.outbox.declare.set(true);
+            return;
         }
         Ok((need, status)) => {
             if let Some(n) = need {
-                env.out_tx.send(msg(worker_message::Msg::Need(n))).await?;
+                env.outbox.send(msg(worker_message::Msg::Need(n)));
             }
             status
         }
@@ -231,19 +299,15 @@ async fn advance_staging(
         StagingStatus::InProgress => {}
         StagingStatus::Ready => {
             let build = active.get_mut(id).unwrap();
-            if build.slot.is_none() {
-                build.slot = env.ctx.try_slot();
-            }
-            if build.slot.is_none() {
+            let Some(lease) = build.lease.take().or_else(|| env.ctx.agents.lease()) else {
                 ready.push_back(id.to_string());
-                return Ok(());
-            }
+                return;
+            };
             let build = active.remove(id).unwrap();
-            launch_build(env.ctx, build, env.out_tx, env.build_timeout);
-            declare_capacity(active, ready, env).await?;
+            launch_build(build, lease, env);
+            env.outbox.declare.set(true);
         }
     }
-    Ok(())
 }
 
 /// Cancel a build. Still staging: tear it down right here. Already
@@ -253,13 +317,13 @@ async fn advance_staging(
 pub(super) async fn handle_cancel(
     c: CancelBuild,
     active: &mut HashMap<String, ActiveBuild>,
-    out_tx: &mpsc::Sender<WorkerMessage>,
+    outbox: &Outbox,
     ctx: &Arc<WorkerCtx>,
-) -> Result<()> {
+) {
     tracing::info!(id = c.build_id, "hub cancelled the build");
     if let Some(build) = active.remove(&c.build_id) {
         build.abort().await;
-        fail_build(out_tx, &c.build_id, &err_msg(CANCELLED)).await?;
+        fail_build(outbox, &c.build_id, &err_msg(CANCELLED));
     } else {
         // Only flag builds that are still running: a key flagged for
         // an already-finished build would never be consumed and would
@@ -269,12 +333,23 @@ pub(super) async fn handle_cancel(
         // check and the insert. The entry remembers the cancel, which a
         // later assignment of its key voids (adopt_assignment).
         let mut map = ctx.resumable.lock().unwrap();
-        if let Some(e) = map.get_mut(&c.dedupe_key).filter(|e| e.finished.is_none()) {
+        let open = |e: &&mut ResumableBuild| e.finished.is_none() && !(e.cancelled && !e.adopting);
+        if let Some(e) = map.get_mut(&c.dedupe_key).filter(open) {
             e.cancelled = true;
-            ctx.cancelled.lock().unwrap().insert(c.dedupe_key);
+            ctx.cancelled.lock().unwrap().insert(c.dedupe_key.clone());
         }
+        // A finished result is its run's outcome: the cancel says that its
+        // dispatch wants it no longer, not that no later one will. Kept for
+        // those (adopt_assignment), it is reaped a ttl on, as when its
+        // session closes; a cancel for an earlier adoption leaves it.
+        let held = |e: &&mut ResumableBuild| e.finished.is_some() && e.build_id == c.build_id;
+        if let Some(e) = map.get_mut(&c.dedupe_key).filter(held) {
+            e.released.get_or_insert_with(Instant::now);
+        }
+        drop(map);
+        // A build waiting for an agent looks at its cancel now.
+        ctx.agents.wake();
     }
-    Ok(())
 }
 
 /// Everything needed to launch a staged build.
@@ -284,6 +359,7 @@ struct LaunchEnv<'a> {
     build_timeout: Duration,
     /// Assignments received this session, declared with the capacity.
     assignments: AtomicU64,
+    outbox: Outbox,
 }
 
 /// Hand freed slots to staged builds waiting for one.
@@ -294,16 +370,15 @@ fn grant_slots(
 ) {
     while let Some(id) = ready.front() {
         // cancel may have removed it from active
-        let Some(build) = active.get_mut(id) else {
+        if !active.contains_key(id) {
             ready.pop_front();
             continue;
-        };
-        let Some(slot) = env.ctx.try_slot() else {
+        }
+        let Some(lease) = env.ctx.agents.lease() else {
             break;
         };
-        build.slot = Some(slot);
         let build = active.remove(&ready.pop_front().unwrap()).unwrap();
-        launch_build(env.ctx, build, env.out_tx, env.build_timeout);
+        launch_build(build, lease, env);
     }
 }
 
@@ -312,23 +387,28 @@ async fn handle_assignment(
     a: BuildAssignment,
     active: &mut HashMap<String, ActiveBuild>,
     wake: &mpsc::UnboundedSender<Wake>,
-    out_tx: &mpsc::Sender<WorkerMessage>,
-    ctx: &Arc<WorkerCtx>,
-) -> Result<Option<String>> {
+    env: &LaunchEnv<'_>,
+) -> Option<String> {
+    let ctx = env.ctx;
     // A key we already hold means a hub (likely freshly restarted)
     // re-dispatched a build we are running or have finished: adopt
     // the new build_id and deliver the result when there is one,
     // instead of building again.
-    if ctx.adopt_assignment(&a, out_tx) {
+    if let Some(adoption) = ctx.adopt_assignment(&a, env.out_tx) {
         tracing::info!(id = a.build_id, key = a.dedupe_key, "build resumed");
-        out_tx
-            .send(msg(worker_message::Msg::Resumed(Resumed {
-                build_id: a.build_id.clone(),
-            })))
-            .await?;
-        let ctx = ctx.clone();
-        tokio::task::spawn_blocking(move || try_deliver(&ctx, &a.dedupe_key));
-        return Ok(None);
+        let (ctx, out_tx) = (ctx.clone(), env.out_tx.clone());
+        // Told first, off the loop. Read after the adoption: a run
+        // finished by then has its result delivered to it.
+        tokio::task::spawn_blocking(move || {
+            let finished = (ctx.resumable.lock().unwrap().get(&a.dedupe_key))
+                .is_some_and(|e| e.finished.is_some());
+            let build_id = a.build_id.clone();
+            let resumed = msg(worker_message::Msg::Resumed(Resumed { build_id, finished }));
+            if out_tx.blocking_send(resumed).is_ok() {
+                try_deliver(&ctx, &a.dedupe_key, Some(adoption));
+            }
+        });
+        return None;
     }
     tracing::info!(id = a.build_id, "build assigned");
     // build ids are never reused; a duplicate is a confused hub
@@ -339,13 +419,13 @@ async fn handle_assignment(
     let build_id = a.build_id.clone();
     match validate_assignment(&a).and_then(|()| ActiveBuild::new(a, ctx.clone(), wake.clone())) {
         Ok(mut b) => {
-            b.slot = ctx.try_slot();
+            b.lease = ctx.agents.lease();
             active.insert(build_id.clone(), b);
-            Ok(Some(build_id))
+            Some(build_id)
         }
         Err(e) => {
-            fail_build(out_tx, &build_id, &e).await?;
-            Ok(None)
+            fail_build(&env.outbox, &build_id, &e);
+            None
         }
     }
 }
@@ -353,16 +433,11 @@ async fn handle_assignment(
 /// Register a fully-staged build as resumable and run it on a blocking
 /// thread; the result is delivered via the resumable registry, so the
 /// build outlives this session.
-fn launch_build(
-    ctx: &Arc<WorkerCtx>,
-    build: ActiveBuild,
-    out_tx: &mpsc::Sender<WorkerMessage>,
-    build_timeout: Duration,
-) {
-    let ctx = ctx.clone();
-    let out_tx = out_tx.clone();
+fn launch_build(build: ActiveBuild, mut lease: Lease, env: &LaunchEnv<'_>) {
+    let (ctx, out_tx, build_timeout) = (env.ctx.clone(), env.out_tx.clone(), env.build_timeout);
     let key = build.assignment.dedupe_key.clone();
-    ctx.resumable.lock().unwrap().insert(
+    ResumableBuild::launch(
+        &ctx,
         key.clone(),
         // No log tail: execute() streams the log live itself.
         ResumableBuild {
@@ -373,9 +448,16 @@ fn launch_build(
             ..ResumableBuild::default()
         },
     );
+    // The hub is told that the run starts after all the loop queued for
+    // the build (its Need) and before the run sends anything: the run
+    // waits for its Started to enter the channel. A session gone by then
+    // misses it, as one gone just after it would.
+    let build_id = build.assignment.build_id.clone();
+    let started = (env.outbox).send_told(msg(worker_message::Msg::Started(Started { build_id })));
     tokio::task::spawn_blocking(move || {
-        let fin = execute_to_finished(&build, &out_tx, build_timeout);
-        drop(build);
+        let _ = started.blocking_recv();
+        let fin = execute_to_finished(&build, &mut lease, &out_tx, build_timeout);
+        drop((build, lease));
         record_finished(&ctx, &key, fin);
     });
 }
@@ -384,170 +466,64 @@ fn launch_build(
 async fn abort_active(
     active: &mut HashMap<String, ActiveBuild>,
     id: &str,
-    out_tx: &mpsc::Sender<WorkerMessage>,
+    outbox: &Outbox,
     e: &Error,
-) -> Result<()> {
+) {
     if let Some(build) = active.remove(id) {
         build.abort().await;
     }
-    fail_build(out_tx, id, e).await
+    fail_build(outbox, id, e);
 }
 
 /// Report a per-build failure to the hub without tearing the session down.
-async fn fail_build(
-    out_tx: &mpsc::Sender<WorkerMessage>,
-    build_id: &str,
-    err: &Error,
-) -> Result<()> {
+fn fail_build(outbox: &Outbox, build_id: &str, err: &Error) {
     let err = chain(err);
     tracing::error!(id = build_id, "build setup failed: {err}");
-    out_tx
-        .send(msg(worker_message::Msg::Result(BuildResult {
-            build_id: build_id.into(),
-            exit_code: 1,
-            outputs: vec![],
-            error: err,
-            usage: None,
-        })))
-        .await?;
-    Ok(())
+    outbox.send(msg(worker_message::Msg::Result(BuildResult {
+        build_id: build_id.into(),
+        exit_code: 1,
+        outputs: vec![],
+        error: err,
+        usage: None,
+    })));
 }
 
 #[cfg(test)]
+mod negotiate_tests;
+#[cfg(test)]
+mod slow_link_tests;
+#[cfg(test)]
+mod started_tests;
+
+#[cfg(test)]
 mod tests {
-    use std::hint;
-    use std::pin::pin;
-    use std::sync::Mutex;
-    use std::sync::atomic::Ordering::SeqCst;
-    use std::sync::atomic::{AtomicBool, AtomicUsize};
-    use std::task::{Context, Wake, Waker};
-    use std::thread;
-
     use super::*;
-    use crate::sockpath;
-    use crate::worker::resume::sweep_orphaned_agent_builds;
 
-    /// The free slots the session loop finds when it is woken.
-    struct Woken(Arc<WorkerCtx>, Mutex<Option<usize>>);
-
-    impl Wake for Woken {
-        fn wake(self: Arc<Self>) {
-            self.wake_by_ref();
-        }
-
-        fn wake_by_ref(self: &Arc<Self>) {
-            *self.1.lock().unwrap() = Some(self.0.free_slots());
-        }
-    }
-
-    /// A slot is free by the time its release wakes the session loop,
-    /// which hands it to a staged build (grant_slots). Were the loop
-    /// woken first, it would find no free slot and wait for a wake that
-    /// never comes: the staged build would be stranded.
-    #[test]
-    fn a_freed_slot_is_free_when_the_session_loop_wakes_for_it() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let ctx = WorkerCtx::for_test(dir.path(), 1, vec![dir.path().join("1.sock")])?;
-        let slot = ctx.try_slot().expect("a free slot");
-        let woken = Arc::new(Woken(ctx.clone(), Mutex::new(None)));
-        let waker = Waker::from(woken.clone());
-        let mut notified = pin!(ctx.slot_freed.notified());
-        let polled = notified.as_mut().poll(&mut Context::from_waker(&waker));
-        assert!(polled.is_pending());
-        drop(slot);
-        assert_eq!(*woken.1.lock().unwrap(), Some(1), "free slots when woken");
-        Ok(())
-    }
-
-    /// Builds asking at once never hold more slots than there are. With
-    /// fewer agents than max-jobs, a try_slot that checks free_slots, then
-    /// takes a permit of a semaphore of max-jobs, which does not bind,
-    /// lets two callers both pass the check.
-    #[test]
-    fn callers_at_once_never_hold_more_slots_than_there_are() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let ctx = WorkerCtx::for_test(dir.path(), 8, vec![dir.path().join("1.sock")])?;
-        assert_eq!(ctx.jobs(), 1, "one usable agent");
-        let (held, most) = (AtomicUsize::new(0), AtomicUsize::new(0));
-        thread::scope(|s| {
-            for _ in 0..4 {
-                s.spawn(|| {
-                    for _ in 0..100_000 {
-                        if let Some(slot) = ctx.try_slot() {
-                            most.fetch_max(held.fetch_add(1, SeqCst) + 1, SeqCst);
-                            thread::yield_now();
-                            held.fetch_sub(1, SeqCst);
-                            drop(slot);
-                        }
-                    }
-                });
-            }
-        });
-        assert_eq!(most.load(SeqCst), 1, "the most slots held at once");
-        Ok(())
-    }
-
-    /// The slot an agent back from down frees goes to the orphan cleanup
-    /// that reserves the agent, not to a build asking meanwhile. Were
-    /// the agent reserved first and a slot asked for after, a build
-    /// asking between would take it, and the cleanup run without one.
-    #[test]
-    fn a_reserved_agents_slot_goes_to_the_reservation() -> Result<()> {
-        let dir = tempfile::tempdir()?;
-        let socket = dir.path().join("1.sock");
-        let ctx = WorkerCtx::for_test(dir.path(), 8, vec![socket.clone()])?;
-        let rounds = 2_000;
-        let mut lost = 0;
-        for _ in 0..rounds {
-            ctx.agents.mark_down(&socket);
-            let (asking, done) = (AtomicBool::new(false), AtomicBool::new(false));
-            let (reserved, taken) = thread::scope(|s| {
-                let taker = s.spawn(|| {
-                    loop {
-                        asking.store(true, SeqCst);
-                        let slot = ctx.try_slot();
-                        if slot.is_some() || done.load(SeqCst) {
-                            break slot;
-                        }
-                    }
-                });
-                while !asking.load(SeqCst) {
-                    hint::spin_loop();
-                }
-                let reserved = ctx.reserve(&socket);
-                done.store(true, SeqCst);
-                (reserved, taker.join().unwrap())
-            });
-            lost += usize::from(reserved.is_none() || taken.is_some());
-        }
-        assert_eq!(
-            lost, 0,
-            "a build took the reserved slot in {lost} of {rounds} rounds"
-        );
-        Ok(())
-    }
-
-    /// An agent that does not answer is not offered to the hub, and
-    /// with none reachable not even a lookahead build is.
+    /// A declaration tells the hub which of its capacity are free slots,
+    /// apart from the one build staged ahead while every build holds a lease
+    /// and none waits for one: none ahead with a build ready.
     #[tokio::test]
-    async fn capacity_counts_only_reachable_agents() -> Result<()> {
+    async fn a_declaration_tells_free_slots_from_the_lookahead() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let stale = dir.path().join("1.sock");
-        drop(sockpath::bind(&stale)?);
-        let ctx = WorkerCtx::for_test(dir.path(), 4, vec![stale])?;
-        sweep_orphaned_agent_builds(&ctx, ctx.agents.idle_sockets());
-        let (out_tx, mut out_rx) = mpsc::channel(1);
+        let agents = ["1.sock", "2.sock"].map(|s| dir.path().join(s)).to_vec();
+        let ctx = WorkerCtx::for_test(dir.path(), 4, agents)?;
+        let _lease = ctx.agents.lease();
+        let (out_tx, _) = mpsc::channel(1);
         let env = LaunchEnv {
             ctx: &ctx,
             out_tx: &out_tx,
             build_timeout: Duration::ZERO,
             assignments: AtomicU64::default(),
+            outbox: Outbox::default(),
         };
-        declare_capacity(&HashMap::new(), &VecDeque::new(), &env).await?;
-        let Some(worker_message::Msg::RequestJob(r)) = out_rx.recv().await.unwrap().msg else {
-            panic!("expected RequestJob");
-        };
-        assert_eq!(r.capacity, 0);
+        for (ready, want) in [(vec![], (2, Some(1))), (vec!["b".into()], (1, Some(1)))] {
+            let Some(worker_message::Msg::RequestJob(r)) =
+                capacity(&HashMap::new(), &VecDeque::from(ready), &env).msg
+            else {
+                panic!("expected RequestJob");
+            };
+            assert_eq!((r.capacity, r.free_slots), want);
+        }
         Ok(())
     }
 }
