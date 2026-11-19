@@ -25,6 +25,7 @@ fn said(job: &Job, said: Said) -> Vec<worker_message::Msg> {
     let build_id = job.id.clone();
     let started = worker_message::Msg::Started(proto::Started {
         build_id: job.id.clone(),
+        run: None,
     });
     match said {
         // The first Need of a fresh staging, empty when no input is missing.

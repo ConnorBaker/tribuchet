@@ -20,6 +20,7 @@ use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 use super::chunkcache::ChunkCache;
 use super::metrics;
 use super::record;
+use super::runs::Runs;
 use super::state::HubState;
 use super::submit::AttachSvc;
 use super::{PeerAuth, WorkerSvc};
@@ -140,14 +141,16 @@ async fn run_async(cfg: HubConfig) -> Result<()> {
     let config_dir = cfg.config_dir.as_path();
     let chunks = open_chunk_cache(&cfg)?;
 
-    let state = Arc::new(HubState::new(
+    let mut state = HubState::new(
         Duration::from_secs(cfg.worker_grace_secs),
         cfg.nix_config.clone(),
         chunks,
-    ));
-
-    // The record is folded into the history before the hub serves.
+    );
+    // The record is folded into the history before the hub serves. The run
+    // epoch is kept beside it: both are the hub's state.
     let path = cfg.placement.record.clone().unwrap_or_else(default_record);
+    state.runs = Runs::open(&path.with_file_name("run-epoch"));
+    let state = Arc::new(state);
     let opened = tokio::task::spawn_blocking(move || record::open(&path))
         .await
         .map_err(err_ctx("opening the build record"))?;

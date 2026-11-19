@@ -19,7 +19,7 @@ use super::logtail::LogTail;
 use super::{DaemonConn, WorkerCtx, agent_sockets_in, agents, msg, remove_build_dir, sandbox};
 use crate::errors::{Result, chain};
 use crate::fsutil::io_ctx;
-use crate::proto::{BuildResult, worker_message};
+use crate::proto::{BuildResult, RunId, worker_message};
 
 /// How often a held build's agent is asked again: each call waits up to
 /// AGENT_ANSWER for it.
@@ -55,6 +55,7 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>) {
             Ok(BuildState::Finished {
                 dedupe_key,
                 build_id,
+                run,
                 exit_code,
                 usage,
                 error,
@@ -69,7 +70,7 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>) {
                     dir: dir.clone(),
                     finished_at: Instant::now(),
                 };
-                ResumableBuild::insert(ctx, dedupe_key, build_id, dir, Some(fin));
+                ResumableBuild::insert_run(ctx, dedupe_key, (build_id, run), dir, Some(fin));
             }
             Err(_) => remove_build_dir(&dir),
         }
@@ -122,6 +123,7 @@ async fn settle(
                 chain(&e)
             );
             ctx.agents.probe_up(&st.agent_socket);
+            ctx.lost.lock().unwrap().extend(st.run);
             remove_build_dir(&dir);
         }
     }
@@ -205,10 +207,10 @@ async fn adopt(
     let gc_roots = re_root_inputs(&st.spec).await;
     let held = ctx.resumable.lock().unwrap().contains_key(&st.dedupe_key);
     if !held {
-        ResumableBuild::insert(
+        ResumableBuild::insert_run(
             ctx,
             st.dedupe_key.clone(),
-            st.build_id.clone(),
+            (st.build_id.clone(), st.run),
             dir.clone(),
             None,
         );
@@ -233,7 +235,8 @@ async fn adopt(
 /// assignment of its key wanted it again (adopt_assignment).
 fn wait_for_agent(ctx: &Arc<WorkerCtx>, st: ResumeState, dir: PathBuf) {
     let key = st.dedupe_key.clone();
-    ResumableBuild::insert(ctx, key.clone(), st.build_id.clone(), dir.clone(), None);
+    let ids = (st.build_id.clone(), st.run);
+    ResumableBuild::insert_run(ctx, key.clone(), ids, dir.clone(), None);
     if let Some(e) = ctx.resumable.lock().unwrap().get_mut(&key) {
         e.adopting = true;
     }
@@ -247,10 +250,11 @@ fn wait_for_agent(ctx: &Arc<WorkerCtx>, st: ResumeState, dir: PathBuf) {
         ctx.wait_for_agent(&key, false);
         // Held no more. One that ends takes its log tailer and any cancel
         // taken since fail_cancelled; no cancel or assignment takes it after.
-        let (cancelled, tail) = {
+        let (cancelled, told, tail) = {
             let mut map = ctx.resumable.lock().unwrap();
             let e = map.get_mut(&key);
-            let ends = answer.is_err() || e.as_ref().is_some_and(|e| e.cancelled);
+            let told = e.as_ref().is_some_and(|e| e.cancelled);
+            let ends = answer.is_err() || told;
             if ends {
                 ctx.cancelled.lock().unwrap().remove(&key);
             }
@@ -258,12 +262,16 @@ fn wait_for_agent(ctx: &Arc<WorkerCtx>, st: ResumeState, dir: PathBuf) {
                 (e.adopting, e.cancelled) = (false, ends);
                 ends.then(|| e.log_tail.take()).flatten()
             });
-            (ends, tail)
+            (ends, told, tail)
         };
         match answer {
             Ok((build, _)) if !cancelled => rt.block_on(adopt(&ctx, st, dir, build, lease)),
             answer => {
                 if let Err(e) = &answer {
+                    // Lost, unless the hub had it dropped (a known cause).
+                    if !told {
+                        ctx.lost.lock().unwrap().extend(st.run);
+                    }
                     let e = chain(e);
                     let why = "its agent answered at last, without the build";
                     tracing::warn!(id = st.build_id, "{why}: {e}");
@@ -294,15 +302,16 @@ fn fail_cancelled(ctx: &WorkerCtx, key: &str) {
         if !ctx.cancelled.lock().unwrap().remove(key) {
             return;
         }
-        e.out_tx.clone().map(|tx| (tx, e.build_id.clone()))
+        e.out_tx.clone().map(|tx| (tx, e.build_id.clone(), e.run))
     };
     tracing::info!(
         key,
         "the hub cancelled a build held for its agent; it is killed once the agent answers"
     );
-    if let Some((tx, build_id)) = failed {
+    if let Some((tx, build_id, run)) = failed {
         let result = BuildResult {
             build_id,
+            run,
             exit_code: 1,
             error: CANCELLED.into(),
             ..Default::default()
@@ -422,6 +431,9 @@ pub(super) enum BuildState {
     Finished {
         dedupe_key: String,
         build_id: String,
+        /// Absent from a state persisted before it.
+        #[serde(default)]
+        run: Option<RunId>,
         exit_code: i32,
         #[serde(default)]
         usage: Usage,
@@ -437,6 +449,9 @@ pub(super) struct ResumeState {
     pub(super) dedupe_key: String,
     /// Original assignment id: names the cgroup and the log file.
     pub(super) build_id: String,
+    /// The run; absent from a state persisted before it.
+    #[serde(default)]
+    pub(super) run: Option<RunId>,
     /// Agent-side pid of the builder (Linux: its setup stage).
     pub(super) pid: i32,
     pub(super) spec: sandbox::SandboxSpec,
@@ -479,12 +494,15 @@ mod tests {
     fn a_finished_state_written_before_usage_existed_still_loads() {
         let old = r#"{"phase":"finished","dedupe_key":"k","build_id":"b","exit_code":0,"error":"","outputs":[]}"#;
         let Ok(BuildState::Finished {
-            usage, exit_code, ..
+            usage,
+            exit_code,
+            run,
+            ..
         }) = serde_json::from_str(old)
         else {
             panic!("old finished state did not load");
         };
-        assert_eq!((exit_code, usage), (0, Usage::default()));
+        assert_eq!((exit_code, usage, run), (0, Usage::default(), None));
     }
 
     #[test]
@@ -499,15 +517,16 @@ mod tests {
         let st = BuildState::Finished {
             dedupe_key: "k".into(),
             build_id: "b".into(),
+            run: Some(RunId { epoch: 1, seq: 2 }),
             exit_code: 1,
             usage: u,
             error: String::new(),
             outputs: vec![],
         };
         let json = serde_json::to_string(&st).unwrap();
-        let Ok(BuildState::Finished { usage, .. }) = serde_json::from_str(&json) else {
+        let Ok(BuildState::Finished { usage, run, .. }) = serde_json::from_str(&json) else {
             panic!("finished state did not round trip");
         };
-        assert_eq!(usage, u);
+        assert_eq!((usage, run), (u, Some(RunId { epoch: 1, seq: 2 })));
     }
 }

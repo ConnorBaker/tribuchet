@@ -7,7 +7,7 @@ use std::sync::{OnceLock, mpsc};
 use std::thread;
 
 use crate::errors::Result;
-use crate::proto::{BuildAssignment, CancelBuild, WorkerMessage, worker_message};
+use crate::proto::{BuildAssignment, CancelBuild, RunId, WorkerMessage, worker_message};
 use crate::sockpath;
 use crate::worker::agents::tests::pool::{Calls, fake_agent};
 use crate::worker::agents::tests::spawn_agent;
@@ -71,6 +71,7 @@ fn resume_state(id: &str, socket: PathBuf) -> ResumeState {
     ResumeState {
         dedupe_key: "k".into(),
         build_id: id.into(),
+        run: Some(RUN),
         pid: 42,
         spec: sandbox::SandboxSpec::default(),
         started_unix: 0,
@@ -118,8 +119,36 @@ fn assignment(id: &str) -> BuildAssignment {
     }
 }
 
-/// The build id of a held build.
+/// The build id of a held build, and its run.
 const HELD: &str = "00000000000000000000000000000020";
+const RUN: RunId = RunId { epoch: 2, seq: 6 };
+
+/// A restarted worker reports lost a run it started that its agent no longer
+/// has, whether the agent says so at once or after it is held for it; not one
+/// the hub cancelled meanwhile, which the hub's own cancel ended.
+#[test]
+fn a_run_its_agent_no_longer_has_is_reported_lost() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (build, socket) = (dir.path().join("builds/b1"), dir.path().join("agent.sock"));
+    fs::create_dir_all(&build)?;
+    let allow = Arc::new(AtomicUsize::new(usize::MAX));
+    let _calls = fake_agent(&socket, "", None, allow, String::new)?;
+    resume_state(HELD, socket.clone()).persist(&build)?;
+    let ctx = WorkerCtx::for_test(dir.path(), 4, vec![socket])?;
+    tokio::runtime::Runtime::new()?.block_on(adopt_builds(&ctx));
+    assert_eq!(*ctx.lost.lock().unwrap(), [RUN], "answered at once");
+    for cancel in [false, true] {
+        let h = held_build(false, None)?;
+        if cancel {
+            h.cancel("old");
+        }
+        h.allow.store(usize::MAX, SeqCst);
+        until("removed", || !h.build.exists());
+        let lost = h.ctx.lost.lock().unwrap().clone();
+        assert_eq!(lost, if cancel { vec![] } else { vec![RUN] }, "held");
+    }
+    Ok(())
+}
 
 /// A worker restarted with the running build HELD keyed "k" in builds/b1,
 /// its agent a stand-in that holds the build (or no longer has it) and
@@ -472,9 +501,11 @@ fn rescan_adds_new_agent_sockets() -> Result<()> {
 #[test]
 fn persisted_running_state_round_trips() {
     let dir = tempfile::tempdir().unwrap();
+    let run = Some(RunId { epoch: 5, seq: 9 });
     let st = ResumeState {
         dedupe_key: "k".into(),
         build_id: "b1".into(),
+        run,
         pid: 42,
         spec: sandbox::SandboxSpec::default(),
         started_unix: 11,
@@ -487,17 +518,22 @@ fn persisted_running_state_round_trips() {
     let BuildState::Running(back) = serde_json::from_str(&json).unwrap() else {
         panic!("expected Running");
     };
-    assert_eq!(back.build_id, "b1");
+    assert_eq!((back.build_id.as_str(), back.run), ("b1", run));
     assert_eq!(back.agent_socket, st.agent_socket);
     assert_eq!(back.deadline_unix, 7);
     assert_eq!((back.started_unix, back.max_silent_secs), (11, 13));
-    // As persisted before started_unix and max_silent_secs: 0 each.
+    // As persisted before started_unix, max_silent_secs and run: 0 each, none.
     let before = json
         .replace("\"started_unix\":11,", "")
-        .replace("\"max_silent_secs\":13,", "");
+        .replace("\"max_silent_secs\":13,", "")
+        .replace("\"run\":{\"epoch\":5,\"seq\":9},", "");
     assert!(!before.contains("started_unix") && !before.contains("max_silent_secs"));
+    assert!(!before.contains("\"run\""), "{before}");
     let Ok(BuildState::Running(old)) = serde_json::from_str(&before) else {
         panic!("a state persisted before the limits does not read");
     };
-    assert_eq!((old.started_unix, old.max_silent_secs), (0, 0));
+    assert_eq!(
+        (old.started_unix, old.max_silent_secs, old.run),
+        (0, 0, None)
+    );
 }
