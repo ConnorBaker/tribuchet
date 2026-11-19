@@ -21,8 +21,15 @@
 // struct's `timed_out` field reads naturally despite the lint.
 #![allow(clippy::too_many_lines, clippy::struct_field_names)]
 
+mod arbiter;
+mod canlocal;
 mod daemon;
+mod fod_ipv6;
 mod harness;
+mod held;
+mod history;
+mod pairs;
+mod spread;
 
 use std::time::Instant;
 
@@ -196,28 +203,6 @@ fn build_impure() {
     succeed(Node::Hub, &format!("grep -q impure-ok {}", out.trim()));
 }
 
-#[test]
-fn build_kvm() {
-    if run(Node::Worker, "test -e /dev/kvm").code == 0 {
-        build_grep("/etc/tt/kvm.nix", "kvm-ok");
-    } else {
-        // No worker serves the kvm feature and the hub cannot build it
-        // locally, so the declined build (exit 222) fails.
-        let err = fail(Node::Hub, "nix-build /etc/tt/kvm.nix --no-out-link 2>&1");
-        assert!(err.contains("exit code 222"), "{err}");
-    }
-}
-
-#[test]
-fn build_kvm_emulated() {
-    // An emulated system must not inherit the host's kvm feature.
-    let err = fail(
-        Node::Hub,
-        "nix-build /etc/tt/kvm-emulated.nix --no-out-link 2>&1",
-    );
-    assert!(err.contains("exit code 222"), "{err}");
-}
-
 /// build-memory-max-bytes OOM-kills the builder, exit code 137, and
 /// the agent notes the OOM kill.
 #[test]
@@ -240,8 +225,9 @@ fn build_logbomb() {
 }
 
 /// The fixed-output subtests share the hub's fodsrv and the worker's dnsmasq,
-/// and the DNS variant restarts dnsmasq, so keep them in one test in the
-/// original order rather than racing three tasks on shared network state.
+/// the DNS variant restarts dnsmasq and the IPv6 ones change the worker's
+/// routes, so keep them in one test in the original order rather than racing
+/// tasks on shared network state.
 #[test]
 fn build_fod() {
     // FOD source on the hub, fetched by the isolated sandbox through presto-pasta.
@@ -304,6 +290,9 @@ fn build_fod() {
     wait_until_succeeds(Node::Worker, "getent hosts fod-dns.test", 30);
     fail(Node::Worker, "grep -q fod-dns.test /etc/hosts");
     build_grep("/etc/tt/fod-dns.nix", "hello-fod");
+
+    // 4) and 5): the worker's IPv6 states.
+    fod_ipv6::states();
 }
 
 #[test]
@@ -563,6 +552,7 @@ fn lifecycle() {
         &format!("grep -q 'fallback-payload built-locally' {}", out.trim()),
     );
     assert_journal(Node::Hub, "tribuchet-hub", "no capable worker; declining");
+    canlocal::declined("tt-fallback-build", "x86_64-linux", true);
 
     // --- the restarted worker re-adopts and delivers the stopped build ----
     succeed(Node::Worker, "systemctl start tribuchet-worker");

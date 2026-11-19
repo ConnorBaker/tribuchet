@@ -20,7 +20,6 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::process::{self, Stdio};
 use std::process::{Child, Command};
-use std::sync::Arc;
 use std::{env, slice, thread};
 
 use rustix::io::{FdFlags, fcntl_setfd};
@@ -38,11 +37,10 @@ use sandbox_proto::agent::StartRequest;
 
 use super::{Build, Options, cgroup, make_readable, msg, spawn_plain, stage_scratch};
 use crate::errors::{Error, Result, chain, err_ctx};
-use crate::fsutil::io_ctx;
-use crate::netpolicy::NetPolicy;
-use crate::sd;
+use crate::fsutil::{io_ctx, stat_field};
 use crate::worker::sandbox::{self, SandboxSpec};
 use crate::worker::userns::{self, UsernsHolder};
+use crate::{netpolicy, sd};
 
 /// Argv[1] marker of the re-exec'd userns filesystem helper.
 pub const FS_HELPER_ARG: &str = "__agent_fs";
@@ -162,7 +160,9 @@ pub(super) fn spawn_builder(
     sandbox::prepare_root(&mut spec).map_err(err_ctx("creating the sandbox root skeleton"))?;
     // Isolated network builds hand their tap fd back over this
     // socketpair to the forwarder thread spawned below.
-    let net_fwd = if spec.net_isolation && spec.network {
+    let net_fwd = if spec.network {
+        // Decided per build where the datapath's host sockets live.
+        spec.net_ipv6 = presto_pasta::netdev::host_has_ipv6_default_route();
         let (ours, theirs) = socketpair(
             AddressFamily::UNIX,
             SocketType::DGRAM,
@@ -180,9 +180,16 @@ pub(super) fn spawn_builder(
     let (child, spec_w) = sandbox::spawn(&spec, log)?;
     if let Some((ours, theirs)) = net_fwd {
         drop(theirs);
-        let policy = spec.net_policy.clone();
+        let net = presto_pasta::Config {
+            allow_flow: Some(
+                spec.net_policy
+                    .clone()
+                    .flow_filter(netpolicy::own_addresses),
+            ),
+            ..sandbox::net_config(&spec)
+        };
         let build_pid = child.id();
-        thread::spawn(move || net_forward(&ours, policy, build_pid));
+        thread::spawn(move || net_forward(&ours, net, build_pid));
     }
     // The setup stage waits for the spec on stdin; move it into the
     // build cgroup first so its cgroup namespace is rooted there.
@@ -195,10 +202,20 @@ pub(super) fn spawn_builder(
     Ok((child, Some(spec.root)))
 }
 
+/// The handle on the build's cgroup.freeze the worker gets with `lease`
+/// (cgroup::freeze_handle); none where the build has no cgroup.
+pub(super) fn freeze_handle(
+    confinement: &Confinement,
+    build_id: &str,
+    lease: &UnixStream,
+) -> Option<fs::File> {
+    cgroup::freeze_handle(confinement.cgroup_base.as_ref()?, build_id, lease)
+}
+
 /// Per-build network forwarder: receive the tap fd the setup stage
 /// created inside its netns, run the presto-pasta datapath on it and
 /// stop it (letting the netns go away) once the build process dies.
-fn net_forward(sock: &OwnedFd, policy: NetPolicy, build_pid: u32) {
+fn net_forward(sock: &OwnedFd, net: presto_pasta::Config, build_pid: u32) {
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
     let mut cmsg = RecvAncillaryBuffer::new(&mut space);
     let mut buf = [0u8; 8];
@@ -211,12 +228,6 @@ fn net_forward(sock: &OwnedFd, policy: NetPolicy, build_pid: u32) {
         return;
     };
     let Some(tap) = fds.next() else { return };
-    let net = presto_pasta::Config {
-        allow_flow: Some(Arc::new(move |d: &presto_pasta::FlowDst| {
-            policy.allows(d.proto, d.ip, d.port)
-        })),
-        ..presto_pasta::Config::default()
-    };
     let mut presto = presto_pasta::Presto::new(net, tap);
     // A pidfd stops the datapath (closing the tap fd and with it the
     // build netns) once the build process dies.
@@ -451,13 +462,17 @@ pub(super) fn sample_memory() -> impl FnOnce() -> u64 {
     || 0
 }
 
-/// CPU microseconds and peak memory bytes of the build. The cgroup covers
-/// every process of the build. Only namespace builds have one, so a
-/// direct-exec build, or a host without a delegated cgroup, falls back to
-/// the reaped builder's rusage.
-pub(super) fn usage(confinement: &Confinement, build_id: &str, rusage: (u64, u64)) -> (u64, u64) {
+/// CPU microseconds, peak memory bytes and frozen microseconds of the
+/// build. The cgroup covers every process of the build. Only namespace
+/// builds have one, so a direct-exec build, or a host without a delegated
+/// cgroup, falls back to the reaped builder's rusage, and was never frozen.
+pub(super) fn usage(
+    confinement: &Confinement,
+    build_id: &str,
+    rusage: (u64, u64),
+) -> (u64, u64, u64) {
     let Some(base) = &confinement.cgroup_base else {
-        return rusage;
+        return (rusage.0, rusage.1, 0);
     };
     let u = cgroup::usage(&base.join(format!("build-{build_id}")));
     (
@@ -467,6 +482,7 @@ pub(super) fn usage(confinement: &Confinement, build_id: &str, rusage: (u64, u64
         } else {
             rusage.1
         },
+        u.frozen_usec,
     )
 }
 
@@ -475,13 +491,7 @@ pub(super) fn oom_killed(confinement: &Confinement, build_id: &str) -> bool {
     let Some(base) = &confinement.cgroup_base else {
         return false;
     };
-    fs::read_to_string(base.join(format!("build-{build_id}")).join("memory.events")).is_ok_and(
-        |events| {
-            events
-                .lines()
-                .any(|l| l.strip_prefix("oom_kill ").is_some_and(|n| n.trim() != "0"))
-        },
-    )
+    cgroup::oom_killed(&base.join(format!("build-{build_id}")))
 }
 
 /// Pids whose real uid is this uid, from /proc.
@@ -500,8 +510,7 @@ pub(super) fn own_uid_pids() -> Vec<i32> {
             if field("State:")?.trim_start().starts_with('Z') {
                 return None;
             }
-            let real: u32 = field("Uid:")?.split_whitespace().next()?.parse().ok()?;
-            (real == uid).then_some(pid)
+            (stat_field(&status, "Uid:")? == u64::from(uid)).then_some(pid)
         })
         .collect()
 }

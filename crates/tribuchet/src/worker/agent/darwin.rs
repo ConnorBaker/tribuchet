@@ -34,6 +34,15 @@ impl Confinement {
     pub(super) fn kill_block(&self) {}
 }
 
+/// macOS has no cgroup freezer.
+pub(super) fn freeze_handle(
+    _confinement: &Confinement,
+    _build_id: &str,
+    _lease: &UnixStream,
+) -> Option<fs::File> {
+    None
+}
+
 /// The agent runs the builder as its own uid, so it unpacks the tmp
 /// dir itself.
 pub(super) fn stage_tmp_dir(
@@ -153,9 +162,13 @@ pub(super) fn sample_memory() -> impl FnOnce() -> u64 {
 
 /// No per-build cgroup on macOS: the reaped builder's rusage, which covers
 /// the descendants it waited for. Its peak memory is the largest single
-/// process, a lower bound for the build.
-pub(super) fn usage(_confinement: &Confinement, _build_id: &str, rusage: (u64, u64)) -> (u64, u64) {
-    rusage
+/// process, a lower bound for the build. No freezer, so never frozen.
+pub(super) fn usage(
+    _confinement: &Confinement,
+    _build_id: &str,
+    rusage: (u64, u64),
+) -> (u64, u64, u64) {
+    (rusage.0, rusage.1, 0)
 }
 
 /// No per-build memory limit on macOS.

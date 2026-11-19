@@ -84,6 +84,7 @@ in
   nodes = {
     hub =
       {
+        config,
         pkgs,
         nodes,
         ...
@@ -114,7 +115,6 @@ in
           experimental-features = [
             "ca-derivations"
             "impure-derivations"
-            "recursive-nix"
           ];
           # let the daemon accept uid-range builds; tribuchet's worker
           # provides the actual uid range
@@ -189,6 +189,16 @@ in
             host = "fod-hosts.test";
           }
         '';
+        # --argstr state STATE: the worker state the e2e harness set up
+        environment.etc."tt/fod-ipv6.nix".text = ''
+          { state }:
+          import ${./tests/fod-ipv6.nix} {
+            bash = "${pkgs.bash}";
+            coreutils = "${pkgs.coreutils}";
+            hubIp = "${nodes.hub.networking.primaryIPAddress}";
+            inherit state;
+          }
+        '';
         environment.etc."tt/logbomb.nix".text = ''
           import ${./tests/logbomb.nix} { bash = "${pkgs.bash}"; }
         '';
@@ -231,12 +241,6 @@ in
             busybox = "${pkgs.pkgsCross.aarch64-multiplatform.pkgsStatic.busybox}";
           }
         '';
-        environment.etc."tt/recursive.nix".text = ''
-          import ${./tests/recursive.nix} {
-            bash = "${pkgs.bash}";
-            nix = "${pkgs.nixVersions.latest}";
-          }
-        '';
 
         imports = [
           nixosModule
@@ -248,7 +252,6 @@ in
           settings.worker-grace-secs = 2;
           externalBuilders = {
             enable = true;
-            recursiveNix = true;
             systems = [
               "x86_64-linux"
               "aarch64-linux"
@@ -259,10 +262,32 @@ in
         # started by the test script once certificates exist
         systemd.sockets.tribuchet-hub.wantedBy = lib.mkForce [ ];
         systemd.services.tribuchet-hub.wantedBy = lib.mkForce [ ];
+        # The module's attach, but keeping a copy of each build.json, so
+        # that the e2e tests read Nix's own canBuildLocally.
+        nix.settings.external-builders = lib.mkForce (
+          builtins.toJSON [
+            {
+              systems = config.services.tribuchet-hub.externalBuilders.systems;
+              program = pkgs.writeShellScript "tt-attach" ''
+                set -e
+                cp "$1" "$(mktemp /var/lib/tt-buildjson/XXXXXX)"
+                exec ${lib.getExe' tribuchet "tribuchet"} attach "$1" \
+                  --socket ${config.services.tribuchet-hub.socketPath}
+              '';
+              args = [ ];
+            }
+          ]
+        );
+        systemd.tmpfiles.rules = [ "d /var/lib/tt-buildjson 1777 root root -" ];
       };
 
     worker =
-      { pkgs, nodes, ... }:
+      {
+        config,
+        pkgs,
+        nodes,
+        ...
+      }:
       {
         # Resolvable only via /etc/hosts; the FOD-via-files subtest
         # fetches the hub through this name.
@@ -284,6 +309,29 @@ in
         };
         systemd.tmpfiles.rules = [ "d /var/lib/dnsmasq-fod 0755 root root -" ];
         networking.nameservers = [ "127.0.0.1" ];
+        # Link-local IPv6 only: no IPv6 default route or global address
+        # until the e2e harness adds them. QEMU's user-mode network would
+        # advertise a default route, and the test VLAN's /64 on eth1 is
+        # an address of its own, so the worker gets neither and talks to
+        # the hub over IPv4.
+        #
+        # mkForce replaces qemu-vm.nix's definition, which differs from
+        # this one only by the forwardPorts and restrictNetwork options it
+        # splices in; the assertion keeps both unused here.
+        virtualisation.qemu.networkingOptions = lib.mkForce [
+          "-net nic,netdev=user.0,model=virtio"
+          "-netdev user,id=user.0,ipv6=off,\"$QEMU_NET_OPTS\""
+        ];
+        assertions = [
+          {
+            assertion = config.virtualisation.forwardPorts == [ ] && !config.virtualisation.restrictNetwork;
+            message = "the worker's networkingOptions drop forwardPorts and restrictNetwork";
+          }
+        ];
+        # The test framework sets the VLAN address, and the hosts entry
+        # other nodes get for it, at normal priority.
+        networking.interfaces.eth1.ipv6.addresses = lib.mkForce [ ];
+        networking.primaryIPv6Address = lib.mkForce "";
         # Private store image instead of the shared host store, so input
         # paths the worker lacks really travel over the wire.
         virtualisation.useNixStoreImage = true;
@@ -313,13 +361,18 @@ in
             max-log-size = 1048576;
             # 2 GiB, exceeded only by the memhog subtest
             build-memory-max-bytes = 2147483648;
-            recursive-nix = true;
             # exercised by the fod-policy subtest
             fod-network.rules = [
               {
                 action = "deny";
                 proto = "tcp";
+                dst = "any";
                 ports = [ "8766" ];
+              }
+              # the FOD subtests fetch from the hub on the test VLAN
+              {
+                action = "allow";
+                dst = "private";
               }
             ];
             emulate.aarch64-linux = "${pkgs.pkgsStatic.qemu-user}/bin/qemu-aarch64";
@@ -383,6 +436,7 @@ in
         "TT_SSH_CONFIG": "${pkgs.systemd}/lib/systemd/ssh_config.d/20-systemd-ssh-proxy.conf",
         "TT_HUB_SOCK": str(hub.vsock_host),
         "TT_WORKER_SOCK": str(worker.vsock_host),
+        "TT_SHARED": str(hub.shared_dir),
         "TT_BASH": "${pkgs.bash}",
     })
     e2e = "${tribuchet.e2eTests}/bin/tribuchet-e2e"

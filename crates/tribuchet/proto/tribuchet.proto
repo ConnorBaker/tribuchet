@@ -5,8 +5,14 @@ package tribuchet.v1;
 // Worker-facing service. Workers dial the hub and keep a long-lived
 // bidirectional stream open (NAT-friendly; the hub never dials workers).
 service WorkerHub {
-  // Single bidi stream multiplexing registration, heartbeats, build
-  // assignment, path negotiation, chunk transfer, logs and results.
+  // A worker's control: registration, heartbeats, assignments, cancels,
+  // Needs, Started, logs, results and acks. Opened first, on a
+  // connection of its own, so that no chunk is ever queued ahead of it.
+  rpc Control(stream WorkerMessage) returns (stream HubMessage);
+  // The same worker's bulk, on a second connection: chunks, manifests and
+  // tmp dirs. Its first message is a Register carrying only the session
+  // of the worker's open Control. A Register without one (a worker
+  // predating Control) is refused.
   rpc Session(stream WorkerMessage) returns (stream HubMessage);
 }
 
@@ -31,11 +37,49 @@ message WorkerMessage {
     // store lacks. The first Need answers the assignment and lists
     // every missing input path. May repeat any number of times.
     Need need = 8;
+    // The build is staged and its run starts: sent before its builder is
+    // spawned, so before anything else of the run. A Resumed stands for
+    // it on a resume.
+    Started started = 9;
+    // Answer to a Need for output chunks of a result the worker no longer
+    // has, or cannot read: it has dropped the result.
+    ResultGone result_gone = 10;
   }
+}
+
+// A run: one assignment of a build to a worker, numbered by the hub
+// after every run an earlier hub process numbered (epoch). Unset from
+// peers predating it.
+message RunId {
+  uint64 epoch = 1;
+  uint64 seq = 2;
+}
+
+// A run a worker holds and was not told to drop: staging, started, or
+// finished with its exit code.
+message HeldRun {
+  RunId run = 1;
+  string dedupe_key = 2;
+  bool started = 3;
+  optional int32 exit_code = 4;
+}
+
+message ResultGone {
+  string build_id = 1;
+  RunId run = 2;
 }
 
 message Resumed {
   string build_id = 1;
+  // The run has finished: what follows is its result.
+  bool finished = 2;
+  // The run the worker holds, which the assignment's run stands for.
+  RunId run = 3;
+}
+
+message Started {
+  string build_id = 1;
+  RunId run = 2;
 }
 
 message RequestJob {
@@ -44,6 +88,10 @@ message RequestJob {
   // `capacity`. The hub takes off the ones it sent since. Unset by
   // workers predating the field.
   optional uint64 assignments = 2;
+  // Of `capacity`, the slots no build holds: capacity less the one
+  // build staged ahead while every slot is busy. Unset by workers
+  // predating the field.
+  optional uint32 free_slots = 3;
 }
 
 message HubMessage {
@@ -112,7 +160,7 @@ message PathInfoMsg {
 // "kvm" from the host.
 message SystemCaps {
   string system = 1;            // e.g. "x86_64-linux"
-  repeated string features = 2; // e.g. "kvm", "big-parallel"
+  repeated string features = 2; // e.g. "kvm", "big-parallel", "tribuchet-network"
 }
 
 message Register {
@@ -126,6 +174,19 @@ message Register {
   // Advisory capacity, summed across workers to size the max-jobs of
   // the generated nix.conf fragment. Not the RequestJob dispatch path.
   uint32 max_jobs = 4;
+  // What its builds may use, which the hub's placement weighs builds
+  // against: CPUs (the worker's own affinity and quota, its agents'
+  // taken to be the same), and bytes of memory (MemTotal, or less where
+  // the agents' slice or a cgroup above the worker's caps it). Unset
+  // where the worker cannot tell, and by workers predating the fields.
+  optional uint32 cores = 5;
+  optional uint64 build_memory = 6;
+  // Random, chosen by the worker per session: names its Control to its
+  // Session.
+  bytes session = 7;
+  // Every run it holds, and those it found gone as it started.
+  repeated HeldRun held = 8;
+  repeated RunId lost = 9;
 }
 
 message Heartbeat {
@@ -133,6 +194,17 @@ message Heartbeat {
   double load1 = 2;
   // Current Register.resumable_keys. Keys not listed are no longer held.
   repeated string resumable_keys = 3;
+  // Current Register.max_jobs: reachable build agents change. Unset by
+  // workers predating the field.
+  optional uint32 max_jobs = 4;
+  // The dedupe keys of the builds the worker's CPU arbiter holds frozen,
+  // and of the build it lets run meanwhile, its leader; none, and unset,
+  // with none frozen, and from workers predating the fields.
+  repeated string frozen_keys = 5;
+  optional string leader_key = 6;
+  // Current Register.held and Register.lost.
+  repeated HeldRun held = 7;
+  repeated RunId lost = 8;
 }
 
 message BuildAssignment {
@@ -152,6 +224,15 @@ message BuildAssignment {
   repeated Manifest inputs = 11;
   repeated string required_features = 12;
   bool local_networking = 13;
+  // The name the hub knows the worker by (in tailscale mode the tailnet
+  // node name, not the worker's hostname), for the notes the worker
+  // sends the client. Empty from hubs predating the field.
+  string worker_name = 14;
+  // BuildRequest's limits. The worker takes the lesser of each and its
+  // own; 0 (none, or from hubs predating the fields) leaves its own.
+  uint64 timeout_secs = 15;
+  uint64 max_silent_secs = 16;
+  RunId run = 17;
 }
 
 message TmpDirArchive {
@@ -189,13 +270,11 @@ message BuildResult {
   // lacks with Need and assembles the NAR.
   repeated Manifest outputs = 3;
   string error = 4;
-  // Inner outputs and AddToStore'd paths the build's outputs
-  // reference (recursive-nix). The hub registers each in the local
-  // store via AddToStoreNar. Attach receives an AddedPath event per
-  // registered extra.
-  repeated Manifest extras = 5; // with info
+  // Was the recursive-nix extras; never reuse.
+  reserved 5;
   // What the build used on the worker; all 0 when unknown.
   BuildUsage usage = 6;
+  RunId run = 7;
 }
 
 message BuildUsage {
@@ -210,6 +289,9 @@ message BuildUsage {
   // censored when oom_killed.
   uint64 peak_memory_bytes = 3;
   bool oom_killed = 4;
+  // Of wall_ms, the time the build was frozen (by the worker's CPU
+  // arbiter, or anyone); 0 when unknown.
+  uint64 frozen_ms = 5;
 }
 
 // Local service between `tribuchet attach` and the hub, served on a unix
@@ -220,6 +302,19 @@ message BuildUsage {
 service AttachHub {
   rpc Build(stream BuildMessage) returns (stream AttachEvent);
 }
+
+// The operator's commands, on the same local socket.
+service HubAdmin {
+  // Retire a worker that is not connected: the hub no longer knows it
+  // (SEMANTICS-7 U4). Fails for a connected or an unknown worker.
+  rpc Decommission(DecommissionRequest) returns (DecommissionReply);
+}
+
+message DecommissionRequest {
+  string worker_name = 1;
+}
+
+message DecommissionReply {}
 
 // Client-streamed submission: the BuildRequest, then TmpDirFile
 // chunks terminated by an eof chunk.
@@ -251,9 +346,20 @@ message BuildRequest {
   repeated string required_features = 10;
   // __darwinAllowLocalNetworking
   bool local_networking = 11;
+  // Nix's timeout and max-silent-time for the build, from build.json; 0
+  // is none. The worker counts them in the build's running time: not the
+  // time it waits for a worker or an agent, nor the time it is frozen.
+  uint64 timeout_secs = 12;
+  uint64 max_silent_secs = 13;
+  // Whether the client's own Nix builds it when declined (canLocal), as
+  // its build.json says, false with network; unset when Nix does not say.
+  // Not part of the build.
+  optional bool can_local = 14;
 }
 
 message AttachEvent {
+  // Was added_path, a recursive-nix extra; never reuse.
+  reserved 6;
   oneof event {
     bytes log = 1;
     OutputNar output = 2;
@@ -263,10 +369,6 @@ message AttachEvent {
     // build was handed to another worker attempt and the output will
     // be streamed again from the start.
     string output_restart = 5;
-    // Store path the hub registered locally on attach's behalf
-    // (recursive-nix extra). Goes into result.json for Nix's output
-    // reference scan.
-    string added_path = 6;
     // Name of the worker the build was dispatched to, for the client
     // to report where the build runs.
     string dispatched = 7;

@@ -3,7 +3,9 @@
 //! attempts: a failure of another class, or at another request, starts
 //! it again, and so does a failure waited on, a drop the journal does
 //! not explain among them. The build fails, naming the cause, once
-//! run(c, r) reaches θ(c); otherwise it waits, its clients told once,
+//! run(c, r) reaches θ(c) for a fact about the hub; for a count (an unknown
+//! message, crashes) the clients whose Nix builds it are declined there and
+//! the others wait. Otherwise it waits, its clients told once,
 //! and no wait is a loss of its worker, for every failure waiting can
 //! clear. θ is 1 for a refusal of the request, a handshake the hub
 //! cannot speak, and a new connection the daemon closes before the
@@ -36,6 +38,7 @@ use tokio_util::sync::CancellationToken;
 pub(in crate::hub) use evidence::Evidence;
 
 use crate::errors::{Error, Result, err_msg};
+use crate::hub::losses;
 use crate::hub::state::{HubState, Job, Wait};
 use crate::worker::unix_now;
 
@@ -248,7 +251,15 @@ impl<'a> DaemonWait<'a> {
             }
         };
         if let Some(why) = verdict(failure, run, request, what, &shown) {
-            return Err(err_msg(why));
+            // A count is no fact about the hub (SEMANTICS-7 cut-over 10):
+            // the clients whose Nix builds it are declined, the others wait.
+            if !matches!(failure, Failure::Unknown | Failure::Dropped) {
+                return Err(err_msg(why));
+            }
+            if let Some((declined, waiting)) = losses::decline(self.state, self.job, "daemon").await
+            {
+                tracing::warn!(id = self.job.id, declined, waiting, "{why}; declining");
+            }
         }
         self.failures += 1;
         self.tell(what).await;
@@ -322,7 +333,7 @@ fn verdict(failure: Failure, n: u32, request: &str, what: &str, shown: &str) -> 
         ),
         Failure::Unknown if n >= 2 => format!(
             "{what}: the hub's nix-daemon sent a message the hub does not know, again on \
-             another connection, and waiting does not change that"
+             another connection"
         ),
         Failure::Closed => format!(
             "{what}: the hub's nix-daemon closed the connection before answering the \

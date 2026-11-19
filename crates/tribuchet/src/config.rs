@@ -8,6 +8,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io;
+use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::thread;
 
@@ -73,6 +74,9 @@ pub struct HubConfig {
     /// (re)serve before declining (lets a patched Nix fall back to a
     /// local build). Covers the startup re-registration window and a
     /// worker's reconnect window; a never-seen platform declines at
+    /// once, but a build with network waits for a worker. A build whose
+    /// worker session died is also kept this long for that worker to
+    /// re-register and resume it.
     #[serde(default = "default_worker_grace_secs")]
     pub worker_grace_secs: u64,
     /// Optional address (e.g. 127.0.0.1:7438) for the Prometheus
@@ -98,6 +102,20 @@ pub struct HubConfig {
     /// Cache directory override. Defaults to XDG_CACHE_HOME/tribuchet.
     #[serde(default)]
     pub chunk_cache_dir: Option<PathBuf>,
+    /// What placement learns.
+    #[serde(default)]
+    pub placement: PlacementConfig,
+}
+
+/// The `[placement]` table.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
+pub struct PlacementConfig {
+    /// The build record, whose fold is what placement learns (state,
+    /// not cache: the only copy). Defaults to
+    /// XDG_STATE_HOME/tribuchet/record.sqlite.
+    #[serde(default)]
+    pub record: Option<PathBuf>,
 }
 
 fn default_chunk_cache_bytes() -> u64 {
@@ -116,6 +134,16 @@ fn cache_dir() -> PathBuf {
 /// XDG_CACHE_HOME/tribuchet/chunks.
 pub fn default_chunk_cache_dir() -> PathBuf {
     cache_dir().join("chunks")
+}
+
+/// XDG_STATE_HOME/tribuchet/record.sqlite, with the usual
+/// ~/.local/state fallback.
+pub fn default_record() -> PathBuf {
+    env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| env::var_os("HOME").map(|h| PathBuf::from(h).join(".local/state")))
+        .unwrap_or_else(|| PathBuf::from("/var/lib"))
+        .join("tribuchet/record.sqlite")
 }
 
 /// A hub-maintained nix.conf fragment. A local nix.conf `include`s the
@@ -184,11 +212,15 @@ pub struct WorkerConfig {
     pub cert: PathBuf,
     #[serde(default = "default_key")]
     pub key: PathBuf,
-    /// Kill builds running longer than this many seconds.
+    /// Kill builds running longer than this many seconds, counted from
+    /// when a build agent starts the build: waiting for a free agent
+    /// does not count, nor does time frozen by the CPU arbiter. 0 is
+    /// refused at load, not taken as none.
     #[serde(default = "default_build_timeout")]
-    pub build_timeout_secs: u64,
+    pub build_timeout_secs: NonZeroU64,
     /// Kill builds producing no log output for this many seconds
-    /// (Nix's max-silent-time); 0 disables.
+    /// (Nix's max-silent-time), not counting time frozen by the CPU
+    /// arbiter; 0 disables.
     #[serde(default)]
     pub max_silent_time_secs: u64,
     /// Kill builds whose log exceeds this many bytes (Nix's
@@ -222,11 +254,6 @@ pub struct WorkerConfig {
     /// evaluated when a build opens an outbound connection.
     #[serde(default)]
     pub fod_network: NetPolicy,
-    /// Advertise the `recursive-nix` system feature so the hub routes
-    /// derivations using it here. Requires the patched Nix on the
-    /// client side (see `nix/patches/`).
-    #[serde(default)]
-    pub recursive_nix: bool,
     /// Confine builds with a Seatbelt profile (macOS only).
     #[serde(default)]
     pub sandbox: bool,
@@ -234,8 +261,9 @@ pub struct WorkerConfig {
     /// agent count bounds concurrent builds.
     #[serde(default)]
     pub agent_sockets: Vec<PathBuf>,
-    /// Directory whose `*.sock` entries are appended to agent-sockets at
-    /// startup, for hosts that size the agent count at boot.
+    /// Directory whose `*.sock` entries are appended to agent-sockets,
+    /// for hosts that size the agent count at boot. Sockets created
+    /// later join within 10 s.
     #[serde(default)]
     pub agent_sockets_dir: Option<PathBuf>,
     /// Number of agents the worker spawns and supervises itself, for
@@ -281,8 +309,8 @@ fn default_cert() -> PathBuf {
 fn default_key() -> PathBuf {
     "/var/lib/tribuchet/tls/worker.key".into()
 }
-fn default_build_timeout() -> u64 {
-    24 * 3600
+fn default_build_timeout() -> NonZeroU64 {
+    NonZeroU64::new(24 * 3600).unwrap()
 }
 fn default_import_jobs() -> u32 {
     4
@@ -297,53 +325,4 @@ fn default_max_jobs() -> u32 {
         .unwrap_or(1)
 }
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn env_overrides_tls_paths() {
-        let mut cfg: WorkerConfig = toml::from_str("hub = \"https://hub:7437\"").unwrap();
-        // SAFETY: test-only; no other thread reads the environment here.
-        unsafe { env::set_var("TRIBUCHET_KEY", "/run/credentials/w/worker-key") };
-        cfg.apply_env_overrides();
-        unsafe { env::remove_var("TRIBUCHET_KEY") };
-        assert_eq!(cfg.key, PathBuf::from("/run/credentials/w/worker-key"));
-        assert_eq!(cfg.cert, default_cert());
-    }
-
-    #[test]
-    fn worker_defaults_and_emulate_map() {
-        let cfg: WorkerConfig = toml::from_str(
-            r#"
-            hub = "https://hub:7437"
-            max-jobs = 2
-
-            [emulate]
-            aarch64-linux = "/nix/store/x-qemu/bin/qemu-aarch64"
-            "#,
-        )
-        .unwrap();
-        assert_eq!(cfg.hub, "https://hub:7437");
-        assert_eq!(cfg.max_jobs, 2);
-        assert_eq!(cfg.build_timeout_secs, 24 * 3600);
-        assert_eq!(cfg.state_dir, PathBuf::from("/var/lib/tribuchet/worker"));
-        assert_eq!(
-            cfg.emulate.get("aarch64-linux"),
-            Some(&PathBuf::from("/nix/store/x-qemu/bin/qemu-aarch64"))
-        );
-    }
-
-    #[test]
-    fn sandbox_defaults_off() {
-        let parse =
-            |body: &str| toml::from_str::<WorkerConfig>(&format!("hub = \"x\"\n{body}")).unwrap();
-        assert!(!parse("").sandbox);
-        assert!(parse("sandbox = true").sandbox);
-    }
-
-    #[test]
-    fn unknown_keys_are_rejected() {
-        let err = toml::from_str::<HubConfig>("max-jobs = 2").unwrap_err();
-        assert!(err.to_string().contains("max-jobs"), "{err}");
-    }
-}
+mod tests;

@@ -143,19 +143,16 @@ in
         type = lib.types.bool;
         default = true;
         description = ''
-          Patch Nix so uid-range derivations reach the external builder
-          and so a declined build (no worker for the system) falls back
-          to a local build instead of failing.
-        '';
-      };
-      recursiveNix = lib.mkOption {
-        type = lib.types.bool;
-        default = false;
-        description = ''
-          Patch Nix so external builders see recursive-nix derivations
-          and can populate the registered output closure via a
-          `result.json` sidecar. Off by default; only useful when a
-          tribuchet worker advertises the `recursive-nix` feature.
+          Patch Nix so uid-range derivations reach the external builder,
+          so a declined build (no worker for the system) falls back to a
+          local build instead of failing, and so a build's `timeout` and
+          `max-silent-time` reach the worker, which counts only running
+          time toward them, and so build.json says whether Nix would
+          build a declined build itself (`canBuildLocally`). Set false,
+          `nixPackage` must carry all four patches (nix/patches) itself:
+          without the timeouts one, Nix counts a build's timeouts by the
+          wall clock from its start, and so kills builds the CPU arbiter
+          froze for time they did not run.
         '';
       };
     };
@@ -233,12 +230,12 @@ in
     (lib.mkIf hub.externalBuilders.enable {
       nix.package =
         let
-          patches =
-            lib.optionals hub.externalBuilders.patchNix [
-              ./patches/external-builders-uid-range.patch
-              ./patches/external-builders-decline-fallback.patch
-            ]
-            ++ lib.optional hub.externalBuilders.recursiveNix ./patches/recursive-nix-external-builders.patch;
+          patches = lib.optionals hub.externalBuilders.patchNix [
+            ./patches/external-builders-uid-range.patch
+            ./patches/external-builders-decline-fallback.patch
+            ./patches/external-builders-timeouts.patch
+            ./patches/external-builders-can-build-locally.patch
+          ];
         in
         if patches == [ ] then
           hub.externalBuilders.nixPackage
@@ -301,6 +298,11 @@ in
       environment.etc."tribuchet/hub.toml".source = hubToml;
       systemd.services.tribuchet-hub = {
         wantedBy = [ "multi-user.target" ];
+        # Stopped before its socket, which then listens while the hub
+        # commits the last of its build record. Requires= makes it;
+        # After= is systemd's own for a socket's service, written out.
+        requires = [ "tribuchet-hub.socket" ];
+        after = [ "tribuchet-hub.socket" ];
         restartTriggers = [ hubToml ];
         serviceConfig = {
           Type = "notify";
@@ -311,9 +313,12 @@ in
           RuntimeDirectoryPreserve = true;
           # staging chunk cache
           CacheDirectory = "tribuchet";
+          # the build record (state, not cache: the only copy)
+          StateDirectory = "tribuchet";
           Environment = [
             "RUST_LOG=info"
             "XDG_CACHE_HOME=/var/cache"
+            "XDG_STATE_HOME=/var/lib"
           ];
           WatchdogSec = "30";
           Restart = "on-failure";

@@ -14,11 +14,15 @@ pub mod agent;
 #[cfg(target_os = "linux")]
 pub(crate) mod agent_spawn;
 mod agents;
+mod arbiter;
 pub mod binfmt;
 mod build;
 #[cfg(test)]
 pub(crate) use build::chunk_tests;
 mod caps;
+#[cfg(test)]
+mod held_tests;
+mod lease;
 mod logtail;
 mod pins;
 mod resume;
@@ -31,31 +35,42 @@ pub use userns::{USERNS_HOLD_ARG, hold_stage as userns_hold_stage};
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::io;
+use std::num::NonZeroU64;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use harmonia_store_remote::DaemonClient;
-use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, mpsc};
+use tokio::sync::mpsc;
 
 use caps::host_system;
 use logtail::spawn_log_tail;
-use resume::{ResumableBuild, adopt_builds, spawn_resumable_reaper, sweep_orphaned_agent_builds};
+use resume::{
+    CANCELLED, ResumableBuild, adopt_builds, spawn_agent_rescan, spawn_resumable_reaper,
+    sweep_orphaned_agent_builds,
+};
 
 use crate::chunkstore::ChunkStore;
 use crate::config::WorkerConfig;
 use crate::errors::{Result, err_ctx, err_msg};
 use crate::fsutil::io_ctx;
 use crate::netpolicy::NetPolicy;
-use crate::proto::{BuildAssignment, WorkerMessage, worker_message};
+use crate::proto::{BuildAssignment, HeldRun, LogChunk, RunId, WorkerMessage, worker_message};
 use crate::{fsutil, rt, sd};
 
 /// Connection to the local nix-daemon; one per active build so its
 /// temp roots live exactly as long as the build.
 type DaemonConn = DaemonClient<tokio::net::unix::OwnedReadHalf, tokio::net::unix::OwnedWriteHalf>;
+
+/// The numbers of waits for an agent and their takeovers, none given twice.
+static WAITS: AtomicU64 = AtomicU64::new(1);
+
+/// Adoptions so far; numbered from it: none twice, none 0 (registration).
+static ADOPTIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Per-process context threaded through builds.
 struct WorkerCtx {
@@ -67,18 +82,17 @@ struct WorkerCtx {
     secret_paths: Vec<PathBuf>,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     sandbox: bool,
-    /// One permit per concurrent build.
-    slots: Arc<Semaphore>,
-    /// A `Slot` dropped. The session loop re-declares capacity.
-    slot_freed: Notify,
     /// dedupe_key -> build past staging; survives session loss so a
     /// replacement hub can resume instead of rebuilding.
     resumable: Mutex<HashMap<String, ResumableBuild>>,
+    /// Runs it found gone as it started, which their agents no longer had
+    /// though no hub told it to drop them: told to the hub at each report.
+    lost: Mutex<Vec<RunId>>,
     /// system -> static emulator binary, from the emulate setting.
     emulators: HashMap<String, PathBuf>,
-    /// Fixed-output builds get a private netns with the presto-pasta
-    /// user-mode NAT (Linux workers with /dev/net/tun).
-    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    /// A build with network can get a network of its own, a private
+    /// netns with the presto-pasta user-mode NAT: a Linux worker with
+    /// /dev/net/tun. Without it such a build is refused.
     fod_isolation: bool,
     /// Flow policy for that network, from the fod-network setting.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -87,11 +101,10 @@ struct WorkerCtx {
     max_log_size: u64,
     /// memory.max for each build's cgroup.
     build_memory_max_bytes: Option<u64>,
-    /// Builder gets the host nix-daemon socket bind-mounted in; the
-    /// worker advertises the `recursive-nix` feature.
-    pub(super) recursive_nix: bool,
-    /// The per-uid build agents, one leased per build.
-    agents: agents::AgentPool,
+    /// The per-uid build agents, one leased per build with its slot.
+    agents: Arc<lease::Pool>,
+    /// Freezes and thaws the running builds and counts their frozen time.
+    arbiter: Arc<arbiter::Arbiter>,
     /// Dedupe keys of builds the hub cancelled; the supervising loops
     /// abort them. Keyed like the registry, since a resumed build's
     /// build_id changes while it runs.
@@ -100,31 +113,28 @@ struct WorkerCtx {
     claims: build::Claims,
     /// Parallel daemon connections importing input NARs per build.
     import_jobs: usize,
+    /// The daemon socket negotiation connects to: None, the default one.
+    daemon_socket: Option<PathBuf>,
     chunks: Arc<ChunkStore>,
 }
 
 impl WorkerCtx {
     /// Reason to abort a running build, evaluated each supervision
-    /// tick. Reads the log file (size for max-log-size, mtime for
-    /// max-silent-time): counters fed by a session-bound tailer freeze
-    /// when the hub session drops and would kill a healthy build.
-    /// `timed_out` carries the caller's deadline check (wall clock vs
-    /// the persisted unix deadline of an adopted build).
+    /// tick. Reads the log file's size for max-log-size, and takes the
+    /// caller's checks of its deadline (`timed_out`) and max-silent-time
+    /// (`silent`), both by its running time: counters fed by a
+    /// session-bound tailer freeze when the hub session drops and would
+    /// kill a healthy build.
     fn abort_reason(
         &self,
         dedupe_key: &str,
         log_path: &Path,
         timed_out: Option<String>,
+        silent: Option<String>,
     ) -> Option<String> {
-        let log = fs::metadata(log_path).ok();
-        let silent = log
-            .as_ref()
-            .and_then(|m| m.modified().ok())
-            .and_then(|t| t.elapsed().ok())
-            .unwrap_or_default();
-        let log_size = log.map_or(0, |m| m.len());
+        let log_size = fs::metadata(log_path).map_or(0, |m| m.len());
         if self.cancelled.lock().unwrap().remove(dedupe_key) {
-            return Some("build cancelled".into());
+            return Some(CANCELLED.into());
         }
         if let Some(reason) = timed_out {
             return Some(reason);
@@ -135,51 +145,142 @@ impl WorkerCtx {
                 self.max_log_size
             ));
         }
-        if !self.max_silent_time.is_zero() && silent > self.max_silent_time {
-            return Some(format!(
-                "build produced no output for {}s",
-                self.max_silent_time.as_secs()
-            ));
-        }
-        None
+        silent
     }
 
     fn resumable_keys(&self) -> Vec<String> {
         self.resumable.lock().unwrap().keys().cloned().collect()
     }
 
+    /// The runs it holds that no hub told it to drop: neither cancelled
+    /// while running nor ended for a cancel. Unnumbered ones are left out.
+    fn held(&self) -> Vec<HeldRun> {
+        let map = self.resumable.lock().unwrap();
+        let held = map.iter().filter_map(|(key, e)| {
+            let exit_code = e.finished.as_ref().map(|f| f.exit_code);
+            let dropped = match &e.finished {
+                Some(f) => f.error.ends_with(CANCELLED),
+                None => e.cancelled,
+            };
+            (!dropped).then_some(HeldRun {
+                run: Some(e.run?),
+                dedupe_key: key.clone(),
+                started: true,
+                exit_code,
+            })
+        });
+        held.collect()
+    }
+
     /// Re-point an already-held build (same dedupe key) at the
-    /// assignment's new build_id and session; true if one existed.
-    /// A tailer streams the log to the new session from the persisted
-    /// offset and keeps following it.
+    /// assignment's build_id and session: its adoption number if held. A
+    /// tailer streams the log to the new session from the persisted
+    /// offset on. The assignment voids a cancel of the one before while
+    /// its run goes on (not yet taken, or held for its agent); a run killed
+    /// or failed for it is no result: None, and it starts anew. Runs in a
+    /// tokio runtime: telling a waiting build's session spawns a task.
     fn adopt_assignment(
         self: &Arc<Self>,
         a: &BuildAssignment,
         out_tx: &mpsc::Sender<WorkerMessage>,
-    ) -> bool {
+    ) -> Option<u64> {
         let mut map = self.resumable.lock().unwrap();
-        match map.get_mut(&a.dedupe_key) {
-            Some(e) => {
-                e.build_id.clone_from(&a.build_id);
-                e.out_tx = Some(out_tx.clone());
-                if let Some(t) = e.log_tail.take() {
-                    // An earlier resume's tailer feeds a dead session.
-                    // Only flag it (no join): it may be waiting on the
-                    // registry lock held right here.
-                    t.done.store(true, Ordering::Relaxed);
-                }
-                e.log_tail = Some(spawn_log_tail(
-                    self.clone(),
-                    a.dedupe_key.clone(),
-                    a.build_id.clone(),
-                    e.dir.clone(),
-                    out_tx.clone(),
-                ));
-                true
+        let e = map.get_mut(&a.dedupe_key)?;
+        let voided = self.cancelled.lock().unwrap().remove(&a.dedupe_key);
+        match &e.finished {
+            Some(f) if f.error.ends_with(CANCELLED) => return None,
+            None if e.cancelled && !voided && !e.adopting => return None,
+            _ => {}
+        }
+        e.cancelled = false;
+        // No result goes to the new session before it is told it resumed.
+        let n = NonZeroU64::MIN.saturating_add(ADOPTIONS.fetch_add(1, Ordering::Relaxed));
+        (e.adoption, e.resuming) = (n.get(), true);
+        e.build_id.clone_from(&a.build_id);
+        (e.out_tx, e.released) = (Some(out_tx.clone()), None);
+        e.worker_name.clone_from(&a.worker_name);
+        if let Some(t) = e.log_tail.take() {
+            // An earlier resume's tailer feeds a dead session.
+            // Only flag it (no join): it may be waiting on the
+            // registry lock held right here.
+            t.done.store(true, Ordering::Relaxed);
+        }
+        e.log_tail = Some(spawn_log_tail(
+            self.clone(),
+            a.dedupe_key.clone(),
+            a.build_id.clone(),
+            e.dir.clone(),
+            out_tx.clone(),
+        ));
+        // A session taking over a waiting build is told of the wait, under
+        // a new number: a note still pending for the session before is not.
+        if e.waiting_for_agent {
+            e.wait = WAITS.fetch_add(1, Ordering::Relaxed);
+            self.tell_wait(&a.dedupe_key, e.wait, out_tx);
+        }
+        Some(e.adoption)
+    }
+
+    /// Mark the build keyed `key` as waiting for a build agent, or not,
+    /// numbering the entry anew. A wait that starts is told to the
+    /// session the registry holds the build for, under its build id: not
+    /// the launching session, which a takeover may have replaced before
+    /// the wait; adopt_assignment tells each later one. Both decide under
+    /// the registry lock. A start runs in a tokio runtime (tell_wait).
+    fn wait_for_agent(self: &Arc<Self>, key: &str, waiting: bool) {
+        if let Some(e) = self.resumable.lock().unwrap().get_mut(key) {
+            e.waiting_for_agent = waiting;
+            e.wait = WAITS.fetch_add(1, Ordering::Relaxed);
+            if let Some(tx) = e.out_tx.as_ref().filter(|_| waiting) {
+                self.tell_wait(key, e.wait, tx);
             }
-            None => false,
         }
     }
+
+    /// Tell session `tx` once that the build keyed `key` waits for a
+    /// build agent, off the registry lock: a full session holds up
+    /// neither the build nor its cancel, and is told once it has room.
+    /// The note is written under the lock as the room comes, and not once
+    /// the entry's number moved on from `wait` (the wait ended, or a
+    /// takeover is told itself) or another session holds the build: each
+    /// holding of a wait is told once, none after it, a closed session never.
+    fn tell_wait(self: &Arc<Self>, key: &str, wait: u64, tx: &mpsc::Sender<WorkerMessage>) {
+        let (ctx, key, tx) = (self.clone(), key.to_owned(), tx.clone());
+        tokio::spawn(async move {
+            let Ok(room) = tx.reserve().await else {
+                return;
+            };
+            let map = ctx.resumable.lock().unwrap();
+            let held =
+                |e: &&ResumableBuild| (e.out_tx.as_ref()).is_some_and(|t| t.same_channel(&tx));
+            if let Some(e) = map.get(&key).filter(|e| e.wait == wait).filter(held) {
+                room.send(waiting_note(e));
+            }
+        });
+    }
+}
+
+/// The note on a build's wait for a build agent, for the session in the
+/// registry entry `e`.
+fn waiting_note(e: &ResumableBuild) -> WorkerMessage {
+    let name = if e.worker_name.is_empty() {
+        hostname()
+    } else {
+        e.worker_name.clone()
+    };
+    let data = if e.adopting {
+        format!(
+            "tribuchet: the build agent running this build on worker {name} does not answer; waiting for it\n"
+        )
+    } else {
+        format!(
+            "tribuchet: no build agent on worker {name} is free or reachable; waiting for one\n"
+        )
+    };
+    msg(worker_message::Msg::Log(LogChunk {
+        build_id: e.build_id.clone(),
+        data: data.into_bytes(),
+    }))
 }
 
 /// 1-minute load average for the heartbeat; informational only, the
@@ -205,8 +306,11 @@ fn hostname() -> String {
 }
 
 /// Remove a build dir. Only worker-owned staging and packing files
-/// live here; the build's own files sit in agent scratch.
+/// live here; the build's own files sit in agent scratch. Its
+/// state.json goes first: a worker stopped part-way leaves the rest
+/// to the next start's sweep (sweep_state_dir), not a build to adopt.
 pub(super) fn remove_build_dir(dir: &Path) {
+    resume::unrecord(dir);
     if let Err(e) = fs::remove_dir_all(dir) {
         tracing::warn!("cleaning up {}: {e}", dir.display());
     }
@@ -236,28 +340,6 @@ pub(crate) fn unix_now() -> u64 {
 
 fn msg(m: worker_message::Msg) -> WorkerMessage {
     WorkerMessage { msg: Some(m) }
-}
-
-/// A build slot. Dropping it wakes the session loop.
-pub(crate) struct Slot {
-    _permit: OwnedSemaphorePermit,
-    ctx: Arc<WorkerCtx>,
-}
-
-impl Drop for Slot {
-    fn drop(&mut self) {
-        self.ctx.slot_freed.notify_one();
-    }
-}
-
-impl WorkerCtx {
-    fn try_slot(self: &Arc<Self>) -> Option<Slot> {
-        let permit = self.slots.clone().try_acquire_owned().ok()?;
-        Some(Slot {
-            _permit: permit,
-            ctx: self.clone(),
-        })
-    }
 }
 
 pub fn run(opts: WorkerConfig) -> Result<()> {
@@ -333,23 +415,15 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         }
     }
     if let Some(dir) = &opts.agent_sockets_dir {
-        let mut found: Vec<PathBuf> = fs::read_dir(dir)
-            .map_err(|e| err_msg(format!("agent-sockets-dir {}: {e}", dir.display())))?
-            .flatten()
-            .map(|e| e.path())
-            .filter(|p| p.extension().is_some_and(|x| x == "sock"))
-            .collect();
-        found.sort();
+        let found = agent_sockets_in(dir)
+            .map_err(|e| err_msg(format!("agent-sockets-dir {}: {e}", dir.display())))?;
         opts.agent_sockets.extend(found);
     }
-    // Every build runs on one agent, so the agent list bounds
-    // concurrency.
+    // Every build runs on one agent, so the reachable agents bound
+    // concurrency (lease::Pool::capacity).
     if opts.agent_sockets.is_empty() {
         return Err(err_msg("agent-sockets must list at least one build agent"));
     }
-    opts.max_jobs = opts
-        .max_jobs
-        .min(u32::try_from(opts.agent_sockets.len()).unwrap_or(u32::MAX));
     if cfg!(target_os = "macos") && opts.build_memory_max_bytes.is_some() {
         tracing::warn!("build-memory-max is not enforced on macOS");
     }
@@ -364,21 +438,21 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         sandbox_bin_sh: opts.sandbox_bin_sh.clone(),
         secret_paths: vec![opts.key.clone()],
         sandbox: opts.sandbox,
-        slots: Arc::new(Semaphore::new(opts.max_jobs.max(1) as usize)),
-        slot_freed: Notify::new(),
         import_jobs: opts.import_jobs.max(1) as usize,
         chunks: open_chunk_store(&opts)?,
         cancelled: Mutex::new(HashSet::new()),
         claims: build::Claims::default(),
         resumable: Mutex::new(HashMap::new()),
+        lost: Mutex::default(),
         emulators,
         fod_isolation,
         fod_network: opts.fod_network.clone(),
         max_silent_time: Duration::from_secs(opts.max_silent_time_secs),
         max_log_size: opts.max_log_size,
         build_memory_max_bytes: opts.build_memory_max_bytes,
-        recursive_nix: opts.recursive_nix,
-        agents: agents::AgentPool::new(opts.agent_sockets.clone()),
+        agents: lease::Pool::new(opts.agent_sockets.clone(), opts.max_jobs.max(1) as usize),
+        arbiter: arbiter::Arbiter::new(),
+        daemon_socket: None,
     });
 
     // Ready once local setup is done, not once the hub answers: the
@@ -389,7 +463,8 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
     spawn_resumable_reaper(ctx.clone());
     spawn_handover();
     adopt_builds(&ctx).await;
-    sweep_orphaned_agent_builds(&ctx);
+    sweep_orphaned_agent_builds(&ctx, ctx.agents.idle_sockets());
+    spawn_agent_rescan(ctx.clone(), opts.agent_sockets_dir.clone());
 
     // Reconnect with backoff: a hub restart must not drain the fleet.
     let mut backoff = Duration::from_secs(1);
@@ -411,10 +486,21 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
     }
 }
 
-/// SIGTERM (unit stop or restart): exit immediately. All resumable
-/// state is already on disk and builds run in their own process
-/// groups/cgroups (KillMode=process), so a replacement worker
-/// re-adopts them.
+/// The `*.sock` entries of agent-sockets-dir, sorted.
+fn agent_sockets_in(dir: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut found: Vec<PathBuf> = fs::read_dir(dir)?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "sock"))
+        .collect();
+    found.sort();
+    Ok(found)
+}
+
+/// SIGTERM (unit stop or restart): exit. All resumable state is already
+/// on disk and builds run in their own process groups/cgroups
+/// (KillMode=process), so a replacement worker re-adopts them; each
+/// build's agent thaws it as its lease ends.
 fn spawn_handover() {
     tokio::spawn(async {
         sd::stop_requested().await;
@@ -426,6 +512,39 @@ fn spawn_handover() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    impl WorkerCtx {
+        /// A context leasing builds to `agents`, every optional
+        /// feature off.
+        pub(in crate::worker) fn for_test(
+            state_dir: &Path,
+            max_jobs: usize,
+            agents: Vec<PathBuf>,
+        ) -> Result<Arc<Self>> {
+            let chunks = ChunkStore::open(state_dir.join("chunks"), 1 << 20)?;
+            Ok(Arc::new(Self {
+                state_dir: state_dir.to_path_buf(),
+                sandbox_bin_sh: None,
+                secret_paths: vec![],
+                sandbox: false,
+                resumable: Mutex::new(HashMap::new()),
+                lost: Mutex::default(),
+                emulators: HashMap::new(),
+                fod_isolation: false,
+                fod_network: NetPolicy::default(),
+                max_silent_time: Duration::ZERO,
+                max_log_size: 0,
+                build_memory_max_bytes: None,
+                agents: lease::Pool::new(agents, max_jobs),
+                arbiter: arbiter::Arbiter::off(),
+                cancelled: Mutex::new(HashSet::new()),
+                claims: build::Claims::default(),
+                import_jobs: 1,
+                daemon_socket: None,
+                chunks: Arc::new(chunks),
+            }))
+        }
+    }
 
     #[test]
     fn sweep_removes_stale_builds_and_keeps_adoptable_ones() -> Result<()> {

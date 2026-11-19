@@ -14,7 +14,7 @@ use super::{Error, step};
 use crate::fsutil::io_ctx;
 
 #[path = "linux/stage.rs"]
-mod stage;
+pub(super) mod stage;
 pub use stage::setup_stage;
 
 /// Prepare the on-disk sandbox root and finalize the spec. Only the
@@ -44,6 +44,15 @@ pub fn prepare_root(spec: &mut SandboxSpec) -> Result<(), Error> {
             .map_err(io_ctx("setting permissions on", &root.join("nix/store")))?;
     }
     Ok(())
+}
+
+/// presto-pasta configuration of an isolated network: the agent's
+/// datapath and the setup stage's interface and resolv.conf must agree.
+pub fn net_config(spec: &SandboxSpec) -> presto_pasta::Config {
+    presto_pasta::Config {
+        ipv6: spec.net_ipv6,
+        ..presto_pasta::Config::default()
+    }
 }
 
 /// Sandbox root skeleton: directories, /etc files, /dev symlinks.
@@ -99,18 +108,17 @@ fn write_skeleton(spec: &SandboxSpec) -> Result<(), Error> {
                     .map_err(io_ctx("writing", &root.join("etc").join(f)))?;
             }
         }
-        if spec.net_isolation {
-            // presto-pasta answers DNS on the gateway addresses; point
-            // the sandbox at them, not the host resolv.conf whose
-            // nameserver may be an unreachable loopback stub.
-            let net = presto_pasta::Config::default();
-            let conf = format!("nameserver {}\nnameserver {}\n", net.gateway4, net.gateway6);
-            fs::write(root.join("etc/resolv.conf"), conf)
-                .map_err(io_ctx("writing", &root.join("etc/resolv.conf")))?;
-        } else if let Ok(data) = fs::read("/etc/resolv.conf") {
-            fs::write(root.join("etc/resolv.conf"), data)
-                .map_err(io_ctx("writing", &root.join("etc/resolv.conf")))?;
-        }
+        // presto-pasta answers DNS on the gateway addresses; point
+        // the sandbox at them, not the host resolv.conf whose
+        // nameserver may be an unreachable loopback stub.
+        let net = net_config(spec);
+        let conf = if net.ipv6 {
+            format!("nameserver {}\nnameserver {}\n", net.gateway4, net.gateway6)
+        } else {
+            format!("nameserver {}\n", net.gateway4)
+        };
+        fs::write(root.join("etc/resolv.conf"), conf)
+            .map_err(io_ctx("writing", &root.join("etc/resolv.conf")))?;
     }
     Ok(())
 }

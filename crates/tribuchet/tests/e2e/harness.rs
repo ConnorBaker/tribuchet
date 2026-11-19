@@ -1,4 +1,5 @@
 use std::env as std_env;
+use std::fs;
 use std::io::Read;
 use std::process::{Command, Stdio};
 use std::sync::Once;
@@ -71,7 +72,7 @@ pub struct Out {
 }
 
 impl Out {
-    fn combined(&self) -> String {
+    pub fn combined(&self) -> String {
         format!("{}{}", self.stdout, self.stderr)
     }
 }
@@ -272,6 +273,35 @@ pub fn write_file(node: Node, path: &str, content: &str) {
     // Quoted heredoc: content is written verbatim, no shell expansion or
     // quoting to worry about (no test payload contains the TTEOF sentinel).
     succeed(node, &format!("cat > {path} <<'TTEOF'\n{content}\nTTEOF"));
+}
+
+/// The file at `path` on `node`, through the VMs' /tmp/shared, the
+/// driver's TT_SHARED: `cat` over ssh of the arbiter phase's monitor rows
+/// (428 KB in a run that fetched them) ended in exit 255 with no output.
+pub fn fetch(node: Node, path: &str) -> String {
+    let name = path.rsplit('/').next().unwrap();
+    succeed(node, &format!("cp '{path}' /tmp/shared/{name}"));
+    fs::read_to_string(format!("{}/{name}", env("TT_SHARED"))).unwrap()
+}
+
+/// Runs `cmd` on the hub in the background as the unit `unit`: its output
+/// in /tmp/`unit`.out, its pid in .pid, its exit status in .rc.
+pub fn submit(unit: &str, cmd: &str) {
+    succeed(
+        Node::Hub,
+        &format!(
+            "systemd-run --unit={unit} bash -lc '{cmd} > /tmp/{unit}.out 2>&1 & echo $! > /tmp/{unit}.pid; \
+             rc=0; wait $! || rc=$?; echo $rc > /tmp/{unit}.rc'"
+        ),
+    );
+}
+
+/// The exit status of `submit`'s `unit`, once it ended, within `secs`.
+pub fn ended(unit: &str, secs: u64) -> String {
+    wait_until_succeeds(Node::Hub, &format!("test -s /tmp/{unit}.rc"), secs);
+    succeed(Node::Hub, &format!("cat /tmp/{unit}.rc"))
+        .trim()
+        .to_owned()
 }
 
 pub fn build_grep(nixfile: &str, needle: &str) {

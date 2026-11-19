@@ -36,14 +36,14 @@ use std::process::exit;
 use std::{env, mem, ptr};
 
 use super::super::{SandboxSpec, binfmt};
-use super::{create_mount_points, exit_status_file, setup_error_file, write_skeleton};
+use super::{create_mount_points, exit_status_file, net_config, setup_error_file, write_skeleton};
 
 use crate::fsutil::io_ctx;
 
 // Interface name for the presto-pasta tap inside the build netns.
 // Addressing (link-local guest/gateway, DNS forwarded on the gateway
 // address so a loopback host resolver like systemd-resolved's stub
-// stays reachable) comes from presto_pasta::Config::default().
+// stays reachable) comes from net_config.
 const NET_IFNAME: &str = "eth0";
 
 // linux/if_tun.h
@@ -88,7 +88,13 @@ pub fn setup_stage() -> ! {
 
 const CLOSE_RANGE_CLOEXEC: libc::c_uint = 4;
 
-fn enter_and_exec(spec: &SandboxSpec, status_file: &fs::File) -> io::Result<Infallible> {
+pub(in crate::worker::sandbox) fn enter_and_exec(
+    spec: &SandboxSpec,
+    status_file: &fs::File,
+) -> io::Result<Infallible> {
+    if let Some(why) = spec.unconfined() {
+        return Err(io::Error::other(format!("refusing a build {why}")));
+    }
     // The agent placed this process in the build cgroup before the
     // spec arrived on stdin; CLONE_NEWCGROUP below roots the namespace
     // there.
@@ -200,10 +206,9 @@ fn open_tap(name: &str) -> io::Result<OwnedFd> {
 /// until the datapath runs.
 /// The local tap fd is closed afterwards
 /// because the agent's copy keeps the interface carrier up.
-fn attach_net(sock: &OwnedFd) -> io::Result<()> {
-    let net = presto_pasta::Config::default();
+fn attach_net(sock: &OwnedFd, net: &presto_pasta::Config) -> io::Result<()> {
     let tap = open_tap(NET_IFNAME)?;
-    presto_pasta::netdev::configure(NET_IFNAME, &net)?;
+    presto_pasta::netdev::configure(NET_IFNAME, net)?;
     let fds = [tap.as_fd()];
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
     let mut cmsg = SendAncillaryBuffer::new(&mut space);
@@ -306,20 +311,17 @@ struct SetupParams<'a> {
 
 fn setup(p: &SetupParams) -> io::Result<()> {
     let spec = p.spec;
+    // Every build gets a network of its own, never the host's: a
+    // network build one with the user-mode NAT the agent runs.
     let mut flags = UnshareFlags::NEWUSER
         | UnshareFlags::NEWNS
+        | UnshareFlags::NEWNET
         | UnshareFlags::NEWPID
         | UnshareFlags::NEWIPC
         | UnshareFlags::NEWUTS;
-    // Network builds keep the host namespace only without isolation;
-    // with it they get a private one plus user-mode NAT.
-    let private_net = !spec.network || spec.net_isolation;
-    if private_net {
-        flags |= UnshareFlags::NEWNET;
-    }
-    // The agent runs the datapath. This end of the tap-handoff
-    // socketpair was inherited across the setup stage's exec.
-    let net_fwd = if spec.net_isolation && spec.network {
+    // This end of the tap-handoff socketpair was inherited across the
+    // setup stage's exec.
+    let net_fwd = if spec.network {
         let fd = spec
             .net_fwd_fd
             .ok_or_else(|| io::Error::other("sandbox spec lacks the tap handoff fd"))?;
@@ -359,11 +361,9 @@ fn setup(p: &SetupParams) -> io::Result<()> {
     sethostname(b"localhost").map_err(ioerr("sethostname"))?;
     // "(none)" is the kernel default; fixed like Nix for determinism
     setdomainname(b"(none)").map_err(ioerr("setdomainname"))?;
-    if private_net {
-        loopback_up().map_err(ioerr("bringing lo up"))?;
-    }
+    loopback_up().map_err(ioerr("bringing lo up"))?;
     if let Some(sock) = net_fwd {
-        attach_net(&sock)?;
+        attach_net(&sock, &net_config(spec))?;
     }
 
     // CLONE_NEWPID only applies to children: fork so the builder

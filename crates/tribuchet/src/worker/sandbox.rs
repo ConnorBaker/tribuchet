@@ -20,9 +20,7 @@ use std::io;
 use std::os::fd::OwnedFd;
 #[cfg(target_os = "linux")]
 use std::os::unix::process::CommandExt;
-#[cfg(target_os = "linux")]
-use std::path::Path;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 #[cfg(target_os = "linux")]
 use std::process::{Child, Command, Stdio};
 
@@ -32,10 +30,10 @@ use rustix::pipe::{PipeFlags, pipe_with};
 
 #[cfg(target_os = "linux")]
 use super::binfmt;
+use crate::build_json;
 #[cfg(target_os = "linux")]
 use crate::fsutil::io_ctx;
 use crate::netpolicy::NetPolicy;
-#[cfg(target_os = "linux")]
 use crate::proto::BuildAssignment;
 
 // On macOS only the fields the shared packing code reads are used;
@@ -49,6 +47,9 @@ pub struct SandboxSpec {
     pub args: Vec<String>,
     pub env: HashMap<String, String>,
     pub cwd: String,
+    /// Fixed-output build: a private netns with the presto-pasta
+    /// user-mode NAT, as every build has a netns of its own; host
+    /// abstract sockets and loopback services stay unreachable.
     pub network: bool,
     /// Linux: private root directory. macOS: unused.
     pub root: PathBuf,
@@ -62,8 +63,8 @@ pub struct SandboxSpec {
     /// Scratch output store paths.
     #[cfg_attr(target_os = "linux", allow(dead_code))]
     pub outputs: Vec<String>,
-    /// Input store paths visible to the builder; reference-scan
-    /// candidates alongside outputs.
+    /// Input store paths visible to the builder, temp-rooted again when
+    /// a restarted worker adopts the build.
     #[serde(default)]
     pub store_inputs: Vec<String>,
     /// Store objects that are themselves symlinks: (path inside the
@@ -81,9 +82,9 @@ pub struct SandboxSpec {
     /// Uids mapped in that namespace at in-ns 0 (1 or 65536).
     #[serde(default)]
     pub leased_uid_count: Option<u32>,
-    /// Fixed-output build: private netns with the presto-pasta
-    /// user-mode NAT; host abstract sockets and loopback services
-    /// stay unreachable.
+    /// Set with `network` (prepare) for an agent still running an older
+    /// Tribuchet, which reads it: without it, such an agent runs a build
+    /// with network in the host's network, or refuses it.
     #[serde(default)]
     pub net_isolation: bool,
     /// Flow policy applied to that network.
@@ -93,6 +94,14 @@ pub struct SandboxSpec {
     /// agent, which runs the presto-pasta forwarder for the netns.
     #[serde(default)]
     pub net_fwd_fd: Option<i32>,
+    /// Whether that network gives the guest IPv6. Set by the agent from
+    /// its own routes and addresses, which its datapath's host sockets
+    /// use (presto_pasta's `netdev::host_has_ipv6_default_route`). No
+    /// IPv6 without a default route the agent can use is Tribuchet's
+    /// choice, not pasta's: a guest IPv6 route would only make the guest
+    /// try IPv6 first (RFC 6724 rule 2) and wait out UDP timeouts there.
+    #[serde(default)]
+    pub net_ipv6: bool,
     /// Static emulator binary for foreign-system builds, bound at
     /// binfmt::INTERP_PATH and registered in a per-userns binfmt_misc
     /// instance.
@@ -100,16 +109,18 @@ pub struct SandboxSpec {
     /// Secret files the build must never read (the worker TLS
     /// key). Defense in depth, the mount namespace already hides them.
     pub deny_read: Vec<PathBuf>,
-    /// Sandbox has the host daemon socket bind-mounted in; the
-    /// closure-delta producer also consults this flag.
-    #[serde(default)]
-    pub recursive_nix: bool,
 }
 
-/// Default daemon socket path inside the sandbox; `nix` looks here
-/// unless `NIX_REMOTE` overrides.
-#[cfg(target_os = "linux")]
-pub const NIX_DAEMON_SOCKET: &str = "/nix/var/nix/daemon-socket/socket";
+impl SandboxSpec {
+    /// Why a build with this spec may not run, if it may not: with the
+    /// host's nix-daemon socket bound in (recursive Nix, which workers no
+    /// longer serve). No spec this worker sends has it.
+    pub fn unconfined(&self) -> Option<&'static str> {
+        (self.binds_ro.iter())
+            .any(|(_, to)| to.starts_with("/nix/var/nix/daemon-socket"))
+            .then_some("with the host's nix-daemon socket")
+    }
+}
 
 /// Host path where the builder's output for `scratch` lands.
 pub fn output_host_path(spec: &SandboxSpec, scratch: &str) -> PathBuf {
@@ -132,16 +143,18 @@ pub struct PrepareOpts<'a> {
     /// Uids the build needs mapped (1 or 65536).
     pub leased_uid_count: Option<u32>,
     pub emulator: Option<&'a Path>,
-    /// Fixed-output builds get a private netns with user-mode NAT.
-    pub net_isolation: bool,
-    /// Flow policy applied to that network.
+    /// Flow policy applied to a build's network.
     pub net_policy: NetPolicy,
-    /// Bind-mount the host nix-daemon socket into the sandbox so the
-    /// builder can register inner-build outputs.
-    pub recursive_nix: bool,
-    /// Host path of the daemon socket to expose; only consulted when
-    /// `recursive_nix` is set.
-    pub nix_daemon_socket: Option<&'a Path>,
+}
+
+/// Whether the build `a` gets network: its derivation is fixed-output by
+/// its own env, structured attrs (in `build_dir`) and output path, as
+/// attach tells it (build_json::fixed_output); not by the assignment's
+/// `fixed_output`, which any peer of the hub's socket can set.
+pub fn network(a: &BuildAssignment, build_dir: &Path) -> bool {
+    let env = |name: &str| a.env.get(name).map(String::as_str);
+    let attrs = build_json::read_attrs(build_dir, a.env.contains_key("NIX_ATTRS_JSON_FILE"));
+    build_json::fixed_output(&a.store_dir, &a.outputs, env, attrs.as_ref())
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -180,13 +193,14 @@ pub fn prepare(
 ) -> Result<SandboxSpec, Error> {
     let build_dir = dir.join("top").join("build");
     fs::create_dir_all(&build_dir).map_err(io_ctx("creating", &build_dir))?;
+    let network = network(a, &build_dir);
     let mut spec = SandboxSpec {
         builder: a.builder.clone(),
         system: a.system.clone(),
         args: a.args.clone(),
         env: a.env.clone().into_iter().collect(),
         cwd: a.tmp_dir_in_sandbox.clone(),
-        network: a.fixed_output,
+        network,
         root: dir.join("root"),
         build_dir,
         // inputs live at their real store paths (daemon import)
@@ -206,13 +220,13 @@ pub fn prepare(
         cgroup: None,
         leased_userns: opts.leased_userns.clone(),
         leased_uid_count: opts.leased_uid_count,
-        // filled in by the agent, like the namespace and cgroup
-        net_isolation: opts.net_isolation && a.fixed_output,
+        net_isolation: network,
         net_policy: opts.net_policy.clone(),
+        // filled in by the agent, like the namespace and cgroup
         net_fwd_fd: None,
+        net_ipv6: false,
         emulator: opts.emulator.map(Path::to_path_buf),
         deny_read: opts.secrets.to_vec(),
-        recursive_nix: opts.recursive_nix,
     };
     if let Some(em) = opts.emulator {
         spec.binds_ro
@@ -223,20 +237,6 @@ pub fn prepare(
         // need a shell at /bin/sh.
         spec.binds_ro
             .push((sh.to_owned(), PathBuf::from("/bin/sh")));
-    }
-    if opts.recursive_nix {
-        let host = opts
-            .nix_daemon_socket
-            .unwrap_or_else(|| Path::new(NIX_DAEMON_SOCKET));
-        spec.binds_ro
-            .push((host.to_path_buf(), PathBuf::from(NIX_DAEMON_SOCKET)));
-        // The hub-side patched Nix points NIX_REMOTE at its own
-        // topTmpDir/.nix-socket (where its in-process recursive
-        // daemon would listen); redirect to the worker's daemon.
-        spec.env.insert(
-            "NIX_REMOTE".to_owned(),
-            format!("unix://{NIX_DAEMON_SOCKET}"),
-        );
     }
     spec.binds_ro.sort(); // deterministic mount order
     Ok(spec)
@@ -293,7 +293,7 @@ pub fn send_spec_to(spec: &SandboxSpec, w: OwnedFd) -> Result<(), Error> {
 }
 
 #[cfg(target_os = "linux")]
-pub use platform::{SETUP_STAGE_ARG, prepare_root, setup_error_detail, setup_stage};
+pub use platform::{SETUP_STAGE_ARG, net_config, prepare_root, setup_error_detail, setup_stage};
 
 #[cfg(target_os = "linux")]
 #[path = "sandbox/linux.rs"]
@@ -302,72 +302,9 @@ mod platform;
 #[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-    use std::collections::BTreeMap;
+    use crate::build_json::tests::{HASH, INPUT_ADDRESSED, SRI};
     use std::{error, result};
     type Result<T> = result::Result<T, Box<dyn error::Error>>;
-
-    fn min_assignment() -> BuildAssignment {
-        BuildAssignment {
-            build_id: "0123456789abcdef0123456789abcdef".into(),
-            dedupe_key: "k".into(),
-            required_features: vec![],
-            local_networking: false,
-            system: "x86_64-linux".into(),
-            builder: "/nix/store/00000000000000000000000000000000-b/bin/b".into(),
-            args: vec![],
-            env: BTreeMap::default(),
-            outputs: BTreeMap::default(),
-            tmp_dir_in_sandbox: "/build".into(),
-            store_dir: "/nix/store".into(),
-            fixed_output: false,
-            inputs: vec![],
-            ..Default::default()
-        }
-    }
-
-    /// recursive-nix flag toggles a daemon-socket bind; without it,
-    /// no /nix/var path appears in binds_ro.
-    #[test]
-    fn recursive_nix_adds_the_daemon_socket_bind() -> Result<()> {
-        let host = tempfile::tempdir()?;
-        let host_sock = host.path().join("sock");
-        fs::File::create(&host_sock)?;
-
-        let off_dir = tempfile::tempdir()?;
-        let off = prepare(
-            &min_assignment(),
-            off_dir.path(),
-            &[],
-            &PrepareOpts {
-                recursive_nix: false,
-                nix_daemon_socket: Some(&host_sock),
-                ..Default::default()
-            },
-        )?;
-        assert!(
-            off.binds_ro
-                .iter()
-                .all(|(_, dst)| dst != Path::new(NIX_DAEMON_SOCKET))
-        );
-
-        let on_dir = tempfile::tempdir()?;
-        let on = prepare(
-            &min_assignment(),
-            on_dir.path(),
-            &[],
-            &PrepareOpts {
-                recursive_nix: true,
-                nix_daemon_socket: Some(&host_sock),
-                ..Default::default()
-            },
-        )?;
-        assert!(
-            on.binds_ro
-                .iter()
-                .any(|(src, dst)| src == &host_sock && dst == Path::new(NIX_DAEMON_SOCKET))
-        );
-        Ok(())
-    }
 
     /// Common fields for a /bin/sh test build rooted in `dir`;
     /// tests override what they exercise via struct update syntax.
@@ -380,6 +317,58 @@ mod tests {
             build_dir: dir.join("top/build"),
             ..SandboxSpec::default()
         }
+    }
+
+    /// The setup stage refuses a spec with the host's nix-daemon socket
+    /// before it enters any namespace; a store path is no such bind.
+    #[test]
+    fn the_setup_stage_refuses_an_unconfined_spec() {
+        let dir = tempfile::tempdir().unwrap();
+        let spec = |bind: &str| SandboxSpec {
+            binds_ro: vec![(PathBuf::from("/x"), PathBuf::from(bind))],
+            ..test_spec(dir.path())
+        };
+        assert_eq!(spec("/nix/store/x").unconfined(), None);
+        let status = fs::File::create(dir.path().join("status")).unwrap();
+        let socket = spec("/nix/var/nix/daemon-socket/socket");
+        let err = platform::stage::enter_and_exec(&socket, &status).unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "refusing a build with the host's nix-daemon socket"
+        );
+    }
+
+    /// A fixed-output build, from its env or structured attrs and its
+    /// output path, gets network, in a network of its own; the hub's word
+    /// that a build is fixed-output gives none, nor does its absence take it.
+    #[test]
+    fn a_build_has_network_by_its_derivation_not_the_hubs_word() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let build = |hub: bool, out: &str, env: &[(&str, &str)]| BuildAssignment {
+            fixed_output: hub,
+            store_dir: "/nix/store".into(),
+            outputs: [("out".to_owned(), out.to_owned())].into(),
+            env: env
+                .iter()
+                .map(|(k, v)| ((*k).to_owned(), (*v).to_owned()))
+                .collect(),
+            ..BuildAssignment::default()
+        };
+        let network = |a: &BuildAssignment| -> Result<(bool, bool)> {
+            let spec = prepare(a, dir.path(), &[], &PrepareOpts::default())?;
+            assert!(spec.unconfined().is_none());
+            Ok((spec.network, spec.net_isolation))
+        };
+        let fod = build(false, SRI, &[("outputHash", HASH)]);
+        assert_eq!(network(&fod)?, (true, true));
+        let claimed = build(true, INPUT_ADDRESSED, &[("outputHash", HASH)]);
+        assert_eq!(network(&claimed)?, (false, false));
+        let attrs = build(false, SRI, &[("NIX_ATTRS_JSON_FILE", "/build/.attrs.json")]);
+        assert_eq!(network(&attrs)?, (false, false));
+        let file = dir.path().join("top/build/.attrs.json");
+        fs::write(file, format!(r#"{{"outputHash": "{HASH}"}}"#))?;
+        assert_eq!(network(&attrs)?, (true, true));
+        Ok(())
     }
 
     /// The derivation env is client-controlled (LD_PRELOAD, …) and must

@@ -1,16 +1,17 @@
 //! Worker-side client for the per-uid build agents.
 //!
-//! Each build leases one agent from the fixed list in the worker
+//! Each build leases one agent from the agent sockets in the worker
 //! config. The Start/Adopt connection stays open for the build's
 //! lifetime and delivers the exit notice. Kill, Finish and Cleanup go
 //! over fresh connections, so they work from any worker generation.
 
 use std::fs;
+use std::io;
+use std::time::Duration;
 
 use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 #[cfg(target_os = "macos")]
 use std::fmt::Write as _;
@@ -23,8 +24,13 @@ use sandbox_proto::agent::{
 };
 use sandbox_proto::framing;
 
-use crate::errors::{Result, err_ctx, err_msg};
+use crate::errors::{Error, Result, chain, err_ctx, err_msg};
 use crate::sockpath;
+
+/// How long the worker waits on an agent call it bounds (Adopt, Status,
+/// Shutdown): a worker starting up does not wait on a stopped agent
+/// (unbounded, startup stayed unregistered 30.4 s and 71.4 s in VM runs).
+pub(super) const AGENT_ANSWER: Duration = Duration::from_secs(7);
 
 /// SBPL string literal escaping: a quote or backslash in an
 /// interpolated path must not terminate the literal and inject
@@ -43,8 +49,6 @@ fn sb_escape(s: &str) -> Result<String> {
 /// `src/libstore/darwin/build/` so updates are a file copy.
 #[cfg(target_os = "macos")]
 const NIX_SANDBOX_DEFAULTS: &str = include_str!("seatbelt/sandbox-defaults.sb");
-#[cfg(target_os = "macos")]
-const NIX_SANDBOX_NETWORK: &str = include_str!("seatbelt/sandbox-network.sb");
 
 /// Nix's baseline with its tmp dir parameters bound to the agent's
 /// scratch dir ([`SCRATCH_DIR_PARAM`], filled in agent-side), broad
@@ -54,7 +58,6 @@ const NIX_SANDBOX_NETWORK: &str = include_str!("seatbelt/sandbox-network.sb");
 pub(super) fn seatbelt_profile(
     outputs: &[String],
     deny_read: &[PathBuf],
-    network: bool,
     local_network: bool,
 ) -> Result<String> {
     let scratch = format!("(param \"{SCRATCH_DIR_PARAM}\")");
@@ -107,48 +110,24 @@ pub(super) fn seatbelt_profile(
         ")
 ",
     );
-    if network {
-        profile.push_str(NIX_SANDBOX_NETWORK);
-    }
     Ok(profile)
 }
 
-/// Free agent sockets. One build per agent, so the pool size is the
-/// worker's effective max-jobs.
-pub(super) struct AgentPool {
-    all: Vec<PathBuf>,
-    free: Mutex<Vec<PathBuf>>,
-}
-
-impl AgentPool {
-    pub(super) fn new(sockets: Vec<PathBuf>) -> Self {
-        Self {
-            all: sockets.clone(),
-            free: Mutex::new(sockets),
-        }
-    }
-
-    /// Take a free agent socket. None when every agent is leased,
-    /// which only happens if max-jobs exceeds the agent count.
-    pub(super) fn acquire(&self) -> Option<PathBuf> {
-        self.free.lock().unwrap().pop()
-    }
-
-    pub(super) fn release(&self, socket: PathBuf) {
-        if self.all.contains(&socket) {
-            self.free.lock().unwrap().push(socket);
-        }
-    }
-
-    /// Take a specific agent out of the pool: an adopted build already
-    /// occupies it, so new builds must not be placed there.
-    pub(super) fn reserve(&self, socket: &Path) {
-        self.free.lock().unwrap().retain(|s| s != socket);
-    }
-
-    /// Sockets not occupied by an adopted build.
-    pub(super) fn idle_sockets(&self) -> Vec<PathBuf> {
-        self.free.lock().unwrap().clone()
+/// Nothing listens on the agent socket, or the file is gone: a stopped
+/// socket unit leaves its file behind (RemoveOnStop=no). `connect` is
+/// the only step of an agent call that yields a context-wrapped
+/// io::Error. Or the connection dropped unanswered: the agent service
+/// failed. An error the agent replies with is not this.
+pub(super) fn unreachable(e: &Error) -> bool {
+    match e {
+        Error::Context { source, .. } => source.downcast_ref::<io::Error>().is_some_and(|e| {
+            matches!(
+                e.kind(),
+                io::ErrorKind::ConnectionRefused | io::ErrorKind::NotFound
+            )
+        }),
+        Error::Framing(framing::Error::ConnectionClosed | framing::Error::Io { .. }) => true,
+        _ => false,
     }
 }
 
@@ -157,6 +136,9 @@ pub(super) struct AgentBuild {
     conn: UnixStream,
     pub(super) pid: i32,
     pub(super) scratch_dir: PathBuf,
+    /// The build's cgroup.freeze, write-only, where it has a cgroup: the
+    /// arbiter's to freeze and thaw it with while the lease lasts.
+    pub(super) freeze: Option<fs::File>,
 }
 
 impl AgentBuild {
@@ -174,7 +156,7 @@ impl AgentBuild {
             call::Call::Start(Box::new(req.clone())),
             &[tmp_pack.as_raw_fd(), log.as_raw_fd()],
         )?;
-        let (reply, _fds) = framing::recv_reply(&conn)?;
+        let (reply, fds) = framing::recv_reply(&conn)?;
         let reply::Reply::Start(reply) = reply else {
             return Err(err_msg(format!("unexpected agent reply {reply:?}")));
         };
@@ -182,13 +164,16 @@ impl AgentBuild {
             conn,
             pid: reply.pid,
             scratch_dir: PathBuf::from(reply.scratch_dir),
+            freeze: fds.into_iter().next().map(fs::File::from),
         })
     }
 
     /// Reattach to a build a previous worker generation started.
     /// Returns the build plus its exit code if it already finished.
+    /// The agent answers within AGENT_ANSWER, or the call fails as
+    /// unreachable.
     pub(super) fn adopt(socket: &Path, build_id: &str) -> Result<(Self, Option<i32>)> {
-        let conn = connect(socket)?;
+        let conn = connect_bounded(socket)?;
         framing::send_call(
             &conn,
             call::Call::Adopt(AdoptRequest {
@@ -196,14 +181,17 @@ impl AgentBuild {
             }),
             &[],
         )?;
-        let (reply, _fds) = framing::recv_reply(&conn)?;
+        let (reply, fds) = framing::recv_reply(&conn)?;
         let reply::Reply::Adopt(reply) = reply else {
             return Err(err_msg(format!("unexpected agent reply {reply:?}")));
         };
+        // The lease connection then waits for the exit notice, unbounded.
+        bound(&conn, None)?;
         let build = Self {
             conn,
             pid: reply.pid,
             scratch_dir: PathBuf::from(reply.scratch_dir),
+            freeze: fds.into_iter().next().map(fs::File::from),
         };
         Ok((build, reply.exit_code))
     }
@@ -225,17 +213,36 @@ fn connect(socket: &Path) -> Result<UnixStream> {
     )))
 }
 
+/// A connection whose reads and writes give up after AGENT_ANSWER,
+/// for calls the agent answers at once. A timeout is a framing I/O
+/// error, which `unreachable` counts.
+fn connect_bounded(socket: &Path) -> Result<UnixStream> {
+    let conn = connect(socket)?;
+    bound(&conn, Some(AGENT_ANSWER))?;
+    Ok(conn)
+}
+
+fn bound(conn: &UnixStream, within: Option<Duration>) -> Result<()> {
+    conn.set_read_timeout(within)
+        .and_then(|()| conn.set_write_timeout(within))
+        .map_err(err_ctx("bounding an agent call"))
+}
+
 /// Fire a control call that replies with an empty message.
 fn control(socket: &Path, call: call::Call) -> Result<()> {
-    let conn = connect(socket)?;
-    framing::send_call(&conn, call, &[])?;
-    framing::recv_reply(&conn)?;
+    control_on(&connect(socket)?, call)
+}
+
+fn control_on(conn: &UnixStream, call: call::Call) -> Result<()> {
+    framing::send_call(conn, call, &[])?;
+    framing::recv_reply(conn)?;
     Ok(())
 }
 
-/// The build the agent behind `socket` currently owns, if any.
+/// The build the agent behind `socket` currently owns, if any, within
+/// AGENT_ANSWER.
 pub(super) fn current_build(socket: &Path) -> Result<Option<String>> {
-    let conn = connect(socket)?;
+    let conn = connect_bounded(socket)?;
     framing::send_call(&conn, call::Call::Status(StatusRequest {}), &[])?;
     let (reply, _) = framing::recv_reply(&conn)?;
     let reply::Reply::Status(reply) = reply else {
@@ -275,14 +282,29 @@ pub(super) fn cleanup(socket: &Path, build_id: &str) -> Result<()> {
     )
 }
 
-/// Ask an idle activated agent to exit. Sent while the caller still
-/// holds the agent slot, so nothing connects to the dying instance.
+/// Have the agent at `socket` forget build `id` (Cleanup), then exit
+/// (Shutdown), warning of the first that fails: a failed Cleanup as
+/// `what` failed.
+pub(super) fn retire(socket: &Path, id: &str, what: &str) {
+    if let Err(e) = cleanup(socket, id) {
+        tracing::warn!(id, "{what} failed: {}", chain(&e));
+    } else if let Err(e) = shutdown(socket) {
+        tracing::warn!(id, "agent shutdown failed: {}", chain(&e));
+    }
+}
+
+/// Ask an idle activated agent to exit, within AGENT_ANSWER. Sent
+/// while the caller still holds the agent slot, so nothing connects to
+/// the dying instance.
 pub(super) fn shutdown(socket: &Path) -> Result<()> {
-    control(socket, call::Call::Shutdown(ShutdownRequest {}))
+    control_on(
+        &connect_bounded(socket)?,
+        call::Call::Shutdown(ShutdownRequest {}),
+    )
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::os::fd::IntoRawFd;
@@ -291,12 +313,11 @@ mod tests {
     use crate::tmpdir::pack_zstd_dir;
     use crate::worker::agent;
 
-    /// A dev-mode agent (self-bound socket, same uid) plus a staged
-    /// tmp dir pack for it, shared by the tests below.
-    fn spawn_test_agent(dir: &Path) -> Result<(PathBuf, PathBuf)> {
-        let socket = dir.join("agent.sock");
-        let state_dir = dir.join("state");
-        let listener = sockpath::bind(&socket)?;
+    pub(in crate::worker) mod pool;
+
+    /// A dev-mode agent: self-bound socket, same uid.
+    pub(in crate::worker) fn spawn_agent(socket: &Path, state_dir: PathBuf) -> Result<()> {
+        let listener = sockpath::bind(socket)?;
         thread::spawn(move || {
             let _ = agent::run(&agent::Options {
                 socket: None,
@@ -307,6 +328,14 @@ mod tests {
                 dedicated_uid: false,
             });
         });
+        Ok(())
+    }
+
+    /// A dev-mode agent plus a staged tmp dir pack for it, shared by
+    /// the tests below.
+    pub(in crate::worker) fn spawn_test_agent(dir: &Path) -> Result<(PathBuf, PathBuf)> {
+        let socket = dir.join("agent.sock");
+        spawn_agent(&socket, dir.join("state"))?;
         // build dir carrying .attrs.json, like the client pack
         let build = dir.join("top/build");
         fs::create_dir_all(&build)?;
@@ -316,7 +345,11 @@ mod tests {
         Ok((socket, pack_path))
     }
 
-    fn start_request(build_id: &str, script: String, outputs: Vec<String>) -> StartRequest {
+    pub(in crate::worker) fn start_request(
+        build_id: &str,
+        script: String,
+        outputs: Vec<String>,
+    ) -> StartRequest {
         StartRequest {
             build_id: build_id.into(),
             builder: "/bin/sh".into(),
@@ -417,7 +450,7 @@ mod tests {
             ),
             outputs.clone(),
         );
-        req.profile = seatbelt_profile(&outputs, &[secret], false, false)?;
+        req.profile = seatbelt_profile(&outputs, &[secret], false)?;
         let log_w = fs::OpenOptions::new()
             .create(true)
             .append(true)

@@ -5,6 +5,7 @@ use std::fs;
 use std::mem;
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use harmonia_store_path::{StoreDir, StorePath, StorePathSet};
 use harmonia_store_path_info::ValidPathInfo;
@@ -18,8 +19,9 @@ use claims::{ClaimState, Claimed, Wait};
 pub(super) use claims::{Claims, Wake};
 use import_pool::{ImportHandle, ImportPool};
 
+use super::lease::Lease;
 use super::pins;
-use super::{DaemonConn, Slot, WorkerCtx, unix_now};
+use super::{DaemonConn, WorkerCtx, unix_now};
 use crate::chunkio::ChannelReader;
 use crate::errors::chain;
 use crate::errors::{Result, err_ctx, err_msg};
@@ -36,12 +38,18 @@ pub(super) enum StagingStatus {
 
 type Unpacker = (mpsc::Sender<Vec<u8>>, tokio::task::JoinHandle<Result<()>>);
 
+/// The daemon's connection, which holds the temp roots, each offered
+/// input and whether it is valid, and (macOS) whether every output is.
+pub(super) type Checked = (DaemonConn, Vec<(String, bool)>, bool);
+/// A negotiation's build id, run dir, and what the daemon said.
+pub(super) type Negotiation = (String, PathBuf, Result<Checked>);
+
 pub(super) struct ActiveBuild {
     pub(super) assignment: BuildAssignment,
-    pub(super) dir: PathBuf, // state_dir/builds/<id>
+    pub(super) dir: PathBuf, // state_dir/builds/<id>.<ns>, the run's own
     pub(super) ctx: Arc<WorkerCtx>,
     /// None while staged as lookahead beyond the free slots.
-    pub(super) slot: Option<Slot>,
+    pub(super) lease: Option<Lease>,
     /// Input store paths valid in /nix/store (bind-mount sources).
     inputs: HashSet<String>,
     /// Paths this build claimed and imports, removed at dispatch.
@@ -59,7 +67,7 @@ pub(super) struct ActiveBuild {
     /// Needs with hashes the hub has not answered with eof yet.
     needs_outstanding: u32,
     /// Daemon connection; carries this build's temp roots, so it must
-    /// outlive the build.
+    /// outlive the build. None until negotiated.
     daemon: Option<DaemonConn>,
     /// macOS: all outputs are already valid in the shared store.
     reuse_outputs: bool,
@@ -86,10 +94,15 @@ impl ActiveBuild {
         ctx: Arc<WorkerCtx>,
         wake: mpsc::UnboundedSender<Wake>,
     ) -> Result<Self> {
-        let dir = ctx.state_dir.join("builds").join(&assignment.build_id);
-        if dir.exists() {
-            fs::remove_dir_all(&dir).map_err(io_ctx("removing", &dir))?;
-        }
+        // A dir of its own: the hub may run a build id again while its
+        // earlier run's is still in use (killed for a cancel, or removed).
+        let run = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let dir = ctx
+            .state_dir
+            .join(format!("builds/{}.{run}", assignment.build_id));
         fs::create_dir_all(dir.join("top/build"))
             .map_err(io_ctx("creating", &dir.join("top/build")))?;
         let chunks = ChunkStaging::new(ctx.chunks.clone());
@@ -97,7 +110,7 @@ impl ActiveBuild {
             assignment,
             dir,
             ctx,
-            slot: None,
+            lease: None,
             inputs: HashSet::new(),
             pending: HashSet::new(),
             infos: HashMap::new(),
@@ -117,12 +130,36 @@ impl ActiveBuild {
         })
     }
 
-    /// Pin and check the inputs, take inline manifests, and answer
-    /// with the first Need listing every path this build imports.
-    pub(super) async fn negotiate(&mut self) -> Result<(Option<Need>, StagingStatus)> {
+    /// Pin and check the inputs, with the daemon, apart from the build:
+    /// the session loop runs it, reading the hub meanwhile.
+    pub(super) fn negotiation(&self) -> impl Future<Output = Negotiation> + Send + 'static {
+        let offered = (self.assignment.inputs.iter())
+            .map(|m| m.store_path.clone())
+            .collect();
+        let outputs = self.assignment.outputs.values().cloned().collect();
+        let (id, dir) = (self.assignment.build_id.clone(), self.dir.clone());
+        let socket = self.ctx.daemon_socket.clone();
+        async move { (id, dir, Self::check_inputs(socket, offered, outputs).await) }
+    }
+
+    /// Take the negotiation's inputs and the inline manifests, and
+    /// answer with the first Need listing every path this build imports
+    /// (the hub sends no manifest or chunk before it).
+    pub(super) fn negotiated(
+        &mut self,
+        checked: Result<Checked>,
+    ) -> Result<(Option<Need>, StagingStatus)> {
+        let (daemon, offered, reuse_outputs) = checked?;
+        let mut missing = Vec::new();
+        for (p, valid) in offered {
+            if valid {
+                self.inputs.insert(p);
+            } else if self.claim(&p) {
+                missing.push(p);
+            }
+        }
+        (self.daemon, self.reuse_outputs) = (Some(daemon), reuse_outputs);
         let inputs = mem::take(&mut self.assignment.inputs);
-        let offered: Vec<String> = inputs.iter().map(|m| m.store_path.clone()).collect();
-        let missing = self.check_inputs(&offered).await?;
         let mut hashes = Vec::new();
         for m in inputs {
             if m.info.is_some() {
@@ -140,15 +177,21 @@ impl ActiveBuild {
         Ok((Some(need), self.try_complete()))
     }
 
-    async fn check_inputs(&mut self, offered: &[String]) -> Result<Vec<String>> {
+    async fn check_inputs(
+        socket: Option<PathBuf>,
+        offered: Vec<String>,
+        outputs: Vec<String>,
+    ) -> Result<Checked> {
         let store_dir = StoreDir::default();
-        let mut daemon = DaemonClient::builder()
-            .connect_daemon()
-            .await
-            .map_err(err_ctx("connecting to the local nix-daemon"))?;
+        let builder = DaemonClient::builder();
+        let mut daemon = match socket {
+            Some(s) => builder.connect_unix(s).await,
+            None => builder.connect_daemon().await,
+        }
+        .map_err(err_ctx("connecting to the local nix-daemon"))?;
         let mut parsed = Vec::with_capacity(offered.len());
         let mut set = StorePathSet::new();
-        for p in offered {
+        for p in &offered {
             // Only real store paths may become bind-mount sources; a
             // compromised hub must not get the worker's own files
             // (TLS key) mounted into a sandbox.
@@ -212,29 +255,27 @@ impl ActiveBuild {
                 .await
                 .map_err(err_ctx("re-querying valid paths"))?;
         }
-        let mut missing = Vec::new();
-        for (p, sp) in parsed {
-            if valid.contains(&sp) {
-                self.inputs.insert(p.clone());
-            } else if self.claim(p) {
-                missing.push(p.clone());
-            }
-        }
-        if cfg!(target_os = "macos") {
-            self.reuse_outputs = self.check_outputs(&mut daemon, &store_dir).await?;
-        }
-        self.daemon = Some(daemon);
-        Ok(missing)
+        let checked = parsed
+            .into_iter()
+            .map(|(p, sp)| (p.clone(), valid.contains(&sp)));
+        let checked = checked.collect();
+        let mac = cfg!(target_os = "macos");
+        let reuse = mac && Self::check_outputs(&mut daemon, &store_dir, &outputs).await?;
+        Ok((daemon, checked, reuse))
     }
 
     /// macOS builds write into the real store and cleanup deletes the
     /// outputs, so existing ones can't be built over. Another builder
     /// sharing the store may have produced them: reuse if all are
     /// valid, reject if any exists unregistered.
-    async fn check_outputs(&self, daemon: &mut DaemonConn, store_dir: &StoreDir) -> Result<bool> {
+    async fn check_outputs(
+        daemon: &mut DaemonConn,
+        store_dir: &StoreDir,
+        outputs: &[String],
+    ) -> Result<bool> {
         let mut set = StorePathSet::new();
         let mut exists = false;
-        for p in self.assignment.outputs.values() {
+        for p in outputs {
             let sp = store_dir
                 .parse(p)
                 .map_err(err_ctx(format!("output {p:?} is not a store path")))?;
@@ -378,6 +419,7 @@ impl ActiveBuild {
     /// path is imported and every waited-on claim settled.
     fn try_complete(&self) -> StagingStatus {
         let busy = !self.tmp_dir_done
+            || self.daemon.is_none()
             || !self.pending.is_empty()
             || !self.imports.is_empty()
             || !self.waits.is_empty();
@@ -397,7 +439,8 @@ impl ActiveBuild {
     /// Tear down a build abandoned before execution: stop the import
     /// and unpacker tasks and remove everything staged on disk. The
     /// daemon connection (and with it the temp roots) drops here; a
-    /// half-imported path is the daemon's to clean up.
+    /// half-imported path is the daemon's to clean up. The removal goes
+    /// on off the runtime's threads, after it returns.
     pub(super) async fn abort(mut self) {
         self.settle_all(ClaimState::Failed);
         self.imports.clear();
@@ -409,9 +452,12 @@ impl ActiveBuild {
             task.abort();
             let _ = task.await;
         }
-        if let Err(e) = fs::remove_dir_all(&self.dir) {
-            tracing::warn!("cleaning up {}: {e}", self.dir.display());
-        }
+        let dir = mem::take(&mut self.dir);
+        spawn_blocking(move || {
+            if let Err(e) = fs::remove_dir_all(&dir) {
+                tracing::warn!("cleaning up {}: {e}", dir.display());
+            }
+        });
     }
 }
 
@@ -430,15 +476,66 @@ pub(super) use validate::validate_assignment;
 mod import_pool;
 mod outputs;
 pub(super) use agent_exec::supervise_agent;
-pub(super) use outputs::pack_outputs_and_extras;
+pub(super) use outputs::pack_outputs;
 
 #[cfg(test)]
-mod tests {
+#[path = "build/wait_tests.rs"]
+mod wait_tests;
+
+#[cfg(test)]
+pub(super) mod tests {
     use std::collections::BTreeMap;
+    use std::time::Duration;
 
+    use super::wait_tests::waiting_build;
     use super::*;
+    use crate::build_json::tests::{HASH, SRI};
 
-    fn base_assignment() -> BuildAssignment {
+    /// A build id run again gets a dir of its own, and its earlier run's
+    /// dir, perhaps still in use, is left be. Before, it was removed.
+    #[test]
+    fn a_build_id_run_again_has_a_dir_of_its_own() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let ctx = WorkerCtx::for_test(dir.path(), 1, vec![])?;
+        let run = || ActiveBuild::new(base_assignment(), ctx.clone(), mpsc::unbounded_channel().0);
+        let earlier = run()?;
+        fs::write(earlier.dir.join("build.log"), "running")?;
+        let again = run()?;
+        assert_ne!(again.dir, earlier.dir);
+        assert_eq!(
+            fs::read_to_string(earlier.dir.join("build.log"))?,
+            "running"
+        );
+        Ok(())
+    }
+
+    /// A build with network is refused, named, where the worker cannot
+    /// give it a network of its own (a Linux worker without /dev/net/tun,
+    /// any macOS worker), before any agent is asked: not run in the
+    /// worker's network.
+    #[test]
+    fn a_build_with_network_is_refused_where_it_cannot_be_isolated() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (out_tx, _out_rx) = mpsc::channel(8);
+        let a = BuildAssignment {
+            env: [("outputHash".to_owned(), HASH.to_owned())].into(),
+            outputs: [("out".to_owned(), SRI.to_owned())].into(),
+            ..base_assignment()
+        };
+        let (ctx, build, _woken) = waiting_build(dir.path(), a, &out_tx)?;
+        // Cancelled, so that a build not refused does not wait for its
+        // agent, which is down: it fails as cancelled instead.
+        ctx.cancelled.lock().unwrap().insert("test-key".into());
+        let mut lease = ctx.agents.lease().expect("a free slot");
+        let refused = build.execute(&mut lease, &out_tx, Duration::from_secs(60));
+        assert_eq!(
+            refused.err().map(|e| chain(&e)).as_deref(),
+            Some("refusing a build with network: this worker cannot give it a network of its own")
+        );
+        Ok(())
+    }
+
+    pub(in crate::worker) fn base_assignment() -> BuildAssignment {
         BuildAssignment {
             build_id: "0123456789abcdef0123456789abcdef".into(),
             dedupe_key: "test-key".into(),
@@ -455,8 +552,7 @@ mod tests {
             .into(),
             tmp_dir_in_sandbox: "/build".into(),
             store_dir: "/nix/store".into(),
-            fixed_output: false,
-            inputs: vec![],
+            ..Default::default()
         }
     }
 
