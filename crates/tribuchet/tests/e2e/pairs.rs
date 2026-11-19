@@ -50,10 +50,9 @@ fn limits((timeout, silent): (i64, i64)) {
         &format!(
             "mkdir -p /run/arb && \
              {{ test -e /run/arb/base.toml || cp $(readlink -f /etc/tribuchet/worker.toml) /run/arb/base.toml; }} && \
-             {{ printf 'build-timeout-secs = %d\\nmax-silent-time-secs = %d\\n' {} {silent}; \
+             {{ printf 'build-timeout-secs = %d\\nmax-silent-time-secs = %d\\n' {timeout} {silent}; \
                 cat /run/arb/base.toml; }} > /run/arb/worker.toml && \
-             cp --remove-destination /run/arb/worker.toml /etc/tribuchet/worker.toml",
-            if timeout == 0 { 86_400 } else { timeout },
+             cp --remove-destination /run/arb/worker.toml /etc/tribuchet/worker.toml"
         ),
     );
     let registered = count(Node::Hub, "tribuchet-hub", "worker registered");

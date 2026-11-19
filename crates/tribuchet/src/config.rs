@@ -8,7 +8,6 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io;
-use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::thread;
 
@@ -214,10 +213,10 @@ pub struct WorkerConfig {
     pub key: PathBuf,
     /// Kill builds running longer than this many seconds, counted from
     /// when a build agent starts the build: waiting for a free agent
-    /// does not count, nor does time frozen by the CPU arbiter. 0 is
-    /// refused at load, not taken as none.
-    #[serde(default = "default_build_timeout")]
-    pub build_timeout_secs: NonZeroU64,
+    /// does not count, nor does time frozen by the CPU arbiter; 0, the
+    /// default, sets none (a client's own timeout still applies).
+    #[serde(default)]
+    pub build_timeout_secs: u64,
     /// Kill builds producing no log output for this many seconds
     /// (Nix's max-silent-time), not counting time frozen by the CPU
     /// arbiter; 0 disables.
@@ -308,9 +307,6 @@ fn default_cert() -> PathBuf {
 }
 fn default_key() -> PathBuf {
     "/var/lib/tribuchet/tls/worker.key".into()
-}
-fn default_build_timeout() -> NonZeroU64 {
-    NonZeroU64::new(24 * 3600).unwrap()
 }
 fn default_import_jobs() -> u32 {
     4

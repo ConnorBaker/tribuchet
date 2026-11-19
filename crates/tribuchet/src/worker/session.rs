@@ -87,7 +87,7 @@ pub(super) async fn session(opts: &WorkerConfig, ctx: &Arc<WorkerCtx>) -> Result
         &mut active,
         &out_tx,
         ctx,
-        Duration::from_secs(opts.build_timeout_secs.get()),
+        Duration::from_secs(opts.build_timeout_secs),
     )
     .await;
     // Builds still staging when the session dies must not keep their

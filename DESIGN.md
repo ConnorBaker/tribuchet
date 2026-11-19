@@ -464,11 +464,14 @@ reported at start, and nothing is frozen there.
 * With no bound on frozen time, a follower waits on the parallel
   builds older than it. A leader that hangs while spinning on every
   CPU holds every younger parallel build on its worker frozen until
-  its own running-time timeout ends it (`build-timeout-secs`, 24 h by
-  default, or its client's lesser one); the next oldest then leads. The
-  wait is bounded, since a build started later never leads over an
-  older one, but can reach that timeout once for each older parallel
-  build.
+  its running-time limit ends it: its client's `timeout`, or the
+  worker's `build-timeout-secs` if set (none by default), or, once every
+  client of it is gone, the clientless rule giving it up for a build
+  with a client that wants its room; the next oldest then leads. A
+  build started later never leads over an older one, but the wait can
+  reach that limit once for each older parallel build, and is unbounded
+  for a leader with neither a limit nor a client while no build with a
+  client wants its room.
 * The frozen builds' memory rule is a margin, not a bound: a leader that
   grows faster than one 200 ms sample can still fill a capped slice.
 * Within the agents' slice the kernel's OOM killer kills one process,

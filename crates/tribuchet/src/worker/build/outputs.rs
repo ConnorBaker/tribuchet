@@ -18,7 +18,7 @@ use crate::proto::MAX_NAR_BYTES;
 pub(in crate::worker) fn pack_outputs(
     dir: &Path,
     spec: &sandbox::SandboxSpec,
-    deadline: Instant,
+    deadline: Option<Instant>,
 ) -> Result<Vec<PackedOutput>> {
     let mut packed = Vec::new();
     for scratch in &spec.outputs {
@@ -44,7 +44,11 @@ pub(in crate::worker) fn pack_outputs(
 const BATCH: usize = 64;
 
 /// Chunk `host_path`'s NAR into a file of zstd frames. Blocking.
-fn pack_one_nar(host_path: &Path, frames_path: &Path, deadline: Instant) -> Result<Vec<OutChunk>> {
+fn pack_one_nar(
+    host_path: &Path,
+    frames_path: &Path,
+    deadline: Option<Instant>,
+) -> Result<Vec<OutChunk>> {
     let mut frames = FrameWriter {
         file: BufWriter::new(File::create(frames_path).map_err(io_ctx("creating", frames_path))?),
         chunks: Vec::new(),
@@ -54,7 +58,7 @@ fn pack_one_nar(host_path: &Path, frames_path: &Path, deadline: Instant) -> Resu
     let mut total = 0u64;
     chunk_store_path(host_path, |c| {
         // A builder can exit instantly leaving a multi-TB sparse output.
-        if Instant::now() >= deadline {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
             return Err(err_msg("build timed out"));
         }
         total += c.data.len() as u64;
