@@ -49,8 +49,6 @@ fn sb_escape(s: &str) -> Result<String> {
 /// `src/libstore/darwin/build/` so updates are a file copy.
 #[cfg(target_os = "macos")]
 const NIX_SANDBOX_DEFAULTS: &str = include_str!("seatbelt/sandbox-defaults.sb");
-#[cfg(target_os = "macos")]
-const NIX_SANDBOX_NETWORK: &str = include_str!("seatbelt/sandbox-network.sb");
 
 /// Nix's baseline with its tmp dir parameters bound to the agent's
 /// scratch dir ([`SCRATCH_DIR_PARAM`], filled in agent-side), broad
@@ -60,7 +58,6 @@ const NIX_SANDBOX_NETWORK: &str = include_str!("seatbelt/sandbox-network.sb");
 pub(super) fn seatbelt_profile(
     outputs: &[String],
     deny_read: &[PathBuf],
-    network: bool,
     local_network: bool,
 ) -> Result<String> {
     let scratch = format!("(param \"{SCRATCH_DIR_PARAM}\")");
@@ -113,9 +110,6 @@ pub(super) fn seatbelt_profile(
         ")
 ",
     );
-    if network {
-        profile.push_str(NIX_SANDBOX_NETWORK);
-    }
     Ok(profile)
 }
 

@@ -191,7 +191,12 @@ impl attach_hub_server::AttachHub for AttachSvc {
         let key = dedupe_key(&req, &tmp_dir_pack);
 
         let features = req.required_features.clone();
-        if let Some(declined) = self.await_capable_worker(&req.system, &features).await {
+        // Declined, a build with network would run on this host's own
+        // daemon, in its network, outside every fod-network policy: it
+        // waits for a worker, queued and its clients told (hold_unservable).
+        if !req.fixed_output
+            && let Some(declined) = self.await_capable_worker(&req.system, &features).await
+        {
             return Ok(declined);
         }
 
@@ -270,6 +275,7 @@ mod tests {
     use std::time::Duration;
 
     use crate::hub::state::WorkerCaps;
+    use crate::hub::tests::submit;
 
     /// 32-char base32 hash part for synthetic store paths.
     const H: &str = "00000000000000000000000000000000";
@@ -363,6 +369,59 @@ mod tests {
         };
         state.worker_caps.lock().unwrap().insert(1, caps);
         state
+    }
+
+    /// A submitted build's replay carries the id the build is queued
+    /// with, which the replay's warnings log.
+    #[tokio::test]
+    async fn a_submitted_builds_replay_carries_its_id() {
+        let state = hub();
+        let _events = submit(&state, base_request()).await;
+        let queue = state.queue.lock().await;
+        assert_eq!(queue[0].replay.id(), queue[0].id);
+    }
+
+    /// The same request submitted again while its build is in flight
+    /// joins that build (a chain of bounded clients).
+    /// So does one asking other limits: the build keeps those of the
+    /// request that dispatched it.
+    #[tokio::test]
+    async fn a_resubmission_joins_the_build_in_flight() {
+        let state = hub();
+        let limited = BuildRequest {
+            timeout_secs: 600,
+            max_silent_secs: 60,
+            ..base_request()
+        };
+        let _first = submit(&state, limited).await;
+        let second =
+            tokio::time::timeout(Duration::from_secs(10), submit(&state, base_request())).await;
+        assert!(second.is_ok(), "the resubmission did not join the build");
+        assert_eq!(state.queue.lock().await.len(), 1, "queued twice");
+    }
+
+    /// With no worker for its system, a build with network is not declined,
+    /// which would have Nix run it on the hub's host: it is queued, its
+    /// client told why it waits. Any other build is declined.
+    #[tokio::test]
+    async fn only_a_build_without_network_is_declined() {
+        let state = Arc::new(HubState::for_test(Duration::ZERO));
+        let first = |mut events: tonic::Streaming<AttachEvent>| async move {
+            let ev = tokio::time::timeout(Duration::from_secs(10), events.message()).await;
+            ev.unwrap().unwrap().unwrap().event.unwrap()
+        };
+        let declined = first(submit(&state, base_request()).await).await;
+        assert_eq!(declined, attach_event::Event::ExitCode(DECLINE_EXIT_CODE));
+        let fod = BuildRequest {
+            fixed_output: true,
+            ..base_request()
+        };
+        let attach_event::Event::Log(told) = first(submit(&state, fod).await).await else {
+            panic!("a fixed-output build was not told it waits");
+        };
+        let told = String::from_utf8(told).unwrap();
+        assert!(told.contains("waiting for one"), "{told}");
+        assert_eq!(state.queue.lock().await.len(), 1);
     }
 
     /// Strings shifted between adjacent sections must not collide:
