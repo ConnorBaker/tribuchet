@@ -433,11 +433,12 @@ fn lifecycle() {
         &format!("[ $(journalctl -u tribuchet-worker | grep -c 'build assigned') -gt {assigned} ]"),
         60,
     );
-    // Settings changes also arrive via restart: bump max-jobs in the config.
+    // Settings changes also arrive via restart: set max-jobs in the config
+    // (unset, one per core: 2).
     succeed(
         Node::Worker,
         "cp --remove-destination $(readlink -f /etc/tribuchet/worker.toml) /etc/tribuchet/worker.toml \
-         && sed -i 's/max-jobs = 2/max-jobs = 3/' /etc/tribuchet/worker.toml",
+         && sed -i '1i max-jobs = 3' /etc/tribuchet/worker.toml",
     );
     succeed(Node::Worker, "systemctl restart tribuchet-worker");
     wait_until_succeeds(Node::Hub, "test -f /tmp/reload.ok", 120);

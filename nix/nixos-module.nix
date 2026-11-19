@@ -177,7 +177,7 @@ in
     agents = lib.mkOption {
       type = lib.types.either lib.types.ints.positive (lib.types.enum [ "auto" ]);
       default = "auto";
-      description = "Build agent count, or \"auto\" for one per CPU, decided at boot.";
+      description = "Build agent count, or \"auto\" for one per CPU and a spare, decided at boot.";
     };
     agentUidBase = lib.mkOption {
       type = lib.types.int;

@@ -28,15 +28,11 @@ let
       f = ./tests + "/phase-${phase}.nix";
     in
     if builtins.pathExists f then import f { inherit pkgs lib tribuchet; } else { };
-  # one agent socket per agent: per core with agents = "auto"
-  agents =
-    let
-      w = nodes.worker;
-    in
-    if w.services.tribuchet-worker.agents == "auto" then
-      w.virtualisation.cores
-    else
-      w.services.tribuchet-worker.agents;
+  # one agent socket per agent: per core and a spare with agents = "auto",
+  # whose worker takes one build per core
+  inherit (nodes.worker.virtualisation) cores;
+  auto = nodes.worker.services.tribuchet-worker.agents == "auto";
+  agents = if auto then cores + 1 else nodes.worker.services.tribuchet-worker.agents;
   # evaluated here so the container closure can be pre-seeded into both
   # VM stores; the hub re-evaluates the same expression at test time
   nspawn = import ./nspawn-container.nix { nixpkgs = pkgs.path; };
@@ -259,8 +255,12 @@ in
         ];
         services.tribuchet-hub = {
           enable = true;
-          # keep the no-worker decline quick for the fallback subtest
-          settings.worker-grace-secs = 2;
+          settings = {
+            # keep the no-worker decline quick for the fallback subtest
+            worker-grace-secs = 2;
+            # the workers' max-jobs as the hub has them, at /workers
+            metrics-listen = "127.0.0.1:9437";
+          };
           externalBuilders = {
             enable = true;
             systems = [
@@ -338,7 +338,7 @@ in
         # the memhog subtest relies on a plain memcg OOM kill
         boot.kernel.sysctl."vm.panic_on_oom" = lib.mkForce 0;
         virtualisation.diskSize = 4096;
-        # agents = "auto": one agent per core
+        # agents = "auto": one build per core, and an agent more
         virtualisation.cores = 2;
         virtualisation.additionalPaths = nspawnPaths;
 
@@ -354,7 +354,6 @@ in
             hub = "https://hub:7437";
             cert = "/etc/tribuchet/tls/worker.crt";
             ca-cert = "/etc/tribuchet/tls/ca.crt";
-            max-jobs = 2;
             max-log-size = 1048576;
             # 2 GiB, exceeded only by the memhog subtest
             build-memory-max-bytes = 2147483648;
@@ -404,7 +403,8 @@ in
         hub.succeed("systemctl start tribuchet-hub.socket")
         hub.succeed("systemctl start tribuchet-hub")
         worker.succeed("systemctl start tribuchet-worker")
-        # agents = "auto": the generator made one agent socket per core
+        # agents = "auto": the generator made one agent socket per core and
+        # a spare, and the hub has the worker's max-jobs, one per core
         worker.succeed(
             # one unit per call: with several, is-active succeeds if any is
             "systemctl is-active tribuchet-agent@1.socket && systemctl is-active tribuchet-agent@${toString agents}.socket"
@@ -413,6 +413,7 @@ in
         hub.wait_until_succeeds(
             "journalctl -u tribuchet-hub | grep -q 'worker registered'"
         )
+        ${lib.optionalString auto ''hub.wait_until_succeeds("printf 'GET /workers HTTP/1.0\\r\\n\\r\\n' | socat - TCP:127.0.0.1:9437 | grep -q '\"max_jobs\": ${toString cores},'", timeout=60)''}
         # The startup sweep activates every agent. Idle ones exit again so
         # they do not pin the binary they were started with.
         worker.wait_until_succeeds(

@@ -324,5 +324,10 @@ fn default_max_jobs() -> u32 {
         .and_then(|n| u32::try_from(n.get()).ok())
         .unwrap_or(1)
 }
+/// The agents of "auto": one per build of the default max-jobs, and a
+/// spare, which takes the slot of a build frozen holding its own agent.
+pub(crate) fn auto_agents() -> usize {
+    usize::try_from(default_max_jobs()).map_or(usize::MAX, |n| n + 1)
+}
 #[cfg(test)]
 mod tests;

@@ -11,7 +11,7 @@
   # unit names differ: tribuchet-worker / tribuchet-agent@ vs <name> / <name>-agent@
   workerUnit,
   agentUnit,
-  # integer or "auto" (one per CPU, decided by a generator on the machine)
+  # integer or "auto" (one per CPU and a spare, decided by a generator on the machine)
   agents,
   agentUidBase,
   keyFile,
