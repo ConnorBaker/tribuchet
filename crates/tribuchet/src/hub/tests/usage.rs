@@ -9,7 +9,7 @@ use rusqlite::types::Value;
 
 use super::rank::{declare, sized_worker};
 use super::*;
-use crate::proto::{BuildResult, BuildUsage};
+use crate::proto::{BuildResult, BuildUsage, DECLINE_EXIT_CODE};
 
 /// A build's usage line names the worker whose session ran it, its
 /// system, and the scratch path of the output it is known by (see
@@ -41,6 +41,33 @@ async fn the_usage_line_names_the_worker_and_the_output_path() {
     assert!(line.contains(r#"worker="w1""#), "{line}");
     assert!(line.contains(r#"system="x86_64-linux""#), "{line}");
     assert!(line.contains(&format!(r#"out_path="{OUT}""#)), "{line}");
+}
+
+/// A builder that exits with the decline code on a worker failed: its
+/// client gets another failure, not a decline its Nix would then build
+/// itself, a fixed-output one in its host's network.
+#[tokio::test]
+async fn a_builder_exiting_with_the_decline_code_is_not_a_decline() {
+    let state = Arc::new(HubState::for_test(Duration::from_secs(30)));
+    let replay = Arc::new(Replay::default());
+    let mut client = replay.subscribe().await;
+    state.queue.lock().await.push_back(job(0, replay));
+    let mut w = connect(&state, "w1", 1, &[]);
+    w.to_hub.send(request_job(1, Some(0))).await.unwrap();
+    let build_id = w.assignment().await.expect("not assigned").build_id;
+    let result = BuildResult {
+        build_id,
+        exit_code: DECLINE_EXIT_CODE,
+        ..Default::default()
+    };
+    w.send(worker_message::Msg::Result(result)).await;
+    let mut codes = Vec::new();
+    while let Some(Ok(ev)) = client.recv().await {
+        if let Some(attach_event::Event::ExitCode(c)) = ev.event {
+            codes.push(c);
+        }
+    }
+    assert_eq!(codes, [1]);
 }
 
 /// What a build's run used is learned, here an OOM-killed run's peak: the

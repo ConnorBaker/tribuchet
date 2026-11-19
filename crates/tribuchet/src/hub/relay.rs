@@ -23,7 +23,8 @@ use super::record::Rest;
 use super::state::{HubState, Job, Replay};
 use crate::errors::{Error, Result, err_msg};
 use crate::proto::{
-    BuildAssignment, BuildResult, HubMessage, ResultAck, attach_event, hub_message, worker_message,
+    BuildAssignment, BuildResult, DECLINE_EXIT_CODE, HubMessage, ResultAck, attach_event,
+    hub_message, worker_message,
 };
 
 pub(super) async fn send(
@@ -258,8 +259,17 @@ async fn publish_worker_failure(
             .await;
     }
     Metrics::inc(&state.metrics.failed);
+    // A builder exiting with the decline code failed; passed on, the
+    // client's Nix would build it itself, a fixed-output one in its host's
+    // network (DESIGN.md).
+    let code = if res.exit_code == DECLINE_EXIT_CODE {
+        tracing::warn!(id = job.id, "builder exit 222 (decline code) sent as 1");
+        1
+    } else {
+        res.exit_code
+    };
     job.replay
-        .publish(attach_event::Event::ExitCode(res.exit_code))
+        .publish(attach_event::Event::ExitCode(code))
         .await;
     ack_result(out_tx, job).await;
     Ok(())
