@@ -8,7 +8,7 @@ use std::pin::{Pin, pin};
 
 use tokio::sync::futures::Notified;
 
-use crate::proto::{BuildResult, Resumed};
+use crate::proto::BuildResult;
 use placement::{Demand, Expected, GRACE, Level, Room, Rooms, Size};
 
 const GIB: f64 = 1_073_741_824.0;
@@ -155,8 +155,7 @@ async fn a_resumed_build_counts_until_its_supervision_ends() {
     state.queue.lock().await.push_back(j);
     let mut w = connect(&state, "w", 1, &["k0"]);
     let build_id = w.assignment().await.expect("not assigned").build_id;
-    let resumed = Resumed { build_id };
-    w.send(worker_message::Msg::Resumed(resumed)).await;
+    w.send(resumed(&build_id, false)).await;
     assert_eq!(committed_cores(&state), 3.0, "resumed");
     for keys in [vec!["k0".to_owned()], vec![]] {
         let listing = Heartbeat {

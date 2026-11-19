@@ -35,7 +35,7 @@ pub(super) fn queued(system: &str, replay: Arc<Replay>) -> Job {
         replay,
         listing: Arc::default(),
         attempts: 0,
-        resumed_losses: 0,
+        transport_losses: 0,
         queued_at: Instant::now(),
         loss: None,
         deferred: None,

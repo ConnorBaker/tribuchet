@@ -1,35 +1,50 @@
 //! Worker-session losses of a dispatched build: which count against
-//! MAX_JOB_ATTEMPTS, and which against MAX_RESUMED_LOSSES.
+//! MAX_JOB_ATTEMPTS, and which in transport against MAX_TRANSPORT_LOSSES.
 
 use super::fake_daemon::told;
 use super::*;
 
-use crate::proto::{self, LogChunk, Need};
-use Said::{Nothing, Resumed, Staged};
+use crate::proto::{self, BuildResult, DECLINE_EXIT_CODE, LogChunk, Need};
+use Said::{Delivered, Finished, Nothing, Resumed, Staged, Started};
 use Take::{Back, Fresh};
-use losses::MAX_JOB_ATTEMPTS;
+use Verdict::{Declined, Failed, Gone};
+use losses::{MAX_JOB_ATTEMPTS, MAX_TRANSPORT_LOSSES};
 
-/// One queued build with its client attached.
-async fn queued_build(state: &HubState) -> mpsc::Receiver<Result<AttachEvent, Status>> {
-    let j = job(1, Arc::new(Replay::default()));
+/// One queued build with its client attached, `fod` a build with network.
+async fn queued_build(state: &HubState, fod: bool) -> mpsc::Receiver<Result<AttachEvent, Status>> {
+    let mut j = job(1, Arc::new(Replay::default()));
+    j.req.fixed_output = fod;
     let client = j.replay.subscribe().await;
     state.queue.lock().await.push_back(j);
     client
 }
 
-/// The first Need of a fresh staging, empty when no input is missing.
-fn staged(job: &Job) -> Option<worker_message::Msg> {
-    Some(worker_message::Msg::Need(Need {
+/// What the worker sends of `job`, saying `said`.
+fn said(job: &Job, said: Said) -> Vec<worker_message::Msg> {
+    let build_id = job.id.clone();
+    let started = worker_message::Msg::Started(proto::Started {
         build_id: job.id.clone(),
-        paths: vec![],
-        hashes: vec![],
-    }))
-}
-
-fn resume(job: &Job) -> Option<worker_message::Msg> {
-    Some(worker_message::Msg::Resumed(proto::Resumed {
-        build_id: job.id.clone(),
-    }))
+    });
+    match said {
+        // The first Need of a fresh staging, empty when no input is missing.
+        Staged => vec![worker_message::Msg::Need(Need {
+            build_id,
+            paths: vec![],
+            hashes: vec![],
+        })],
+        Started => vec![started],
+        Resumed => vec![resumed(&job.id, false)],
+        Finished => vec![resumed(&job.id, true)],
+        // Its result arrived, and its delivery is under way.
+        Delivered => vec![
+            started,
+            worker_message::Msg::Result(BuildResult {
+                build_id,
+                ..Default::default()
+            }),
+        ],
+        Nothing => vec![],
+    }
 }
 
 /// The worker `name` is back holding the build, and is handed it.
@@ -39,25 +54,33 @@ async fn back(state: &Arc<HubState>, name: &str) -> Option<(Job, CapsGuard)> {
     Some((job, worker))
 }
 
-/// The client's verdict, if it got one: the error it was sent, and
-/// whether its stream then ended.
-async fn verdict(
-    client: &mut mpsc::Receiver<Result<AttachEvent, Status>>,
-) -> (Option<String>, bool) {
-    let mut error = None;
+/// What a client is told of a build no longer handed out.
+#[derive(Debug, PartialEq)]
+enum Verdict {
+    /// The build failed with this error.
+    Failed(String),
+    /// Its Nix is to build it (DECLINE_EXIT_CODE).
+    Declined,
+    /// It was no longer handed out after this many of the losses.
+    Gone(usize),
+}
+
+/// The client's verdict, once its stream ended.
+async fn verdict(client: &mut mpsc::Receiver<Result<AttachEvent, Status>>) -> Option<Verdict> {
+    let mut verdict = None;
     let ended = tokio::time::timeout(Duration::from_secs(2), async {
-        while let Some(ev) = client.recv().await {
-            if let Ok(AttachEvent {
-                event: Some(attach_event::Event::Error(e)),
-            }) = ev
-            {
-                error = Some(e);
+        while let Some(Ok(AttachEvent { event })) = client.recv().await {
+            match event {
+                Some(attach_event::Event::Error(e)) => verdict = Some(Failed(e)),
+                Some(attach_event::Event::ExitCode(DECLINE_EXIT_CODE)) => verdict = Some(Declined),
+                _ => {}
             }
         }
     })
     .await
     .is_ok();
-    (error, ended)
+    assert!(ended, "the client's stream did not end at the verdict");
+    verdict
 }
 
 /// How a dispatch of the build is taken.
@@ -74,39 +97,56 @@ enum Take {
 enum Said {
     /// It asks for its inputs: it starts the build over.
     Staged,
+    /// Its run starts.
+    Started,
+    /// It holds a run of the build, unfinished.
     Resumed,
+    /// It holds a run of the build, finished.
+    Finished,
+    /// Its run starts and succeeds.
+    Delivered,
     Nothing,
 }
 
-/// The queued build, taken as `take` after dispatches taken and lost as
-/// `lost`: its genuine losses, losses on a resume and whether a loss is
-/// pending; or, once it is no longer handed out, the client's verdict,
-/// which ends its stream, the build counted failed and not queued.
-async fn after_losses(lost: &[(Take, Said)], take: Take) -> Result<(u32, u32, bool), String> {
+/// The queued build, a build with network if `fod`, taken as `take` after
+/// dispatches taken and lost as `lost`: its genuine losses, losses in
+/// transport and whether a loss is pending; or, once it
+/// is no longer handed out, the client's verdict, which ends its stream,
+/// the build counted as such and not queued.
+async fn after_losses(
+    fod: bool,
+    lost: &[(Take, Said)],
+    take: Take,
+) -> Result<(u32, u32, bool), Verdict> {
     let state = Arc::new(HubState::for_test(Duration::ZERO));
-    let mut client = queued_build(&state).await;
-    for (n, &(t, said)) in lost.iter().enumerate() {
-        let (j, w) = taken(&state, t)
-            .await
-            .ok_or_else(|| format!("not handed out after {n} losses"))?;
-        let msg = match said {
-            Said::Staged => staged(&j),
-            Said::Resumed => resume(&j),
-            Said::Nothing => None,
+    let mut client = queued_build(&state, fod).await;
+    for (n, &(t, s)) in lost.iter().enumerate() {
+        let Some((j, w)) = taken(&state, t).await else {
+            return Err(Gone(n));
         };
-        lose_session(&state, j, w, msg).await;
+        let msgs = said(&j, s);
+        lose_session(&state, j, w, msgs).await;
     }
     if let Some((j, _)) = taken(&state, take).await {
-        return Ok((j.attempts, j.resumed_losses, j.loss.is_some()));
+        let pending = j.loss.is_some();
+        return Ok((j.attempts, j.transport_losses, pending));
     }
-    let (error, ended) = verdict(&mut client).await;
-    assert!(ended, "the client's stream did not end at the verdict");
-    assert_eq!(state.metrics.failed.load(Ordering::Relaxed), 1);
+    let verdict = verdict(&mut client).await.expect("no verdict");
+    let counted = if verdict == Declined {
+        &state.metrics.declined
+    } else {
+        &state.metrics.failed
+    };
+    assert_eq!(
+        counted.load(Ordering::Relaxed),
+        1,
+        "{verdict:?} not counted"
+    );
     assert!(
         state.queue.lock().await.is_empty(),
-        "the failed build is queued"
+        "the build is queued after its verdict"
     );
-    Err(error.unwrap_or_default())
+    Err(verdict)
 }
 
 async fn taken(state: &Arc<HubState>, take: Take) -> Option<(Job, CapsGuard)> {
@@ -120,74 +160,126 @@ async fn taken(state: &Arc<HubState>, take: Take) -> Option<(Job, CapsGuard)> {
     }
 }
 
+/// The build's run succeeds, and its delivery dies with the session
+/// MAX_TRANSPORT_LOSSES + 1 times, each time but the first resumed.
+fn delivery_flaps() -> Vec<(Take, Said)> {
+    let mut flaps = vec![(Fresh("w1"), Delivered)];
+    flaps.extend([(Back("w1"), Finished); 12]);
+    flaps
+}
+
 /// The loss policy, each row a sequence of losses:
 /// a build survives MAX_JOB_ATTEMPTS genuine losses and the next fails
-/// it, and MAX_RESUMED_LOSSES losses on a resume,
-/// with the same verdict. The caps are pinned by number, so that
-/// changing one is a decision.
+/// it, and MAX_TRANSPORT_LOSSES losses in transport, the next declining it.
+/// The caps are pinned by number, so that changing one is a decision.
 #[tokio::test]
 async fn each_sequence_of_losses_counts_as_decided() {
     let genuine = |n| {
-        Err(format!(
+        Err(Failed(format!(
             "build lost {n} times without a worker resuming it; giving up"
-        ))
-    };
-    let on_resume = |n| {
-        Err(format!(
-            "build lost {n} times while its worker resumed it; giving up"
-        ))
+        )))
     };
     let rows = [
-        // Each worker dies with the build staged and another takes it,
-        // the common genuine loss: the fourth fails it.
+        // Each worker dies with the build staged and another takes it:
+        // no run of it was lost, but its transfer, and the 13th such loss
+        // declines it, its client to build it.
+        (vec![(Fresh("w"), Staged); 13], Fresh("w"), Err(Declined)),
         (
-            [Fresh("w0"), Fresh("w1"), Fresh("w2"), Fresh("w3")]
-                .map(|t| (t, Staged))
-                .to_vec(),
-            Fresh("w4"),
-            genuine(4),
+            vec![(Fresh("w"), Staged); 12],
+            Fresh("w"),
+            Ok((0, 12, false)),
         ),
-        // Another worker holding the build takes it by key: the loss
-        // stands, as when it takes it fresh.
-        (vec![(Fresh("w1"), Nothing)], Back("w2"), Ok((1, 0, false))),
-        // After a hub restart, the worker holding the build resumes it,
-        // starts it over three times, and resumes it: the 13th loss on a
-        // resume fails it.
+        // So does the 13th session dying before its worker answered.
+        (vec![(Fresh("w"), Nothing); 13], Fresh("w"), Err(Declined)),
+        // A run that started, its worker back without it, is a genuine
+        // loss: one that kills its worker every time fails at the fourth.
+        (vec![(Fresh("w"), Started)], Fresh("w"), Ok((1, 0, false))),
+        // Its worker not back within the grace may run it still: a loss
+        // in transport.
+        (vec![(Fresh("w1"), Started)], Fresh("w2"), Ok((0, 1, false))),
+        (vec![(Fresh("w"), Started); 4], Fresh("w"), genuine(4)),
+        // A finished run whose delivery dies with the session every time
+        // is lost in transport, never failed: the 13th declines it.
+        (delivery_flaps(), Back("w1"), Err(Declined)),
+        // Another worker holding the build takes it by key: the run the
+        // first started may go on, a loss in transport.
+        (vec![(Fresh("w1"), Started)], Back("w2"), Ok((0, 1, false))),
+        // A worker staging afresh the run it resumed no longer had it: a
+        // genuine loss, and the session's a loss in transport.
         (
-            [
-                vec![(Back("w1"), Resumed)],
-                vec![(Back("w1"), Staged); 3],
-                vec![(Back("w1"), Resumed); 12],
-            ]
-            .concat(),
+            vec![(Back("w1"), Resumed), (Back("w1"), Staged)],
             Back("w1"),
-            on_resume(13),
+            Ok((1, 2, true)),
         ),
+        // A finished run whose delivery died, its worker back staging the
+        // build afresh: it dropped the result, which no run lost, so only
+        // the two sessions count, in transport.
+        (
+            vec![(Fresh("w1"), Delivered), (Back("w1"), Staged)],
+            Back("w1"),
+            Ok((0, 2, true)),
+        ),
+        // A worker holding the build resumes it, its session dying every
+        // time: it may run it still, so each is a loss in transport, never
+        // failed, and the 13th declines it.
+        (
+            vec![(Back("w1"), Resumed); 12],
+            Back("w1"),
+            Ok((0, 12, true)),
+        ),
+        (vec![(Back("w1"), Resumed); 13], Back("w1"), Err(Declined)),
         // Handed back the build it lost, a worker whose session dies
         // before it says whether it resumed or staged it settles
-        // nothing: each is a loss on a resume, or the build would be
-        // handed back forever.
+        // nothing: each is a loss in transport, or the build would be
+        // handed back forever, and the 13th declines it.
         (
-            [vec![(Fresh("w1"), Staged)], vec![(Back("w1"), Nothing); 13]].concat(),
+            [vec![(Fresh("w1"), Staged)], vec![(Back("w1"), Nothing); 12]].concat(),
             Back("w1"),
-            on_resume(13),
+            Err(Declined),
         ),
-        // Losses on a resume count per build, across the workers it moves
-        // between: seven on w1, a start-over on w2, six on w2.
+        // Losses in transport count per build, across the workers it
+        // moves between: seven on w1, its run taken over by w2 (w1 not
+        // back), a start-over on w2, and the 13th on w2 declines it.
         (
             [
                 vec![(Back("w1"), Resumed); 7],
                 vec![(Fresh("w2"), Staged)],
-                vec![(Back("w2"), Resumed); 6],
+                vec![(Back("w2"), Resumed); 4],
             ]
             .concat(),
             Back("w2"),
-            on_resume(13),
+            Err(Declined),
         ),
     ];
+    let mut wrong = Vec::new();
     for (n, (lost, take, verdict)) in rows.into_iter().enumerate() {
-        assert_eq!(after_losses(&lost, take).await, verdict, "row {n}");
+        let after = after_losses(false, &lost, take).await;
+        if after != verdict {
+            wrong.push(format!("row {n}: {after:?}, not {verdict:?}"));
+        }
     }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+/// A build with network the farm keeps losing in transport is never
+/// declined, which would build it in the client host's own network: it
+/// keeps waiting for a worker.
+#[tokio::test]
+async fn a_build_with_network_lost_in_transport_keeps_waiting() {
+    let rows = [
+        (vec![(Fresh("w"), Staged); 13], Fresh("w"), false),
+        (vec![(Fresh("w"), Nothing); 13], Fresh("w"), false),
+        (delivery_flaps(), Back("w1"), true),
+        (vec![(Back("w1"), Resumed); 13], Back("w1"), true),
+    ];
+    let mut wrong = Vec::new();
+    for (n, (lost, take, pending)) in rows.into_iter().enumerate() {
+        let after = after_losses(true, &lost, take).await;
+        if after != Ok((0, 13, pending)) {
+            wrong.push(format!("row {n}: {after:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }
 
 /// A worker whose session drops comes back holding the build and is
@@ -195,14 +287,14 @@ async fn each_sequence_of_losses_counts_as_decided() {
 /// as a worker whose session flaps does, none is genuine (counting them
 /// fails the build at the fourth): twice the genuine cap, so counting
 /// all but one fails too, every other session dying between the build's
-/// log line and its `Resumed`, the worker's order. Starting it over (it
-/// was gone by then), each is: the build is not handed out after the fifth.
+/// log line and its `Resumed`, the worker's order. Staging it afresh,
+/// each is a loss in transport: declined, not failed, after the 13th.
 #[tokio::test]
 async fn what_a_returning_worker_says_settles_the_loss_before() {
     let max = MAX_JOB_ATTEMPTS;
-    for (resumes, losses) in [(true, 2 * (max + 1)), (false, max + 1)] {
+    for (resumes, losses) in [(true, 2 * (max + 1)), (false, MAX_TRANSPORT_LOSSES)] {
         let state = Arc::new(HubState::for_test(Duration::from_secs(30)));
-        let mut client = queued_build(&state).await;
+        let mut client = queued_build(&state, false).await;
         let mut w = connect(&state, "w1", 1, &[]);
         w.to_hub.send(request_job(1, Some(0))).await.unwrap();
         assert!(w.assignment().await.is_some(), "first dispatch");
@@ -231,8 +323,7 @@ async fn what_a_returning_worker_says_settles_the_loss_before() {
             };
             w.send(worker_message::Msg::Log(log)).await;
             if loss % 2 == 0 {
-                w.send(worker_message::Msg::Resumed(proto::Resumed { build_id }))
-                    .await;
+                w.send(resumed(&build_id, false)).await;
             }
             assert_eq!(told(&mut client).await.1, None, "after loss {loss}");
         }
@@ -240,9 +331,10 @@ async fn what_a_returning_worker_says_settles_the_loss_before() {
         let mut w = connect(&state, "w1", 1, &["k1"]);
         let handed_out = w.assignment().await.is_some();
         let failed = told(&mut client).await.1.is_some();
+        let declined = state.metrics.declined.load(Ordering::Relaxed) == 1;
         assert_eq!(
-            (handed_out, failed),
-            (resumes, !resumes),
+            (handed_out, failed, declined),
+            (resumes, false, !resumes),
             "resumes: {resumes}"
         );
     }
@@ -254,7 +346,7 @@ async fn what_a_returning_worker_says_settles_the_loss_before() {
 #[tokio::test]
 async fn an_assignment_the_worker_never_got_counts_no_loss() {
     let state = Arc::new(HubState::for_test(Duration::ZERO));
-    let mut client = queued_build(&state).await;
+    let mut client = queued_build(&state, false).await;
     let w = register(&state, "w1", &[]);
     let job = state
         .take_job(&caps("w1"), None)
@@ -282,7 +374,7 @@ async fn an_assignment_the_worker_never_got_counts_no_loss() {
     let _w2 = register(&state, "w2", &[]);
     let taken = state.take_job(&caps("w2"), None).await;
     assert_eq!(
-        taken.map(|j| (j.attempts, j.resumed_losses, j.loss.is_some())),
+        taken.map(|j| (j.attempts, j.transport_losses, j.loss.is_some())),
         Some((0, 0, false))
     );
     assert_eq!(told(&mut client).await.1, None);

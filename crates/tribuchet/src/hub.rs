@@ -50,7 +50,7 @@ use crate::errors::{Error, Result, chain};
 use losses::Dispatch;
 use metrics::Metrics;
 use relay::{WorkerSession, run_job, send};
-use state::{Holding, HubState, Job, WorkerCaps};
+use state::{HubState, Job, WorkerCaps};
 
 /// No worker message for this long tears the session down and fails
 /// its builds: heartbeats flow every 30s, so silence means a dead
@@ -181,6 +181,7 @@ fn msg_build_id(msg: &worker_message::Msg) -> Option<&str> {
         worker_message::Msg::Chunk(c) => Some(&c.build_id),
         worker_message::Msg::Resumed(r) => Some(&r.build_id),
         worker_message::Msg::Need(n) => Some(&n.build_id),
+        worker_message::Msg::Started(s) => Some(&s.build_id),
         worker_message::Msg::Register(_)
         | worker_message::Msg::Heartbeat(_)
         | worker_message::Msg::RequestJob(_) => None,
@@ -435,29 +436,6 @@ async fn worker_loop(
     tracing::info!(worker = register.worker_name, "worker disconnected");
 }
 
-/// The loss of a build with the session of the worker that ran it. The
-/// worker likely still runs it and re-registers shortly: until `until`,
-/// the build is kept for it. A worker that said it no longer has the
-/// build gets no grace; its loss is still the next dispatch's to settle.
-struct Loss {
-    /// Name the worker registers with, the identity a reconnect keeps.
-    worker: String,
-    /// Id of the session that died.
-    session: u64,
-    until: Instant,
-}
-
-impl Loss {
-    /// Within the grace and the worker is not back. Back means
-    /// registered with its held keys: from then on those route the job.
-    fn awaited(&self, workers: &HashMap<u64, WorkerCaps>, holding: &HashMap<u64, Holding>) -> bool {
-        Instant::now() < self.until
-            && !workers.iter().any(|(id, c)| {
-                *id != self.session && c.name == self.worker && holding.contains_key(id)
-            })
-    }
-}
-
 /// Run one dispatched job and settle it: finish, requeue or fail.
 /// `worker` is the session's id and worker name.
 async fn supervise_job(
@@ -500,8 +478,8 @@ async fn supervise_job(
     };
     // A worker that no longer lists a build it resumed lost it as much
     // as one whose session died, though the session lives on.
-    let unlisted = matches!(err, Error::Unlisted);
-    let session_dead = unlisted || router.is_closed() || out_tx.is_closed();
+    let gone = matches!(err, Error::Unlisted);
+    let session_dead = gone || router.is_closed() || out_tx.is_closed();
     if matches!(err, Error::Superseded) {
         // Its worker delivers to the dispatch that took its key over.
         tracing::info!(
@@ -548,28 +526,12 @@ async fn supervise_job(
     // A dead session is no build verdict: requeue so this worker (by
     // dedupe key) or another one picks it up.
     if session_dead {
-        let Some(j) = losses::lost(&state, job, &dispatch).await else {
+        let Some(j) = losses::lost(&state, job, &dispatch, gone, worker).await else {
             return;
         };
         job = j;
         tracing::warn!(id = job.id, "dispatch lost, requeueing build: {err}");
         Metrics::inc(&state.metrics.requeued);
-        // A worker restart drops the session but not the build: keep
-        // it for that worker until it re-registers, or the grace ends,
-        // instead of running it a second time elsewhere. One that said
-        // it no longer has it is waited for no longer; its next
-        // dispatch starts it over.
-        let (session, worker) = worker;
-        let grace = if unlisted {
-            Duration::ZERO
-        } else {
-            state.worker_grace
-        };
-        job.loss = Some(Loss {
-            worker,
-            session,
-            until: Instant::now() + grace,
-        });
         state.requeue(job).await;
     } else {
         tracing::warn!(id = job.id, "build failed: {err}");

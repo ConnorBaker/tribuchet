@@ -523,7 +523,7 @@ mod tests {
             replay: Arc::new(Replay::default()),
             listing: Arc::default(),
             attempts: 0,
-            resumed_losses: 0,
+            transport_losses: 0,
             queued_at: Instant::now(),
             loss: None,
             deferred: None,

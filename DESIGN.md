@@ -242,8 +242,9 @@ stop behaves the same way: builds keep running, and their results
 wait on disk until a worker starts again (or expire undelivered).
 A queued build that no connected worker can serve stays queued until
 one registers, and its clients are told so. A loss the worker resumes costs a build nothing; the fourth
-genuine loss (followed by a start-over) fails it, and so does the
-thirteenth loss on a resume (`hub/losses.rs`).
+genuine loss (a run that started, its worker back without it) fails
+it, and the thirteenth loss in transport (every other loss) hands it
+back to its clients' Nix (`hub/losses.rs`).
 The hub knows a reconnecting worker by name: the hostname it reports
 (not anything in its certificate), or with `auth = "tailscale"` its
 tailscale node's short name. No two workers may share a name, nor two

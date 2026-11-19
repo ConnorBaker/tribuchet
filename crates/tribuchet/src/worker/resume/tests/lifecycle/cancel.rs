@@ -278,6 +278,7 @@ impl Session {
     fn resume(&self, ctx: &Arc<WorkerCtx>) {
         let resumed = Resumed {
             build_id: self.id.into(),
+            finished: true,
         };
         self.tx
             .try_send(msg(worker_message::Msg::Resumed(resumed)))
