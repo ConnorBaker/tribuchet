@@ -40,6 +40,9 @@ let
   # evaluated here so the container closure can be pre-seeded into both
   # VM stores; the hub re-evaluates the same expression at test time
   nspawn = import ./nspawn-container.nix { nixpkgs = pkgs.path; };
+  syscallProbe = pkgs.runCommandCC "tt-syscall-probe" { } ''
+    $CC -Wall -Werror -o $out ${./tests/syscalls.c}
+  '';
   # the container closure and the stdenvNoCC that builds it stay out
   # of the other phases' VM stores
   nspawnPaths = lib.optionals (phase == "nspawn") [
@@ -75,6 +78,15 @@ in
   defaults.services.openssh.settings.LogLevel = "ERROR";
   defaults.services.journald.settings.Journal.MaxLevelConsole = lib.mkForce "notice";
   defaults.boot.kernelParams = [ "loglevel=4" ];
+  # on both nodes: the worker's own nix-daemon builds the stock reference
+  defaults.environment.etc."tt/syscalls.nix".text = ''
+    { variant }:
+    import ${./tests/syscalls.nix} {
+      bash = "${pkgs.bash}";
+      probe = "${syscallProbe}";
+      inherit variant;
+    }
+  '';
   defaults.systemd.services =
     lib.genAttrs [ "tribuchet-hub" "tribuchet-worker" "nix-daemon" "tribuchet-agent@" ]
       (_: {
@@ -314,6 +326,9 @@ in
         # other nodes get for it, at normal priority.
         networking.interfaces.eth1.ipv6.addresses = lib.mkForce [ ];
         networking.primaryIPv6Address = lib.mkForce "";
+        # The stock reference of build_syscalls: Nix since 2.35, as the
+        # farm runs, also answers the *listxattr calls ENOTSUP.
+        nix.package = pkgs.nixVersions.latest;
         # Private store image instead of the shared host store, so input
         # paths the worker lacks really travel over the wire.
         virtualisation.useNixStoreImage = true;

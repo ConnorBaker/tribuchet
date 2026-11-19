@@ -29,6 +29,7 @@ mod held;
 mod history;
 mod pairs;
 mod spread;
+mod syscalls;
 
 use std::time::Instant;
 
