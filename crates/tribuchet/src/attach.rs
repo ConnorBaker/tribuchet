@@ -59,35 +59,11 @@ async fn run_async(build: BuildJson, socket: PathBuf) -> Result<i32> {
         tracing::info!("diverted store; declining so Nix builds locally");
         return Ok(DECLINE_EXIT_CODE);
     }
-    let attrs = build.attrs();
-    let fixed_output = build.network_allowed(attrs.as_ref());
-    let required_features = required_system_features(&build.env, attrs.as_ref());
-    let local_networking = flag(&build.env, attrs.as_ref(), "__darwinAllowLocalNetworking");
-    let can_local = build.can_local(fixed_output);
-    tracing::info!(fixed_output, can_local, system = %build.system, "submitting build");
-    let req = BuildRequest {
-        system: build.system,
-        builder: build.builder,
-        args: build.args,
-        env: build.env.into_iter().collect(),
-        outputs: build.outputs.into_iter().collect(),
-        input_paths: build.input_paths,
-        tmp_dir_in_sandbox: build.tmp_dir_in_sandbox.to_string_lossy().into_owned(),
-        store_dir: build.store_dir,
-        fixed_output,
-        required_features,
-        local_networking,
-        timeout_secs: build.timeout,
-        max_silent_secs: build.max_silent_time,
-        can_local,
-    };
-    // Packed once and resent verbatim on every reconnect attempt.
     // Nix places everything the builder consumes in topTmpDir/build.
-    let tmp_dir_pack = tokio::task::spawn_blocking({
-        let dir = build.top_tmp_dir.join("build");
-        move || tmpdir::pack_zstd_dir(&dir)
-    })
-    .await??;
+    let dir = build.top_tmp_dir.join("build");
+    let (req, told) = request(build);
+    // Packed once and resent verbatim on every reconnect attempt.
+    let tmp_dir_pack = tokio::task::spawn_blocking(move || tmpdir::pack_zstd_dir(&dir)).await??;
     let expected_outputs: Vec<String> = req.outputs.values().cloned().collect();
 
     // When the hub restarts mid-build we reconnect and resubmit the
@@ -106,7 +82,12 @@ async fn run_async(build: BuildJson, socket: PathBuf) -> Result<i32> {
         )
         .await?
         {
-            Outcome::Done(code) => return Ok(code),
+            Outcome::Done(code) => {
+                if let Some(hint) = untold_hint(told) {
+                    eprintln!("tribuchet: {hint}");
+                }
+                return Ok(code);
+            }
             Outcome::Retry(e) => {
                 attempts += 1;
                 if attempts > RECONNECT_ATTEMPTS {
@@ -120,6 +101,50 @@ async fn run_async(build: BuildJson, socket: PathBuf) -> Result<i32> {
             }
         }
     }
+}
+
+/// What attach sends the hub for `build`, and whether it is told
+/// fixed-output (BuildJson::fixed_output).
+fn request(build: BuildJson) -> (BuildRequest, Option<bool>) {
+    let attrs = build.attrs();
+    let told = build.fixed_output(attrs.as_ref());
+    let fixed_output = told == Some(true);
+    let required_features = required_system_features(&build.env, attrs.as_ref());
+    let local_networking = flag(&build.env, attrs.as_ref(), "__darwinAllowLocalNetworking");
+    // Never hand back one declaring a hash, told or not: the client's Nix
+    // would build it in its host's network (DESIGN.md), whatever Nix wrote.
+    let can_local = told.map_or(build.can_build_locally, |_| Some(false));
+    tracing::info!(fixed_output, can_local, system = %build.system, "submitting build");
+    let req = BuildRequest {
+        system: build.system,
+        builder: build.builder,
+        args: build.args,
+        env: build.env.into_iter().collect(),
+        outputs: build.outputs.into_iter().collect(),
+        input_paths: build.input_paths,
+        tmp_dir_in_sandbox: build.tmp_dir_in_sandbox.to_string_lossy().into_owned(),
+        store_dir: build.store_dir,
+        fixed_output,
+        required_features,
+        local_networking,
+        timeout_secs: build.timeout,
+        max_silent_secs: build.max_silent_time,
+        can_local,
+    };
+    (req, told)
+}
+
+/// The line for the log of a build that ended, as fixed_output `told` it:
+/// one declaring a hash it is not at gets no network (DESIGN.md, Known
+/// limitations), whether its builder ran or a worker failed first. Nix
+/// checks its output's hash only after attach exits, so whatever its exit
+/// code. None is declined: `request` sends it can_local false, and the hub
+/// passes a worker's decline code on as 1.
+fn untold_hint(told: Option<bool>) -> Option<&'static str> {
+    let hint = "tribuchet gives it no network: it found its output not at a path it derives \
+                from the outputHash it declares (as under --check, --rebuild or --repair); it \
+                derives none for git hashing or a hash it cannot read (DESIGN.md)";
+    (told == Some(false)).then_some(hint)
 }
 
 enum Outcome {
@@ -359,6 +384,7 @@ mod tests {
     use tonic::{Request, Response, Status, Streaming};
 
     use super::*;
+    use crate::build_json::tests::{HASH, INPUT_ADDRESSED, SRI, doc};
     use crate::proto::AttachEvent;
     use crate::proto::attach_hub_server::{AttachHub, AttachHubServer};
 
@@ -496,5 +522,43 @@ mod tests {
         assert_eq!(code, DECLINE_EXIT_CODE);
         let left = [earlier, whole, part].map(|p| fs::symlink_metadata(&p).map(|_| p).ok());
         assert_eq!(left, [None, None, None], "trees left");
+    }
+
+    /// Attach sends fixed_output as build_json tells it, true for an output
+    /// at the path of the hash it declares; and can_local false for any
+    /// declaring a hash, which the client's Nix would build in its host's
+    /// network, whatever Nix wrote; for any other, what Nix wrote.
+    #[test]
+    fn attach_sends_fixed_output_only_for_an_output_at_its_hash() {
+        let hash = serde_json::json!({"outputHash": HASH});
+        let cases = [
+            (&hash, SRI, Some(true)),
+            (&hash, INPUT_ADDRESSED, Some(true)),
+            (&hash, INPUT_ADDRESSED, None),
+            (&serde_json::json!({}), INPUT_ADDRESSED, Some(true)),
+            (&serde_json::json!({}), INPUT_ADDRESSED, None),
+        ];
+        let sent = cases.map(|(env, out, can)| {
+            let mut build = doc(env);
+            build.outputs = [("out".to_owned(), out.to_owned())].into();
+            build.can_build_locally = can;
+            let (req, _) = request(build);
+            (req.fixed_output, req.can_local)
+        });
+        let want = [
+            (true, Some(false)),
+            (false, Some(false)),
+            (false, Some(false)),
+            (false, Some(true)),
+            (false, None),
+        ];
+        assert_eq!(sent, want);
+    }
+
+    /// Only a build declaring a hash it is not at gets the line.
+    #[test]
+    fn the_untold_hint_is_for_a_hash_at_another_path_only() {
+        let got = [None, Some(true), Some(false)].map(|told| untold_hint(told).is_some());
+        assert_eq!(got, [false, false, true]);
     }
 }

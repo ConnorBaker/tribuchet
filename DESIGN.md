@@ -141,6 +141,13 @@ Reference implementations: `nix/src/libstore/unix/build/` and
   agent, but not with the worker or other builds. Since the agent, not
   the worker, owns the builder process, running builds survive worker
   restarts and are re-adopted.
+* A gap, fixable: a fixed-output derivation that passes `outputHash`
+  as a file (`passAsFile`) is not told fixed-output by the rule below.
+  Its builder gets `outputHashPath`, a file in the build's tmp dir,
+  which attach does not read yet, so it sees no declared hash: the
+  build gets no network and no log line, and may be declined like any
+  other. attach could read the hash from that file under
+  `top_tmp_dir/build`.
 * A build has network iff it is fixed-output, told from the path Nix
   chose for its one output, `out`, never from the environment it sets
   for itself (`build_json.rs`): fixed-output where that path is the
@@ -497,7 +504,13 @@ reported at start, and nothing is frozen there.
 * A build's network is told from its output path, which build.json
   does not say the type of: a fixed-output build Nix runs at another
   path (`--check`, `--rebuild` or `--repair` of a valid output) or
-  under git hashing is not told fixed-output, and gets none.
+  under git hashing is not told fixed-output, and gets none; attach
+  says so in its log, where Nix reports the fetch or hash mismatch.
+* Attach declines every build in a diverted store (`realStoreDir`
+  other than `storeDir`) before looking at it, fixed-output ones
+  included, though a fixed-output build is otherwise never declined:
+  a client Nix that can build locally then builds it in its host's
+  network.
 * Input chunks are verified against the hub's manifest and the daemon
   checks the NAR hash the hub declared, but both come from the hub: the
   worker trusts the mTLS-authenticated hub for input content.

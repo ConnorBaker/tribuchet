@@ -157,7 +157,7 @@ pub struct PrepareOpts<'a> {
 pub fn network(a: &BuildAssignment, build_dir: &Path) -> bool {
     let env = |name: &str| a.env.get(name).map(String::as_str);
     let attrs = build_json::read_attrs(build_dir, a.env.contains_key("NIX_ATTRS_JSON_FILE"));
-    build_json::fixed_output(&a.store_dir, &a.outputs, env, attrs.as_ref())
+    build_json::fixed_output(&a.store_dir, &a.outputs, env, attrs.as_ref()) == Some(true)
 }
 
 #[derive(Debug, thiserror::Error)]
