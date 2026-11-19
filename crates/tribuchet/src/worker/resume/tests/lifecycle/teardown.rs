@@ -65,9 +65,13 @@ fn reaped_results_leave_nothing_to_adopt_once_their_keys_are_gone() -> Result<()
     thread::sleep(Duration::from_millis(1));
     let reaper_ctx = ctx.clone();
     let reaper = thread::spawn(move || delivery::reap(&reaper_ctx, Duration::ZERO));
-    let end = Instant::now() + Duration::from_mins(1);
-    while !ctx.resumable.lock().unwrap().is_empty() {
-        assert!(Instant::now() < end, "never reaped");
+    // Done is read first: the reaper ended before the registry was read.
+    loop {
+        let done = reaper.is_finished();
+        if ctx.resumable.lock().unwrap().is_empty() {
+            break;
+        }
+        assert!(!done, "never reaped");
         thread::sleep(Duration::from_millis(1));
     }
     let kept: Vec<&PathBuf> = builds
