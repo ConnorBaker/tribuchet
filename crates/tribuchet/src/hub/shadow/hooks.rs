@@ -7,7 +7,7 @@ use super::{CLIENTS, Client, Mirror, Shadow, Sys, id, key, serves, today};
 use crate::hub::losses::Loss;
 use crate::hub::semantics::{self as sem, Answer, Event, Outcome, Phase};
 use crate::hub::state::{HubState, Job};
-use crate::proto::{Register, RunId, attach_event};
+use crate::proto::{Register, RunId};
 
 impl Shadow {
     /// A client asks for `key`; it leaves as the returned Client drops.
@@ -210,17 +210,14 @@ impl Shadow {
         });
     }
 
-    /// The hub fails `job`'s clients still waiting at `point`, its own
-    /// error, cancelling `run` if it names it.
-    pub(in crate::hub) fn failed(&self, job: &Job, point: &str, run: Option<&RunId>) {
-        let today = today(job, Answer::Give(Outcome::Failed(1)));
+    /// The hub cannot carry `job` (its verdict at `point`): it refuses the
+    /// clients still waiting, those whose Nix builds the key deferred first,
+    /// and cancels its run (L12).
+    pub(in crate::hub) fn cannot(&self, job: &Job, point: &str) {
+        let today = today(job, Answer::Refuse);
         self.with(|m| {
-            let run = run.and_then(|r| m.runs.get(&(r.epoch, r.seq)).copied());
-            m.feed(
-                point,
-                &today,
-                run.map(|run| Event::Abort { run }).into_iter().collect(),
-            );
+            let Some(key) = key(&job.key) else { return };
+            m.feed(point, &today, vec![Event::Cannot { key }]);
         });
     }
 
@@ -258,22 +255,6 @@ impl Shadow {
             let worker = m.name(worker);
             m.feed("grace over", &[], vec![Event::Suspect { worker }]);
         });
-    }
-}
-
-impl Job {
-    /// Fail the build's clients still waiting with `err`, as the hub does
-    /// at `point` (attach fails on an Error), cancelling `run` if it
-    /// names it.
-    pub(in crate::hub) async fn fail(
-        &self,
-        state: &HubState,
-        point: &str,
-        run: Option<&RunId>,
-        err: String,
-    ) {
-        state.shadow.failed(self, point, run);
-        self.replay.publish(attach_event::Event::Error(err)).await;
     }
 }
 

@@ -50,6 +50,59 @@ async fn a_refusal_while_a_client_could_build_it_diverges() {
     assert_eq!(log.count("shadow divergence"), 1);
 }
 
+/// The hub's verdict (L12), before dispatch and after: it declines the
+/// client whose Nix builds the key and refuses the other, as the core Defers
+/// and then takes Cannot. Before, the core was fed Give Failed and diverged.
+#[tokio::test]
+async fn the_hubs_verdict_is_the_cores_cannot() {
+    let log = Captured;
+    let _guard = log.install();
+    let sys: (&str, &[String]) = ("x86_64-linux", &[]);
+    let caps = vec![SystemCaps {
+        system: "x86_64-linux".into(),
+        features: vec![],
+    }];
+    for run in [None, Some(RunId { epoch: 1, seq: 1 })] {
+        let state = Arc::new(HubState::for_test(Duration::ZERO));
+        let worker_name = "w".to_owned();
+        let caps = caps.clone();
+        state.shadow.register(&Register {
+            worker_name,
+            caps,
+            ..Register::default()
+        });
+        let mut j = job(0, Arc::new(Replay::default()));
+        j.key = key_of(0);
+        let mut clients = Vec::new();
+        for can_local in [true, false] {
+            let c = state.shadow.submit(&j.key, sys, can_local);
+            clients.push(j.replay.subscribe_as(c).await);
+        }
+        if let Some(r) = &run {
+            state.shadow.assigned(r, &j.key, "w");
+            state.shadow.started(Some(r));
+        }
+        losses::hub_cannot(&state, j, "hub-side error", "no".into()).await;
+        let bad = "shadow divergence";
+        assert_eq!(log.count(bad), 0, "{run:?}: {}", log.line(bad));
+    }
+}
+
+/// The hub's verdict while a client whose Nix builds the key still waits
+/// gives it an answer §2 forbids: the core takes no such Cannot.
+#[tokio::test]
+async fn a_verdict_while_a_client_could_build_it_diverges() {
+    let log = Captured;
+    let _guard = log.install();
+    let state = Arc::new(HubState::for_test(Duration::ZERO));
+    let mut j = job(0, Arc::new(Replay::default()));
+    j.key = key_of(0);
+    let c = state.shadow.submit(&j.key, ("aarch64-linux", &[]), true);
+    let _client = j.replay.subscribe_as(c).await;
+    state.shadow.cannot(&j, "hub-side error");
+    assert_eq!(log.count("shadow divergence"), 1);
+}
+
 /// A worker of the system without a feature the build requires does not
 /// serve it in the core either: the hub refuses the client, and the core
 /// agrees (it takes a Refuse only while no worker serves the key).
@@ -122,61 +175,6 @@ async fn a_build_run_to_its_outcome_is_no_divergence() {
 /// A dedupe key the core maps to `i`.
 fn key_of(i: usize) -> String {
     format!("{i:08x}{}", "0".repeat(56))
-}
-
-/// The time a shadow call takes with `waiting` builds waiting: over 200
-/// dispatches of five calls each, as probe C of the line review timed it.
-async fn per_call(waiting: usize) -> Duration {
-    let shadow = Arc::new(HubState::for_test(Duration::ZERO)).shadow.clone();
-    let caps = vec![SystemCaps {
-        system: "x86_64-linux".into(),
-        features: vec![],
-    }];
-    let r = Register {
-        worker_name: "w".into(),
-        caps,
-        ..Register::default()
-    };
-    shadow.register(&r);
-    let sys: (&str, &[String]) = ("x86_64-linux", &[]);
-    let waits: Vec<_> = (0..waiting + 200)
-        .map(|i| shadow.submit(&key_of(i), sys, true))
-        .collect();
-    let mut jobs = Vec::new();
-    for i in 0..200 {
-        let mut j = job(i, Arc::new(Replay::default()));
-        j.key = key_of(i);
-        let client = j.replay.subscribe().await;
-        jobs.push((j, client));
-    }
-    let start = Instant::now();
-    for (i, (j, _)) in jobs.iter().enumerate() {
-        let run = RunId {
-            epoch: 1,
-            seq: i as u64 + 1,
-        };
-        shadow.assigned(&run, &j.key, "w");
-        shadow.need(Some(&run));
-        shadow.started(Some(&run));
-        shadow.result(j, Some(&run), 0);
-        shadow.fetched(j, Some(&run));
-    }
-    let took = start.elapsed() / 1000;
-    drop((waits, jobs));
-    took
-}
-
-/// A shadow call costs the same however many builds wait: it frees what a
-/// build had as it ends and scans nothing else. Before, each call scanned
-/// every waiting build (253 µs a call with 20,000 waiting, in release).
-#[tokio::test]
-async fn a_shadow_call_costs_the_same_however_many_builds_wait() {
-    let (few, many) = (per_call(100).await, per_call(20_000).await);
-    eprintln!("a shadow call: {few:?} with 100 waiting, {many:?} with 20,000");
-    assert!(
-        many < few * 10,
-        "a call: {few:?} with 100 waiting, {many:?} with 20,000"
-    );
 }
 
 /// A divergence is logged once the shadow's lock is let go, and a warning

@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use super::metrics::Metrics;
 use super::state::{Holding, HubState, Job, WorkerCaps};
-use crate::proto::RunId;
+use crate::proto::{RunId, attach_event};
 
 /// Genuine losses a build survives; the next declines it.
 pub(super) const MAX_JOB_ATTEMPTS: u32 = 3;
@@ -224,12 +224,7 @@ async fn defer(state: &HubState, job: Job, (losses, lost): (u32, &str)) -> Optio
 /// about the hub (relay/daemon.rs), not an outcome of the build's
 /// (SEMANTICS-7 L12). Each client whose own Nix builds it is declined,
 /// which needs nothing of the hub's; the others fail with `err`.
-pub(super) async fn hub_cannot(
-    state: &HubState,
-    job: Job,
-    (point, run): (&str, Option<&RunId>),
-    err: String,
-) {
+pub(super) async fn hub_cannot(state: &HubState, job: Job, point: &str, err: String) {
     if !job.req.fixed_output && job.replay.can_local().contains(&true) {
         job.restart_outputs().await;
         let (declined, _) = job.replay.decline_local().await;
@@ -245,12 +240,11 @@ pub(super) async fn hub_cannot(
             Metrics::inc(&state.metrics.declined);
         }
     }
-    if job.replay.can_local().is_empty() {
-        state.shadow.abort(point, run);
-    } else {
+    state.shadow.cannot(&job, point);
+    if !job.replay.can_local().is_empty() {
         tracing::warn!(id = job.id, point, "build failed: {err}");
         Metrics::inc(&state.metrics.failed);
-        job.fail(state, point, run, err).await;
+        job.replay.publish(attach_event::Event::Error(err)).await;
     }
     state.finish(&job).await;
 }

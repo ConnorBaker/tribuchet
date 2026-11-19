@@ -18,7 +18,9 @@ use super::state::{Job, unserved};
 use crate::proto::{HeldRun, RunId, SystemCaps};
 
 mod hooks;
+mod keyed;
 mod warn;
+use keyed::Keyed;
 use warn::{Warning, brief};
 
 /// A request's system and the features it requires.
@@ -43,20 +45,20 @@ pub(super) struct Mirror {
     /// Each worker's capabilities, as it registered them.
     caps: HashMap<sem::Worker, Vec<SystemCaps>>,
     /// The hub's run -> the core's run it is, or stands for (Resumed).
-    runs: HashMap<(u64, u64), sem::Run>,
+    runs: Keyed<(u64, u64), sem::Run>,
     /// The other way: each core run's hub runs, freed as the core's goes.
-    hub_runs: HashMap<sem::Run, Vec<(u64, u64)>>,
+    hub_runs: Keyed<sem::Run, Vec<(u64, u64)>>,
     /// Runs assigned that no worker answered yet: the answer says whether
     /// the hub placed a new run or adopted one held.
-    pending: HashMap<(u64, u64), (sem::Key, sem::Worker)>,
+    pending: Keyed<(u64, u64), (sem::Key, sem::Worker)>,
     /// The other way: each waiting build's one run in `pending`, freed with
     /// the build, which no Place can follow.
-    pending_of: HashMap<sem::Key, (u64, u64)>,
+    pending_of: Keyed<sem::Key, (u64, u64)>,
     /// The last number given a run first heard of from a worker: down from
     /// the top, the core's own count up.
     held: sem::Run,
     /// Each waiting build's events, for the warnings; freed as it ends.
-    seen: HashMap<sem::Key, Vec<String>>,
+    seen: Keyed<sem::Key, Vec<String>>,
     /// Divergences, logged once the lock is let go (Shadow::with).
     warnings: Vec<Warning>,
 }
@@ -176,6 +178,7 @@ impl Mirror {
             Event::Adopt { key, .. } | Event::Defer { key, .. } | Event::Refuse { key } => {
                 keys.push(key);
             }
+            Event::Cannot { key } => keys.push(key),
             _ => {}
         }
         (keys, runs)
@@ -190,7 +193,7 @@ impl Mirror {
             let (k, r) = self.touches(&ev);
             let line = format!("{point}: {}", brief(&ev));
             for k in &k {
-                self.seen.entry(*k).or_default().push(line.clone());
+                self.seen.slot(*k).push(line.clone());
             }
             runs.extend(r);
             let choice = matches!(ev, Event::Place { .. } | Event::Abort { .. });
@@ -242,14 +245,14 @@ impl Mirror {
     /// The hub's run `hub` is, or stands for, the core's `core`.
     fn link(&mut self, hub: (u64, u64), core: sem::Run) {
         self.runs.insert(hub, core);
-        self.hub_runs.entry(core).or_default().push(hub);
+        self.hub_runs.slot(core).push(hub);
     }
 
     /// The core's run for the hub's `run`; at the worker's first word of a
     /// run assigned and not yet answered, the hub placed it (Place).
     fn bind(&mut self, point: &str, run: (u64, u64)) -> Option<sem::Run> {
         if let Some((key, worker)) = self.answered(run)
-            && !self.runs.contains_key(&run)
+            && self.runs.get(&run).is_none()
             && let Some(Command::Assign { run: r, .. }) = self
                 .feed(point, &[], vec![Event::Place { key, worker }])
                 .first()

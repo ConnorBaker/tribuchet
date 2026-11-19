@@ -86,6 +86,11 @@ pub enum Event {
     Refuse {
         key: Key,
     },
+    /// The hub's verdict: it cannot carry `key` (relay/daemon.rs), a fact
+    /// about the hub, not an outcome of a run (L12).
+    Cannot {
+        key: Key,
+    },
     /// Policy: stop waiting on `worker`'s runs, a cause unknown (D4, D5).
     Suspect {
         worker: Worker,
@@ -360,6 +365,19 @@ pub fn step(hub: &mut Hub, ev: Event) -> Vec<Command> {
                 && !b.clients.values().any(|&can_local| can_local)
             {
                 hub.answer(key, Answer::Refuse, None, &mut out);
+            }
+        }
+        // A Refuse by another static fact, in the same policy order; the
+        // farm ends its live run itself, a known cause (§7).
+        Event::Cannot { key } => {
+            if let Some(b) = hub.builds.get(&key)
+                && !b.clients.values().any(|&can_local| can_local)
+            {
+                let live = b.live;
+                hub.answer(key, Answer::Refuse, None, &mut out);
+                if let Some(run) = live {
+                    hub.drop_run(run, &mut out);
+                }
             }
         }
         // Its runs are forgotten: should it come back, its Register lists
