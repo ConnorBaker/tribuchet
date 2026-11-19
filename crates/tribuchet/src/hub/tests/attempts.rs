@@ -1,6 +1,7 @@
 //! Worker-session losses of a dispatched build: which count against
 //! MAX_JOB_ATTEMPTS, and which in transport against MAX_TRANSPORT_LOSSES.
 
+use super::clientless::sent;
 use super::fake_daemon::told;
 use super::*;
 
@@ -378,4 +379,46 @@ async fn an_assignment_the_worker_never_got_counts_no_loss() {
         Some((0, 0, false))
     );
     assert_eq!(told(&mut client).await.1, None);
+}
+
+/// A build the hub ends with no verdict from a run of it that may go on
+/// has that run cancelled once its worker is back listing it: declined
+/// at the transport cap, failed at the genuine cap, dropped as its client
+/// left. A build still wanted keeps it. No timeout ends a run nobody
+/// cancels: before, each such run held its slot until it ended.
+#[tokio::test]
+async fn a_run_of_a_build_the_hub_ended_is_cancelled_on_its_worker() {
+    let id = format!("{:032x}", 1);
+    let cancel = vec![(id, "k1".to_owned())];
+    let rows = [
+        (vec![(Back("w1"), Resumed); 13], false, cancel.clone()),
+        (vec![(Fresh("w1"), Started); 5], false, cancel.clone()),
+        (vec![(Fresh("w1"), Started)], true, cancel),
+        (vec![(Fresh("w1"), Started)], false, vec![]),
+    ];
+    let mut wrong = Vec::new();
+    for (n, (lost, clientless, want)) in rows.into_iter().enumerate() {
+        let state = Arc::new(HubState::for_test(Duration::ZERO));
+        let client = queued_build(&state, false).await;
+        for &(t, s) in &lost {
+            let Some((j, w)) = taken(&state, t).await else {
+                break;
+            };
+            let msgs = said(&j, s);
+            lose_session(&state, j, w, msgs).await;
+        }
+        if clientless {
+            drop(client);
+            let _w2 = register(&state, "w2", &[]);
+            assert!(state.take_job(&caps("w2"), None).await.is_none(), "row {n}");
+        }
+        let mut w = connect(&state, "w1", 1, &["k1"]);
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        let cancels = sent(&mut w.from_hub).1;
+        w.hub.abort();
+        if cancels != want {
+            wrong.push(format!("row {n}: {cancels:?}"));
+        }
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
 }

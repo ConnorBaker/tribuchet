@@ -40,9 +40,21 @@ pub(in crate::hub) struct Room {
     pub(in crate::hub) idle: u32,
     pub(in crate::hub) size: Size,
     pub(in crate::hub) load: Demand,
+    /// Of `load`, what its builds the clientless rule may give up hold.
+    pub(in crate::hub) clientless: Demand,
 }
 
 impl Room {
+    /// The room with its clientless builds given up.
+    fn freed(&self) -> Self {
+        let (l, c) = (self.load, self.clientless);
+        let load = Demand {
+            cores: l.cores - c.cores,
+            memory: l.memory - c.memory,
+        };
+        Self { load, ..*self }
+    }
+
     /// How full the worker would be with `d` added: its committed cores
     /// over its cores, or, with `memory`, its committed memory over its
     /// memory if fuller.
@@ -60,9 +72,20 @@ impl Room {
 pub(in crate::hub) struct Rooms {
     pub(in crate::hub) asker: u64,
     pub(in crate::hub) rooms: Vec<Room>,
+    /// A room per build passes ranked that lost it only for the load of
+    /// its clientless builds (passes): they are wanted.
+    pub(in crate::hub) wants: Vec<u64>,
 }
 
 impl Rooms {
+    pub(in crate::hub) fn new(asker: u64, rooms: Vec<Room>) -> Self {
+        Self {
+            asker,
+            rooms,
+            wants: Vec::new(),
+        }
+    }
+
     /// The session that `serves` a build expected to use `d` with an
     /// idle agent and ranks better for it than the asker (an idle agent,
     /// then less full; memory only where every room compared has a
@@ -90,12 +113,30 @@ impl Rooms {
             && others.iter().all(|&i| self.rooms[i].size.memory.is_some());
         let rank = |r: &Room| (r.idle == 0, r.fullness(d, memory));
         let order = |a: (bool, f64), b: (bool, f64)| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1));
-        let mine = rank(mine);
-        let best = others.into_iter().min_by(|&i, &j| {
+        let (asker, mine) = (mine.id, rank(mine));
+        let best = others.iter().copied().min_by(|&i, &j| {
             let (a, b) = (&self.rooms[i], &self.rooms[j]);
             order(rank(a), rank(b)).then(a.id.cmp(&b.id))
         })?;
-        if order(rank(&self.rooms[best]), mine) != Ordering::Less {
+        let passed = order(rank(&self.rooms[best]), mine) == Ordering::Less;
+        // A room with an idle agent that would win the build were its
+        // clientless builds given up, and does not, wants them given up.
+        let (won, win) = if passed {
+            (self.rooms[best].id, rank(&self.rooms[best]))
+        } else {
+            (asker, mine)
+        };
+        let lost_only_to_them = |r: &Room| {
+            r.id != won
+                && r.idle > 0
+                && order(rank(&r.freed()), win) == Ordering::Less
+                && order(rank(r), win) != Ordering::Less
+        };
+        let asker = self.rooms.iter().position(|r| r.id == asker);
+        let wants = (others.into_iter().chain(asker)).map(|i| &self.rooms[i]);
+        self.wants
+            .extend(wants.filter(|r| lost_only_to_them(r)).map(|r| r.id));
+        if !passed {
             return None;
         }
         let room = &mut self.rooms[best];

@@ -36,6 +36,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::errors::chain;
+use crate::proto::Heartbeat;
 use crate::worker::resume::ResumeState;
 use policy::{Action, Policy};
 
@@ -236,6 +237,24 @@ impl Arbiter {
             t.ask("0");
         }
         self.lock().builds.insert(key.to_owned(), t);
+    }
+
+    /// The keys of the builds held frozen, and of their leader (running,
+    /// with one frozen), as the worker's heartbeat tells the hub.
+    pub(super) fn frozen_by(&self) -> Heartbeat {
+        let state = self.lock();
+        let frozen = state.builds.iter().filter(|(_, t)| t.frozen);
+        let frozen_keys: Vec<String> = frozen.map(|(k, _)| k.clone()).collect();
+        let running = |k: &&str| state.builds.get(*k).is_some_and(|t| !t.frozen);
+        let leader = state.policy.leader().filter(running);
+        let leader_key = leader
+            .filter(|_| !frozen_keys.is_empty())
+            .map(str::to_owned);
+        Heartbeat {
+            frozen_keys,
+            leader_key,
+            ..Heartbeat::default()
+        }
     }
 
     /// One sample: read every build's demand without the lock, then decide
