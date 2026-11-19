@@ -30,6 +30,8 @@ enum Act {
     Fetched(usize),
     /// A protocol-breaking worker: any run it holds is "fetched".
     BogusFetched(usize, usize),
+    /// A protocol-breaking worker: a finished run's other outcome.
+    Contradict(usize),
     /// Every stream ends; workers re-register and clients resubmit.
     HubRestart,
     Place(Key, usize),
@@ -71,6 +73,8 @@ struct World {
     said: Vec<(Run, Option<Phase>)>,
     /// Answers seen: Give Failed, Give Built, Defer, Refuse; then isolation.
     answers: [usize; 5],
+    /// The outcome the hub first knew each run finished with.
+    finals: BTreeMap<Run, Outcome>,
 }
 
 fn serves(w: usize) -> BTreeSet<Sys> {
@@ -101,7 +105,26 @@ impl World {
             let done = held.iter().filter(|h| matches!(h.2, Phase::Finished(_)));
             self.told.extend(done.map(|h| h.0));
         }
-        for c in step(&mut self.hub, ev) {
+        let (marked, abort) = (self.hub.lost.clone(), matches!(ev, Event::Abort { .. }));
+        let live: BTreeMap<Run, Key> = (self.hub.builds.iter())
+            .filter_map(|(k, b)| Some((b.live?, *k)))
+            .collect();
+        let cmds = step(&mut self.hub, ev);
+        // An outcome taken: a Give, or (to no client) the run's release.
+        let took: BTreeSet<Key> = (cmds.iter())
+            .filter_map(|c| match c {
+                Command::Answer { key, answer, .. } => {
+                    matches!(answer, Answer::Give(_)).then_some(*key)
+                }
+                Command::Drop { run, .. } if !abort => live.get(run).copied(),
+                _ => None,
+            })
+            .collect();
+        for k in marked.difference(&self.hub.lost) {
+            assert!(took.contains(k), "L10: the lost mark lasts to an outcome");
+        }
+        assert!(took.is_disjoint(&self.hub.lost), "L10: an outcome lifts it");
+        for c in cmds {
             match c {
                 Command::Assign { worker, run, key } => {
                     let serving = serves(worker as usize).contains(&(key % 3));
@@ -133,6 +156,7 @@ impl World {
             .filter(|((k, _), (_, hub))| *k == key && *hub == self.hubs)
             .map(|((_, c), _)| *c)
             .collect();
+        assert!(!clients.is_empty(), "an answer reaches a client");
         for c in clients {
             let can_local = self.open.remove(&(key, *c)).map(|o| o.0);
             assert!(can_local.is_some(), "L2: one answer per waiting client");
@@ -183,6 +207,31 @@ impl World {
         rs
     }
 
+    /// The waiting keys whose live run is on `w`, unless `kept` (by the
+    /// run and its phase in the hub): an event that ends the rest ends them
+    /// with no known cause.
+    fn ending(&self, w: usize, kept: impl Fn(Run, Phase) -> bool) -> Vec<Key> {
+        let live = self
+            .hub
+            .builds
+            .iter()
+            .filter_map(|(k, b)| Some((*k, b.live?)));
+        let on = |(k, run)| Some((k, run, self.hub.runs.get(&run)?));
+        let ends = |(k, run, r): (Key, Run, &RunOf)| {
+            (r.worker == w as Worker && !kept(run, r.phase)).then_some(k)
+        };
+        live.filter_map(on).filter_map(ends).collect()
+    }
+
+    /// D4, complete: a run lost with no known cause isolates its key, though
+    /// its build ends (L10).
+    fn isolates(&self, keys: &[Key]) {
+        for k in keys {
+            let lost = self.hub.lost.contains(k);
+            assert!(lost, "D4: a run lost with no known cause isolates its key");
+        }
+    }
+
     fn deliver(&mut self, w: usize) {
         let wk = &mut self.wk[w];
         match (!wk.inbox.is_empty()).then(|| wk.inbox.remove(0)) {
@@ -214,13 +263,18 @@ impl World {
             }
             Act::Leave(key, client) => {
                 self.open.remove(&(key, client));
+                let live = |h: &Hub| h.builds.get(&key).and_then(|b| b.live);
+                let before = live(&self.hub);
                 self.send(Event::Leave { key, client });
+                assert_eq!(live(&self.hub), before, "L9: a leave keeps the live run");
             }
             Act::Connect(w) => {
                 let wk = &mut self.wk[w];
                 (wk.up, wk.inbox) = (true, Vec::new());
                 let keep = wk.runs.iter().filter(|r| !r.1.2);
-                let held = keep.map(|(r, (k, p, _))| (*r, *k, *p)).collect();
+                let held: Vec<_> = keep.map(|(r, (k, p, _))| (*r, *k, *p)).collect();
+                let listed = |r, p| p != Phase::Started || held.iter().any(|h| h.0 == r);
+                let ending = self.ending(w, listed);
                 self.known.insert(w, serves(w));
                 let (worker, serves) = (w as Worker, serves(w));
                 self.send(Event::Register {
@@ -228,6 +282,7 @@ impl World {
                     serves,
                     held,
                 });
+                self.isolates(&ending);
             }
             Act::Down(w) | Act::Crash(w) => {
                 let wk = &mut self.wk[w];
@@ -306,6 +361,18 @@ impl World {
                     self.send(Event::Fetched { run });
                 }
             }
+            Act::Contradict(i) => {
+                let done = |s: &&(Run, Option<Phase>)| matches!(s.1, Some(Phase::Finished(_)));
+                let said: Vec<_> = self.said.iter().filter(done).copied().collect();
+                if let Some(&(run, Some(Phase::Finished(o)))) = said.get(i % said.len().max(1)) {
+                    let o = match o {
+                        Outcome::Built => Outcome::Failed(1),
+                        Outcome::Failed(_) => Outcome::Built,
+                    };
+                    let now = Some(Phase::Finished(o));
+                    self.send(Event::Ran { run, now });
+                }
+            }
             Act::HubRestart => {
                 (self.hub, self.hubs) = (self.hub.restarted(), self.hubs + 1);
                 for w in 0..3 {
@@ -344,7 +411,11 @@ impl World {
                     }
                 }
                 let worker = w as Worker;
+                let ending = self.ending(w, |_, p| matches!(p, Phase::Finished(_)));
                 self.send(Event::Suspect { worker });
+                self.isolates(&ending);
+                let kept = self.hub.runs.values().any(|r| r.worker == worker);
+                assert!(!kept, "a suspected worker's runs are kept");
             }
             Act::Decommission(w) => {
                 self.known.remove(&w);
@@ -353,12 +424,20 @@ impl World {
             }
         }
         for (k, b) in &self.hub.builds {
-            let evidence = self.evidence.contains(k);
-            assert!(
-                !b.lost || evidence,
-                "D4: isolation only after a loss of no known cause"
-            );
-            self.answers[4] = self.answers[4].max(usize::from(b.lost));
+            let wanted = !b.clients.is_empty() || b.live.is_some();
+            assert!(wanted, "C27: a build no client or run wants ends");
+            let lost = self.hub.lost.contains(k);
+            self.answers[4] = self.answers[4].max(usize::from(lost));
+        }
+        assert!(
+            self.hub.lost.is_subset(&self.evidence),
+            "D4: isolation only after a loss of no known cause"
+        );
+        for (run, r) in &self.hub.runs {
+            if let Phase::Finished(o) = r.phase {
+                let first = *self.finals.entry(*run).or_insert(o);
+                assert_eq!(first, o, "a finished run's outcome is final");
+            }
         }
     }
 
@@ -416,6 +495,7 @@ fn act() -> impl Strategy<Value = Act> {
         3 => (0..64usize).prop_map(Act::Replay),
         2 => w.clone().prop_map(Act::Fetched),
         1 => (w.clone(), 0..4usize).prop_map(|(w, i)| Act::BogusFetched(w, i)),
+        1 => (0..64usize).prop_map(Act::Contradict),
         1 => Just(Act::HubRestart),
         5 => (0..4u32, w.clone()).prop_map(|(k, w)| Act::Place(k, w)),
         2 => (0..8usize, 0..8u32).prop_map(|(i, k)| Act::Adopt(i, k)),
@@ -425,6 +505,33 @@ fn act() -> impl Strategy<Value = Act> {
         1 => w.clone().prop_map(Act::Suspect),
         1 => w.prop_map(Act::Decommission),
     ]
+}
+
+/// L10: a clientless build whose run is lost ends, but its key stays lost,
+/// so a resubmission runs alone; the next outcome, read by no one, lifts it.
+#[test]
+fn a_lost_mark_outlasts_its_build_until_an_outcome() {
+    let mut w = World::default();
+    let go = |w: &mut World, acts: &[Act]| acts.iter().for_each(|a| w.act(a.clone()));
+    go(&mut w, &[Act::Connect(0)]);
+    for client in 0..2 {
+        go(&mut w, &[Act::Submit(0, client, false), Act::Place(0, 0)]);
+        let lost = w.hub.lost.contains(&0);
+        assert_eq!(lost, client == 1, "a resubmission after a loss starts lost");
+        go(&mut w, &[Act::Deliver(0), Act::Start(0, 0)]);
+        w.act(Act::Leave(0, client));
+        let live = w.hub.builds.get(&0).and_then(|b| b.live);
+        assert!(live.is_some(), "L9: a clientless run goes on");
+        if client == 0 {
+            // Its worker restarts without it: lost, with no known cause.
+            go(&mut w, &[Act::Crash(0), Act::Connect(0)]);
+            assert!(w.hub.builds.is_empty(), "C27: no one wants it");
+            assert!(w.hub.lost.contains(&0), "L10: its key stays lost");
+        }
+    }
+    go(&mut w, &[Act::Finish(0, 0, true), Act::Fetched(0)]);
+    let (ended, lifted) = (w.hub.builds.is_empty(), w.hub.lost.is_empty());
+    assert!(ended && lifted, "C27; L10: an unread outcome lifts it");
 }
 
 /// Every law after every step of any history under any policy; progress (a

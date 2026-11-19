@@ -161,6 +161,9 @@ impl HubState {
             // back without it; one not back may run it still, a loss in
             // transport. A loss before or after the run was counted as it
             // happened (losses::lost).
+            if let Some(loss) = &job.loss {
+                self.given_up_on(loss);
+            }
             if let Some(loss) = job.loss.take().filter(|l| l.run == Run::Started) {
                 let back = {
                     let holding = self.holding.lock().unwrap();
@@ -201,11 +204,8 @@ impl HubState {
             .unwrap()
             .get(&worker)
             .map(|c| c.name.clone());
-        if job
-            .loss
-            .as_ref()
-            .is_some_and(|r| Some(&r.worker) != name.as_ref())
-        {
+        if let Some(loss) = (job.loss.as_ref()).filter(|r| Some(&r.worker) != name.as_ref()) {
+            self.given_up_on(loss);
             if job.loss.take().is_some_and(|l| l.run == Run::Started) {
                 job = losses::count(self, job, Charge::Transport).await?;
             }

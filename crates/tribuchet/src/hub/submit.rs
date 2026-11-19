@@ -13,7 +13,6 @@ use tonic::{Request, Response, Status, Streaming};
 use super::metrics::Metrics;
 use super::naming::drv_name;
 use super::placement::Expected;
-use super::shadow;
 use super::state::{HubState, Inflight, Job, Replay, Servability, unserved};
 use crate::proto::{
     AttachEvent, BuildMessage, BuildRequest, DECLINE_EXIT_CODE, NETWORK, attach_event,
@@ -145,13 +144,15 @@ impl AttachSvc {
     /// Platforms we never expect to see decline without any wait.
     async fn await_capable_worker(
         &self,
-        system: &str,
+        (key, system): (&str, &str),
         features: &[String],
         can_local: bool,
     ) -> Option<Response<BuildStream>> {
         let decline = || {
-            tracing::info!(system, "no capable worker; declining");
-            shadow::answer("", "no capable worker", "Defer", &[can_local]);
+            tracing::info!(system, can_local, "no capable worker; declining");
+            self.state
+                .shadow
+                .declined(key, (system, features), can_local);
             Metrics::inc(&self.state.metrics.declined);
             let (tx, rx) = tokio::sync::mpsc::channel(1);
             let _ = tx.try_send(Ok(AttachEvent {
@@ -217,7 +218,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
         // waits for a worker, queued and its clients told (hold_unservable).
         if !req.fixed_output
             && let Some(declined) =
-                (self.await_capable_worker(&req.system, &features, can_local)).await
+                (self.await_capable_worker((&key, &req.system), &features, can_local)).await
         {
             return Ok(declined);
         }
@@ -241,7 +242,9 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 .cloned();
             if let Some(replay) = existing {
                 tracing::info!(key, "deduplicating build submission");
-                break replay.subscribe_as(can_local).await;
+                let sys = (req.system.as_str(), features.as_slice());
+                let client = self.state.shadow.submit(&key, sys, can_local);
+                break replay.subscribe_as(client).await;
             }
             let id = new_id();
             let replay = Arc::new(Replay::new(id.clone()));
@@ -257,7 +260,9 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 notified.await;
                 continue;
             };
-            let rx = replay.subscribe_as(can_local).await;
+            let sys = (req.system.as_str(), features.as_slice());
+            let client = self.state.shadow.submit(&key, sys, can_local);
+            let rx = replay.subscribe_as(client).await;
             let mut job = Job {
                 id,
                 key,

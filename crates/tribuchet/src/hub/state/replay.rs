@@ -21,6 +21,7 @@ use super::{EventTx, MAX_REPLAY_BYTES, SUB_CHANNEL_SLACK};
 use crate::chunker::Recipe;
 use crate::chunkstore::{Hash, PinGuard};
 use crate::hub::chunkcache::ChunkCache;
+use crate::hub::shadow::Client;
 use crate::proto::{AttachEvent, OutputNar, attach_event};
 
 /// Said to a client that missed log lines, before what follows them.
@@ -302,8 +303,8 @@ impl ReplayInner {
 /// verdict. Its stream ends without one once the build ended without one,
 /// or a chunk it needs left the cache: attach then resubmits (attach.rs).
 /// Behind what the log keeps while the build runs, it is refused
-/// (EXHAUSTED), which attach does not retry.
-async fn read(replay: Arc<Replay>, tx: EventTx) {
+/// (EXHAUSTED), which attach does not retry. The client leaves as it ends.
+async fn read(replay: Arc<Replay>, tx: EventTx, _client: Client) {
     let id = &replay.id;
     let mut c = Cursor {
         behind: replay.inner.lock().await.ended.is_some(),
@@ -428,20 +429,20 @@ impl Replay {
     pub(in crate::hub) async fn subscribe(
         self: &Arc<Self>,
     ) -> mpsc::Receiver<Result<AttachEvent, Status>> {
-        self.subscribe_as(true).await
+        self.subscribe_as(Client::untracked(true)).await
     }
 
     /// A client subscribes, whose own Nix can build the key or not.
     pub(in crate::hub) async fn subscribe_as(
         self: &Arc<Self>,
-        can_local: bool,
+        client: Client,
     ) -> mpsc::Receiver<Result<AttachEvent, Status>> {
         self.hold.lock().unwrap().clientless = None;
         let (tx, rx) = mpsc::channel(SUB_CHANNEL_SLACK);
-        (self.clients.lock().unwrap()).push((tx.downgrade(), can_local));
+        (self.clients.lock().unwrap()).push((tx.downgrade(), client.can_local));
         // Before the reader, which takes it out when it ends.
         self.inner.lock().await.subs.push(tx.clone());
-        tokio::spawn(read(self.clone(), tx));
+        tokio::spawn(read(self.clone(), tx, client));
         rx
     }
 

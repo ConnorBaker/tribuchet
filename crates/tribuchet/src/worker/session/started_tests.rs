@@ -66,7 +66,8 @@ async fn a_run_says_it_started_after_its_need_and_first() -> Result<()> {
 /// A session that resumes a finished result tells the hub it is
 /// finished, and the session's end starts the result's reaper clock
 /// (released). Its Register lists the run it holds, finished, and the run
-/// it lost; its Resumed names the run it holds, not the assignment's.
+/// it lost, which it forgets once the hub took that Register; its Resumed
+/// names the run it holds, not the assignment's.
 #[tokio::test]
 async fn a_session_resuming_a_finished_result_says_so_and_releases_it() -> Result<()> {
     let dir = tempfile::tempdir()?;
@@ -140,6 +141,7 @@ async fn a_session_resuming_a_finished_result_says_so_and_releases_it() -> Resul
         exit_code: Some(0),
     };
     assert_eq!((&r.held[..], &r.lost[..]), (&[finished][..], &[lost][..]));
+    assert!(ctx.lost.lock().unwrap().is_empty(), "a lost run kept");
     let released = ctx.resumable.lock().unwrap()["test-key"].released;
     assert!(released.is_some(), "not released");
     Ok(())

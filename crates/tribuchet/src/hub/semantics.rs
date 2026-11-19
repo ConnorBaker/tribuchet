@@ -31,7 +31,8 @@ pub enum Answer {
     Refuse,
 }
 
-/// How far a run is known to have got. It only moves forward.
+/// How far a run is known to have got. It only moves forward, and once
+/// Finished it is final.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Phase {
     Assigned,
@@ -94,6 +95,8 @@ pub enum Event {
         run: Run,
     },
     /// The operator retires `worker` (U4); suspecting it is the policy's.
+    /// The hub has no such command yet.
+    #[cfg(test)]
     Decommission {
         worker: Worker,
     },
@@ -132,8 +135,6 @@ pub struct Build {
     pub clients: BTreeMap<Client, bool>,
     /// The run whose outcome will answer it.
     pub live: Option<Run>,
-    /// A run of it ended with no known cause: run it alone (D4).
-    pub lost: bool,
 }
 
 /// A run a worker holds, as far as the hub knows.
@@ -150,12 +151,16 @@ pub struct Hub {
     pub runs: BTreeMap<Run, RunOf>,
     /// Known, not decommissioned, workers and the systems they serve.
     pub workers: BTreeMap<Worker, BTreeSet<Sys>>,
+    /// Keys a run of which ended with no known cause and that have had no
+    /// outcome since: run them alone (D4), a build of them waiting or not (L10).
+    pub lost: BTreeSet<Key>,
     next_run: Run,
 }
 
 impl Hub {
     /// After a restart the hub keeps its workers and run ids (on disk);
     /// reports and resubmissions rebuild the rest.
+    #[cfg(test)]
     pub fn restarted(&self) -> Hub {
         Hub {
             workers: self.workers.clone(),
@@ -171,6 +176,12 @@ impl Hub {
 
     fn answer(&mut self, key: Key, answer: Answer, run: Option<Run>, out: &mut Vec<Command>) {
         let b = self.builds.remove(&key).expect("a waiting build");
+        if let Answer::Give(_) = answer {
+            self.lost.remove(&key); // Only an outcome lifts the mark (L10).
+        }
+        if b.clients.is_empty() {
+            return; // A clientless build ends unsaid: no one to answer.
+        }
         let clients = b.clients.into_keys().collect();
         out.push(Command::Answer {
             key,
@@ -181,16 +192,26 @@ impl Hub {
     }
 
     fn detach(&mut self, key: Key, evidence: bool) {
-        let b = self.builds.get_mut(&key).expect("a waiting build");
-        (b.live, b.lost) = (None, b.lost || evidence);
+        self.builds.get_mut(&key).expect("a waiting build").live = None;
+        if evidence {
+            self.lost.insert(key);
+        }
+        self.unwanted(key);
     }
 
     fn leave(&mut self, key: Key, client: Client) {
         if let Some(b) = self.builds.get_mut(&key) {
             b.clients.remove(&client);
-            if b.clients.is_empty() {
-                self.builds.remove(&key);
-            }
+            self.unwanted(key);
+        }
+    }
+
+    /// A build is wanted while a client waits on it or its live run goes on
+    /// clientless, which a Submit of its key then joins (L9); else it ends (C27).
+    fn unwanted(&mut self, key: Key) {
+        let b = self.builds.get(&key);
+        if b.is_some_and(|b| b.clients.is_empty() && b.live.is_none()) {
+            self.builds.remove(&key);
         }
     }
 
@@ -231,6 +252,9 @@ impl Hub {
             return;
         };
         let was = r.phase;
+        if let Phase::Finished(_) = was {
+            return; // A run has one outcome: a report against it changes nothing.
+        }
         r.phase = was.max(now);
         if let (Some(key), Phase::Finished(o)) = (key, r.phase)
             && was != r.phase
@@ -259,7 +283,6 @@ pub fn step(hub: &mut Hub, ev: Event) -> Vec<Command> {
                 sys,
                 clients: BTreeMap::new(),
                 live: None,
-                lost: false,
             });
             b.clients.insert(client, can_local);
         }
@@ -338,12 +361,15 @@ pub fn step(hub: &mut Hub, ev: Event) -> Vec<Command> {
                 hub.answer(key, Answer::Refuse, None, &mut out);
             }
         }
+        // Its runs are forgotten: should it come back, its Register lists
+        // those it still holds, as for any worker.
         Event::Suspect { worker } => {
             for run in hub.runs_on(worker) {
                 if let Some(key) = hub.live(run) {
                     let finished = matches!(hub.runs[&run].phase, Phase::Finished(_));
                     hub.detach(key, !finished);
                 }
+                hub.runs.remove(&run);
             }
         }
         Event::Abort { run } => {
@@ -351,6 +377,7 @@ pub fn step(hub: &mut Hub, ev: Event) -> Vec<Command> {
                 hub.drop_run(run, &mut out);
             }
         }
+        #[cfg(test)]
         Event::Decommission { worker } => _ = hub.workers.remove(&worker),
     }
     out
