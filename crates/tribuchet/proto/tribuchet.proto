@@ -303,6 +303,19 @@ service AttachHub {
   rpc Build(stream BuildMessage) returns (stream AttachEvent);
 }
 
+// The operator's commands, on the same local socket.
+service HubAdmin {
+  // Retire a worker that is not connected: the hub no longer knows it
+  // (SEMANTICS-7 U4). Fails for a connected or an unknown worker.
+  rpc Decommission(DecommissionRequest) returns (DecommissionReply);
+}
+
+message DecommissionRequest {
+  string worker_name = 1;
+}
+
+message DecommissionReply {}
+
 // Client-streamed submission: the BuildRequest, then TmpDirFile
 // chunks terminated by an eof chunk.
 message BuildMessage {

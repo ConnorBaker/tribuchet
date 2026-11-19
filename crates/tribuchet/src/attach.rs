@@ -131,7 +131,7 @@ enum Outcome {
 
 /// gRPC channel over the hub's local unix socket; tonic only knows
 /// HTTP URIs, so the connector ignores the URI and dials the path.
-async fn connect(socket: &Path) -> Result<tonic::transport::Channel> {
+pub(crate) async fn connect(socket: &Path) -> Result<tonic::transport::Channel> {
     let socket = socket.to_owned();
     Endpoint::try_from("http://hub.invalid")?
         .initial_stream_window_size(Some(chunkio::H2_STREAM_WINDOW))

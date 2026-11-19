@@ -1,7 +1,7 @@
 //! Known workers (SEMANTICS-7, L11): those that registered and were not
-//! decommissioned since. Kept across hub restarts beside the run epoch, so
-//! that the hub refuses a build only if none of them serves it. To
-//! decommission one, stop the hub and delete its entry.
+//! decommissioned since (U4, `tribuchet decommission`). Kept across hub
+//! restarts beside the run epoch, so that the hub refuses a build only if
+//! none of them serves it.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -63,7 +63,21 @@ impl Known {
             return;
         }
         workers.insert(caps.name.clone(), systems);
-        let (Some(path), Ok(json)) = (&self.path, serde_json::to_string_pretty(&*workers)) else {
+        self.store(&workers);
+    }
+
+    /// The worker `name` is decommissioned: whether it was known.
+    pub(super) fn forget(&self, name: &str) -> bool {
+        let mut workers = self.workers.lock().unwrap();
+        let known = workers.remove(name).is_some();
+        if known {
+            self.store(&workers);
+        }
+        known
+    }
+
+    fn store(&self, workers: &BTreeMap<String, Systems>) {
+        let (Some(path), Ok(json)) = (&self.path, serde_json::to_string_pretty(workers)) else {
             return;
         };
         if let Err(e) = write_atomic(path, &json) {
@@ -86,7 +100,7 @@ mod tests {
     use super::*;
 
     /// A worker that registered is known to a hub started after, with
-    /// what it served then, and only that.
+    /// what it served then, and only that; once decommissioned, to none.
     #[test]
     fn a_registered_worker_is_known_after_a_restart() {
         let dir = tempfile::tempdir().unwrap();
@@ -102,5 +116,8 @@ mod tests {
         assert!(known.serves("x86_64-linux", &["kvm".to_owned()]));
         assert!(!known.serves("x86_64-linux", &["big-parallel".to_owned()]));
         assert!(!known.serves("aarch64-linux", &[]));
+        assert!(known.forget("w") && !known.forget("w"), "forgotten once");
+        let known = Known::open(&path);
+        assert!(!known.serves("x86_64-linux", &["kvm".to_owned()]));
     }
 }

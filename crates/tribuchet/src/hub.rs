@@ -29,6 +29,8 @@ use crate::proto::{
     worker_message,
 };
 
+mod admin;
+pub use admin::decommission;
 mod caps;
 use caps::CapsGuard;
 mod chunkcache;
