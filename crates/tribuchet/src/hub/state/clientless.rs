@@ -169,8 +169,7 @@ impl HubState {
     /// that serve it: those with a client, that no session with a free
     /// slot serves (one would take them), nor a worker's key holds, nor a
     /// loss keeps for a worker still awaited. The queue is not held while
-    /// it asks for clients: a stalled one holds its replay's lock for
-    /// SUB_STALL, and take_job needs the queue.
+    /// it asks the replays for clients.
     async fn waiting_queued(&self) -> Vec<Vec<u64>> {
         let candidates: Vec<(Arc<Replay>, Vec<u64>)> = {
             let queue = self.queue.lock().await;

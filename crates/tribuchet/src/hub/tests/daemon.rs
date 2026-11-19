@@ -211,7 +211,7 @@ async fn comes_to(n: usize, daemon: Daemon, journal: Option<&str>, at: At, comes
         }
         Comes::Waits => {
             taken(3).await;
-            let (notes, error) = told(&mut client);
+            let (notes, error) = told(&mut client).await;
             assert_eq!((notes.len(), error), (1, None), "row {n}");
         }
         Comes::GivenUp(_) => {
@@ -288,7 +288,7 @@ async fn a_wait_for_a_free_daemon_connection_is_told() {
     let mut client = j.replay.subscribe().await;
     let _worker = staging_build(&state, j).await;
     tokio::time::sleep(3 * DAEMON_ANSWER + Duration::from_secs(1)).await;
-    let (notes, error) = told(&mut client);
+    let (notes, error) = told(&mut client).await;
     assert_eq!((notes.len(), error), (1, None), "{notes:?}");
     assert!(!log.has(&["retrying"]), "the wait for a connection ended");
 }
@@ -298,7 +298,7 @@ async fn a_wait_for_a_free_daemon_connection_is_told() {
 /// requeued and then held for want of a worker, is told that too.
 #[tokio::test]
 async fn a_build_is_told_of_each_wait_once_per_dispatch() {
-    let replay = Replay::default();
+    let replay = Arc::new(Replay::default());
     let mut client = replay.subscribe().await;
     for wait in [Wait::Daemon, Wait::Daemon, Wait::Worker, Wait::Worker] {
         replay.tell_waiting(wait, "note\n".into()).await;
@@ -307,6 +307,7 @@ async fn a_build_is_told_of_each_wait_once_per_dispatch() {
         .publish(attach_event::Event::Dispatched("w".into()))
         .await;
     replay.tell_waiting(Wait::Daemon, "note\n".into()).await;
+    tokio::task::yield_now().await;
     let mut kinds = Vec::new();
     while let Ok(Ok(AttachEvent { event: Some(e) })) = client.try_recv() {
         kinds.push(match e {

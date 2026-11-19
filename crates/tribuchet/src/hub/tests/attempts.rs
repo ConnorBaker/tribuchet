@@ -234,12 +234,12 @@ async fn what_a_returning_worker_says_settles_the_loss_before() {
                 w.send(worker_message::Msg::Resumed(proto::Resumed { build_id }))
                     .await;
             }
-            assert_eq!(told(&mut client).1, None, "after loss {loss}");
+            assert_eq!(told(&mut client).await.1, None, "after loss {loss}");
         }
         drop(w);
         let mut w = connect(&state, "w1", 1, &["k1"]);
         let handed_out = w.assignment().await.is_some();
-        let failed = told(&mut client).1.is_some();
+        let failed = told(&mut client).await.1.is_some();
         assert_eq!(
             (handed_out, failed),
             (resumes, !resumes),
@@ -285,5 +285,5 @@ async fn an_assignment_the_worker_never_got_counts_no_loss() {
         taken.map(|j| (j.attempts, j.resumed_losses, j.loss.is_some())),
         Some((0, 0, false))
     );
-    assert_eq!(told(&mut client).1, None);
+    assert_eq!(told(&mut client).await.1, None);
 }
