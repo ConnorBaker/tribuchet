@@ -43,6 +43,8 @@ enum Act {
     Abort(usize),
     Defer(Key, Client),
     Refuse(Key),
+    /// The hub's verdict: it cannot carry the key (L12).
+    Cannot(Key),
     Suspect(usize),
     Decommission(usize),
 }
@@ -75,8 +77,10 @@ struct World {
     known: BTreeMap<usize, BTreeSet<Sys>>,
     said: Vec<(Run, Option<Phase>)>,
     /// Answers seen: Give Failed, Give Built, Defer, Refuse; then isolation,
-    /// and a lost key's outcome that no client read (L10).
-    answers: [usize; 6],
+    /// a lost key's outcome that no client read (L10), the hub's verdict.
+    answers: [usize; 7],
+    /// The key the hub says it cannot carry, while it says so.
+    verdict: Option<Key>,
     /// The outcome the hub first knew each run finished with.
     finals: BTreeMap<Run, Outcome>,
 }
@@ -109,7 +113,8 @@ impl World {
             let done = held.iter().filter(|h| matches!(h.2, Phase::Finished(_)));
             self.told.extend(done.map(|h| h.0));
         }
-        let (marked, abort) = (self.hub.lost.clone(), matches!(ev, Event::Abort { .. }));
+        let abort = matches!(ev, Event::Abort { .. } | Event::Cannot { .. });
+        let marked = self.hub.lost.clone();
         let live: BTreeMap<Run, Key> = (self.hub.builds.iter())
             .filter_map(|(k, b)| Some((b.live?, *k)))
             .collect();
@@ -200,8 +205,9 @@ impl World {
             Answer::Refuse => {
                 assert_eq!(clients, &all, "L2: every client of the build gets it");
                 let served = self.known.values().any(|s| s.contains(&(key % 3)));
-                assert!(!served, "Refuse only if no known worker serves the key");
-                self.answers[3] += 1;
+                let verdict = self.verdict == Some(key);
+                assert!(!served || verdict, "Refuse only by a static fact");
+                self.answers[3 + 3 * usize::from(verdict)] += 1;
             }
         }
     }
@@ -440,6 +446,15 @@ impl World {
             }
             Act::Defer(key, client) => self.send(Event::Defer { key, client }),
             Act::Refuse(key) => self.send(Event::Refuse { key }),
+            Act::Cannot(key) => {
+                let live = self.hub.builds.get(&key).and_then(|b| b.live);
+                self.verdict = Some(key);
+                self.send(Event::Cannot { key });
+                self.verdict = None;
+                let ended = !self.hub.builds.contains_key(&key);
+                let kept = live.is_some_and(|r| self.hub.runs.contains_key(&r));
+                assert!(!(ended && kept), "L12: the verdict cancels its run");
+            }
             Act::Suspect(w) => {
                 for (run, (key, _, o)) in self.ran.iter().filter(|t| t.1.1 == w) {
                     if o.is_none() || !self.told.contains(run) {
@@ -547,6 +562,7 @@ fn act() -> impl Strategy<Value = Act> {
         2 => (0..8usize).prop_map(Act::Abort),
         1 => (0..4u32, 0..3u32).prop_map(|(k, c)| Act::Defer(k, c)),
         1 => (0..4u32).prop_map(Act::Refuse),
+        1 => (0..4u32).prop_map(Act::Cannot),
         1 => w.clone().prop_map(Act::Suspect),
         1 => w.prop_map(Act::Decommission),
     ]
@@ -560,12 +576,12 @@ mod lost_mark;
 /// vacuously.
 #[test]
 fn every_history_refines_local_building() {
-    let seen = RefCell::new([0; 6]);
+    let seen = RefCell::new([0; 7]);
     let mut runner = TestRunner::new(Config::with_cases(4000));
     let result = runner.run(&vec(act(), 0..80), |acts| {
         let world = World::run(&acts);
         let mut seen = seen.borrow_mut();
-        (0..6).for_each(|i| seen[i] += usize::from(world.answers[i] > 0));
+        (0..7).for_each(|i| seen[i] += usize::from(world.answers[i] > 0));
         prop_assert!(
             world.open.is_empty(),
             "progress: unanswered {:?}",
@@ -576,7 +592,8 @@ fn every_history_refines_local_building() {
     result.unwrap();
     let seen = seen.into_inner();
     eprintln!(
-        "histories with Give Failed, Give Built, Defer, Refuse, isolation, unread lift: {seen:?}"
+        "histories with Give Failed, Give Built, Defer, Refuse, isolation, unread lift, \
+         verdict: {seen:?}"
     );
     assert!(seen.iter().all(|n| *n > 40), "a case no history reaches");
 }
