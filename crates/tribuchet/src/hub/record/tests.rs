@@ -45,6 +45,7 @@ fn result(id: &str, at_ms: i64) -> Row {
         ..BuildUsage::default()
     };
     let rest = Rest {
+        placed: Placed::default(),
         at_ms,
         id: id.into(),
         key: None,
@@ -88,7 +89,7 @@ fn rows_queued_at_close_are_committed() {
             .placement
             .lock()
             .unwrap()
-            .append(result(&n.to_string(), n));
+            .append(vec![result(&n.to_string(), n)]);
     }
     let release = thread::spawn(move || {
         thread::sleep(Duration::from_millis(300));
@@ -275,4 +276,152 @@ fn a_record_not_ours_is_never_written() {
         assert!(after == before, "{} written", path.display());
     }
     assert!(fs::read(&wal).unwrap() == wal_before, "the WAL written");
+}
+
+/// A record from before the `taught` table is read with no run taught
+/// (keys learned, no speed), and gains it as a hub takes it: each result
+/// taught if the dispatch it answered, its id's last by at_ms at or
+/// before it, was quiet and not resumed.
+#[test]
+fn a_record_from_before_taught_gains_it_by_the_dispatches() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record.sqlite");
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch(SCHEMA).unwrap();
+    // A dispatch's at_ms, resumed and load cores; each result at 20.
+    type Dispatch = (i64, i64, Option<f64>);
+    let builds: [(&str, &str, &[Dispatch]); 6] = [
+        ("quiet", "wa", &[(10, 0, Some(2.0))]),
+        ("loud", "wa", &[(10, 0, Some(3.5))]),
+        ("resumed", "wa", &[(10, 1, Some(1.0))]),
+        ("none", "wa", &[]),
+        ("held", "wb", &[(10, 0, Some(1.0)), (30, 0, Some(4.0))]),
+        ("journal", "wb", &[(10, 0, None)]),
+    ];
+    for (id, worker, dispatches) in builds {
+        for &(d_at, resumed, load) in dispatches {
+            db.execute(
+                "INSERT INTO dispatch (at_ms, id, worker, resumed, capacity, expect_cores, \
+                 load_cores, cores) VALUES (?1, ?2, ?3, ?4, 1, 1.0, ?5, 4.0)",
+                rusqlite::params![d_at, id, worker, resumed, load],
+            )
+            .unwrap();
+        }
+        let mut row = result(id, 20);
+        row.values[7] = worker.to_owned().into();
+        insert(&db, &row).unwrap();
+    }
+    drop(db);
+    let (old, _) = read(&path).unwrap();
+    assert!(old.len().0 > 0 && old.speeds().iter().all(|s| s.2 == 0.0));
+    let opened = open(&path);
+    shut(opened);
+    assert_eq!(taught(&path), ["held", "quiet"]);
+    assert_eq!(rows(&path, "taught"), 6);
+    let (new, _) = read(&path).unwrap();
+    assert!(new.speeds().iter().any(|s| s.2 > 0.0), "nothing compared");
+}
+
+/// The ids of the results `path`'s record says teach speed.
+fn taught(path: &Path) -> Vec<String> {
+    reader(path)
+        .prepare("SELECT r.id FROM taught t JOIN result r ON r.rowid = t.result WHERE t.quiet ORDER BY 1")
+        .unwrap()
+        .query_map([], |r| r.get(0))
+        .unwrap()
+        .collect::<rusqlite::Result<_>>()
+        .unwrap()
+}
+
+/// A quiet dispatch of build `id` on worker `worker` at `at_ms`, and its
+/// result at `at_ms` + 10, inserted as a hub before the `taught` table
+/// would.
+fn quiet_run(db: &Connection, id: &str, worker: &str, at_ms: i64) {
+    db.execute(
+        "INSERT INTO dispatch (at_ms, id, worker, resumed, capacity, expect_cores, load_cores, \
+         cores) VALUES (?1, ?2, ?3, 0, 1, 1.0, 1.0, 4.0)",
+        rusqlite::params![at_ms, id, worker],
+    )
+    .unwrap();
+    let mut row = result(id, at_ms + 10);
+    row.values[7] = worker.to_owned().into();
+    insert(db, &row).unwrap();
+}
+
+/// Results a hub before the `taught` table writes after another took the
+/// record (a rollback) gain their rows as a hub takes it again, the rows
+/// already there kept: no result is left untaught.
+#[test]
+fn results_written_by_an_older_hub_are_taught_at_the_next_take() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record.sqlite");
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch(SCHEMA).unwrap();
+    quiet_run(&db, "first", "wa", 10);
+    drop(db);
+    shut(open(&path));
+    let db = Connection::open(&path).unwrap();
+    db.execute("UPDATE taught SET quiet = 0", []).unwrap();
+    quiet_run(&db, "older", "wa", 30);
+    drop(db);
+    shut(open(&path));
+    assert_eq!(taught(&path), ["older"]);
+    assert_eq!(rows(&path, "taught"), rows(&path, "result"));
+}
+
+/// The record refuses a delete or an update of a result, so a VACUUM,
+/// which renumbers rowids only past a deleted row, keeps each `taught`
+/// row naming its result.
+#[test]
+fn a_vacuum_keeps_the_taught_rows_on_their_results() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record.sqlite");
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch(SCHEMA).unwrap();
+    quiet_run(&db, "a", "wa", 10);
+    db.execute("INSERT INTO dispatch (at_ms, id) VALUES (20, 'b')", [])
+        .unwrap();
+    insert(&db, &result("b", 30)).unwrap();
+    quiet_run(&db, "c", "wa", 40);
+    drop(db);
+    shut(open(&path));
+    let db = Connection::open(&path).unwrap();
+    let deleted = db.execute("DELETE FROM result WHERE id = 'b'", []);
+    let updated = db.execute("UPDATE result SET id = 'd' WHERE id = 'b'", []);
+    assert!(
+        deleted.is_err() && updated.is_err(),
+        "{deleted:?} {updated:?}"
+    );
+    db.execute_batch("VACUUM").unwrap();
+    drop(db);
+    assert_eq!(taught(&path), ["a", "c"]);
+}
+
+/// A record whose missing `taught` rows cannot be given (here a trigger
+/// refuses them) is still folded and written: those results untaught
+/// until a hub takes it again, nothing else lost.
+#[test]
+fn a_failed_migration_still_folds_and_records() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record.sqlite");
+    let db = Connection::open(&path).unwrap();
+    db.execute_batch(SCHEMA).unwrap();
+    db.execute_batch(TAUGHT).unwrap();
+    quiet_run(&db, "a", "wa", 10);
+    db.execute_batch(
+        "CREATE TRIGGER refuse BEFORE INSERT ON taught WHEN NEW.result = 1 \
+         BEGIN SELECT RAISE(ABORT, 'refused'); END",
+    )
+    .unwrap();
+    drop(db);
+    let opened = open(&path);
+    assert!(opened.history.len().0 > 0, "nothing folded");
+    let record = opened.record.clone().expect("written by this hub");
+    record.send_all(vec![result("b", 30), taught_row(true)]);
+    drop(record);
+    shut(opened);
+    assert_eq!(
+        (rows(&path, "result"), taught(&path)),
+        (2, vec!["b".to_owned()])
+    );
 }

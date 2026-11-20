@@ -19,6 +19,7 @@ use super::cancel;
 use super::losses::Dispatch;
 use super::metrics::Metrics;
 use super::naming::drv_name;
+use super::placement;
 use super::record::Rest;
 use super::state::{HubState, Job, Replay};
 use crate::errors::{Error, Result, err_msg};
@@ -77,6 +78,8 @@ pub(super) async fn run_job(
     stream_tmp_dir(&job.id, &job.tmp_dir_pack, out_tx).await?;
 
     let mut cancel_sent = false;
+    // Whether its run teaches speed: not if the worker says it resumed it.
+    let mut placed = job.placed;
     let given_up = state.given_up(&job.id);
     // The worker's heartbeats when it said it holds the build already.
     let mut resumed_after = None;
@@ -114,6 +117,7 @@ pub(super) async fn run_job(
             // restart). Its result arrives like any other.
             worker_message::Msg::Resumed(_) => {
                 dispatch.resumed = true;
+                placed = placement::Placed::default();
                 resumed_after = Some(state.heartbeats(session));
                 tracing::info!(id = job.id, "worker resumed an in-flight build");
             }
@@ -127,7 +131,10 @@ pub(super) async fn run_job(
             worker_message::Msg::Result(res) => {
                 if let Some(u) = &res.usage {
                     state.metrics.observe_usage(&job.req.system, u);
-                    let rest = Rest::of(job, worker);
+                    let rest = Rest {
+                        placed,
+                        ..Rest::of(job, worker)
+                    };
                     let out_path = rest.out_path.clone();
                     state
                         .placement

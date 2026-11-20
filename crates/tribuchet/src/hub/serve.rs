@@ -129,12 +129,22 @@ fn configure_auth(
     })
 }
 
+/// How often the hub, opening its record, asks systemd for more time
+/// (sd::extending_start).
+const EXTEND_EVERY: Duration = Duration::from_secs(10);
+
 pub fn run(cfg: HubConfig) -> Result<()> {
-    let rt = rt::runtime("trib-hub").map_err(err_ctx("creating the tokio runtime"))?;
-    rt.block_on(run_async(cfg))
+    run_extending(cfg, EXTEND_EVERY)
 }
 
-async fn run_async(cfg: HubConfig) -> Result<()> {
+/// The hub, asking for more start time every `period` while its record's
+/// open progresses.
+fn run_extending(cfg: HubConfig, period: Duration) -> Result<()> {
+    let rt = rt::runtime("trib-hub").map_err(err_ctx("creating the tokio runtime"))?;
+    rt.block_on(run_async(cfg, period))
+}
+
+async fn run_async(cfg: HubConfig, period: Duration) -> Result<()> {
     let socket = cfg.socket.as_path();
     let listen = cfg.listen.as_str();
     let config_dir = cfg.config_dir.as_path();
@@ -146,11 +156,17 @@ async fn run_async(cfg: HubConfig) -> Result<()> {
         chunks,
     ));
 
-    // The record is folded into the history before the hub serves.
+    // The record is folded into the history before the hub serves: a
+    // migration of it may outlast the start timeout, so extend it while
+    // it progresses.
     let path = cfg.placement.record.clone().unwrap_or_else(default_record);
-    let opened = tokio::task::spawn_blocking(move || record::open(&path))
-        .await
-        .map_err(err_ctx("opening the build record"))?;
+    let opened = sd::extending_start(
+        tokio::task::spawn_blocking(move || record::open(&path)),
+        &record::PROGRESS,
+        period,
+    )
+    .await
+    .map_err(err_ctx("opening the build record"))?;
     let writer = opened.install(&state);
 
     let (tls, peer_auth) = configure_auth(&cfg, config_dir)?;
@@ -263,4 +279,195 @@ fn open_chunk_cache(cfg: &HubConfig) -> Result<Arc<ChunkCache>> {
     let cache = ChunkCache::open(dir.clone(), cfg.chunk_cache_bytes)
         .map_err(io_ctx("opening chunk cache", &dir))?;
     Ok(Arc::new(cache))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::net::UnixDatagram;
+    use std::process::{Command, Stdio};
+    use std::time::Instant;
+    use std::{env, str};
+
+    use super::*;
+    use crate::config;
+
+    /// A hub, as `tribuchet hub` runs it but asking for more start time
+    /// every 100 ms, on the config TT_HUB_CONFIG names: the child of the
+    /// tests below.
+    #[test]
+    #[ignore = "run alone, in its own process, by the tests below"]
+    fn hub_alone() {
+        let path = env::var_os("TT_HUB_CONFIG").expect("TT_HUB_CONFIG");
+        let cfg = config::load(Path::new(&path)).unwrap();
+        run_extending(cfg, Duration::from_millis(100)).unwrap();
+    }
+
+    /// How a hub's notifications are read: until `enough` holds of them,
+    /// the hub exits, or `quiet` ends the wait.
+    enum Quiet {
+        /// Never: only `enough` or the hub's exit ends it.
+        Never,
+        /// After the hub has spent this much CPU since the last one, or
+        /// since it started: a hub working without asking. A freeze
+        /// spends none.
+        Cpu(Duration),
+        /// This long after the hub is first seen waiting in the open of
+        /// the FIFO at the record's path: a hang. A hub not seen there in
+        /// 30 s is given up on, which can only fail the test.
+        InOpen(Duration),
+    }
+
+    /// The hub's CPU time, user and system, from /proc.
+    fn cpu(pid: u32) -> Duration {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+        let fields: Vec<&str> = stat
+            .rsplit(')')
+            .next()
+            .unwrap_or("")
+            .split_whitespace()
+            .collect();
+        let tick = |i: usize| {
+            fields
+                .get(i)
+                .and_then(|f| f.parse::<u64>().ok())
+                .unwrap_or(0)
+        };
+        // utime and stime, fields 14 and 15, in clock ticks of 10 ms.
+        Duration::from_millis(10 * (tick(11) + tick(12)))
+    }
+
+    /// Whether a thread of the hub waits in the open of a FIFO for a
+    /// writer (the kernel's `wait_for_partner`). Nothing opens one: a
+    /// writer would let the hub read the FIFO as an empty record.
+    fn in_fifo_open(pid: u32) -> bool {
+        fs::read_dir(format!("/proc/{pid}/task")).is_ok_and(|tasks| {
+            tasks.flatten().any(|t| {
+                fs::read_to_string(t.path().join("wchan")).is_ok_and(|w| w == "wait_for_partner")
+            })
+        })
+    }
+
+    /// The notifications a hub sends as it starts on the record `make`
+    /// leaves at the path it is given, read as `quiet` says, and whether
+    /// whether it exited or still waits in the open of a FIFO. The socket's read timeout is only how often the hub
+    /// is looked at. The hub is killed after.
+    fn notifications(
+        make: impl FnOnce(&Path),
+        enough: impl Fn(&[String]) -> bool,
+        quiet: &Quiet,
+    ) -> (Vec<String>, bool, bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let at = |name: &str| dir.path().join(name).display().to_string();
+        let record = dir.path().join("record.sqlite");
+        make(&record);
+        let notify = UnixDatagram::bind(dir.path().join("notify")).unwrap();
+        notify
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let toml = format!(
+            "auth = \"tailscale\"\nsocket = \"{}\"\nlisten = \"127.0.0.1:0\"\n\
+             chunk-cache-dir = \"{}\"\n[placement]\nrecord = \"{}\"\n",
+            at("attach.sock"),
+            at("chunks"),
+            at("record.sqlite"),
+        );
+        fs::write(dir.path().join("hub.toml"), toml).unwrap();
+        let mut hub = Command::new(env::current_exe().unwrap())
+            .args(["--exact", "hub::serve::tests::hub_alone"])
+            .args(["--ignored", "--test-threads=1"])
+            .env("TT_HUB_CONFIG", at("hub.toml"))
+            .env("NOTIFY_SOCKET", at("notify"))
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let (mut seen, mut buf, mut exited) = (Vec::new(), [0; 256], false);
+        let (mut spent, mut held, start) = (Duration::ZERO, None::<Instant>, Instant::now());
+        while !enough(&seen) {
+            if let Quiet::InOpen(_) = quiet
+                && held.is_none()
+                && in_fifo_open(hub.id())
+            {
+                held = Some(Instant::now());
+            }
+            match notify.recv(&mut buf) {
+                Ok(n) => {
+                    seen.push(str::from_utf8(&buf[..n]).unwrap().to_owned());
+                    spent = cpu(hub.id());
+                }
+                // Gone, and every notification it sent read.
+                Err(_) if exited => break,
+                Err(_) => {
+                    exited = hub.try_wait().unwrap().is_some();
+                    let over = match (quiet, &held) {
+                        (Quiet::Cpu(q), _) => cpu(hub.id()) - spent >= *q,
+                        (Quiet::InOpen(q), Some(since)) => since.elapsed() >= *q,
+                        (Quiet::InOpen(_), None) => start.elapsed() >= Duration::from_secs(30),
+                        _ => false,
+                    };
+                    if over && !exited {
+                        break;
+                    }
+                }
+            }
+        }
+        let in_open = in_fifo_open(hub.id());
+        let _ = hub.kill();
+        let _ = hub.wait();
+        (seen, exited, in_open)
+    }
+
+    const EXTEND: &str = "EXTEND_TIMEOUT_USEC=300000\n";
+
+    /// A hub asks systemd to extend its start timeout as it opens its
+    /// record, before it says it is ready (or exits after, as where no
+    /// nixbld group exists).
+    #[test]
+    fn a_starting_hub_extends_its_start_timeout() {
+        let ready = |seen: &[String]| seen.iter().any(|m| m.contains("READY=1"));
+        let (seen, ..) = notifications(|_| {}, ready, &Quiet::Never);
+        assert!(seen.first().is_some_and(|m| m.contains(EXTEND)), "{seen:?}");
+    }
+
+    /// A hub whose record's open hangs (in the open of a FIFO no one
+    /// writes, as of a stuck filesystem) asks for more time once, at once,
+    /// and never again, still in it: systemd's start timeout kills it.
+    /// Absence is waited for, 2 s (20 of the hub's ticks) after the hub
+    /// is seen in the FIFO's open: a test frozen through them could pass
+    /// a hub that asks again, never fail one that does not.
+    #[test]
+    fn a_hung_open_is_not_extended() {
+        let fifo = |path: &Path| nix::unistd::mkfifo(path, nix::sys::stat::Mode::S_IRWXU).unwrap();
+        let two = |seen: &[String]| seen.len() > 1;
+        let wait = Quiet::InOpen(Duration::from_secs(2));
+        let (seen, exited, in_open) = notifications(fifo, two, &wait);
+        assert_eq!(
+            (seen, exited, in_open),
+            (vec![EXTEND.to_owned()], false, true)
+        );
+    }
+
+    /// A hub whose record's open works without end (a trigger counting
+    /// without bound on the one `taught` row the migration gives) asks
+    /// for more time again and again: three asks, or 2 s of its CPU with
+    /// no ask.
+    #[test]
+    fn a_long_open_that_progresses_is_extended() {
+        let endless = |path: &Path| {
+            let db = rusqlite::Connection::open(path).unwrap();
+            db.execute_batch(record::SCHEMA).unwrap();
+            db.execute_batch(record::TAUGHT).unwrap();
+            db.execute_batch(
+                "INSERT INTO result (at_ms, id, declared, exit_code, wall_ms, cpu_usec, \
+                 peak_memory_bytes, oom_killed, frozen_ms) VALUES (1, 'a', 0, 0, 1, 1, 1, 0, 0); \
+                 CREATE TRIGGER endless BEFORE INSERT ON taught BEGIN SELECT count(*) FROM \
+                 (WITH RECURSIVE c(x) AS (SELECT 1 UNION ALL SELECT x + 1 FROM c) \
+                 SELECT x FROM c); END;",
+            )
+            .unwrap();
+        };
+        let three = |seen: &[String]| seen.len() >= 3;
+        let (seen, ..) = notifications(endless, three, &Quiet::Cpu(Duration::from_secs(2)));
+        assert_eq!(seen, [EXTEND; 3]);
+    }
 }

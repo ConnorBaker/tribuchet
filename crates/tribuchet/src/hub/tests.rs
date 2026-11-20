@@ -1,7 +1,6 @@
 use super::*;
 use std::collections::HashSet;
-use std::fs;
-use std::io;
+use std::{fs, io};
 
 use hyper_util::rt::TokioIo;
 use tonic::transport::{Endpoint, Server, Uri};
@@ -195,6 +194,7 @@ pub(super) fn job(n: usize, replay: Arc<Replay>) -> Job {
         loss: None,
         deferred: None,
         expected: placement::Expected::prior(false),
+        placed: Default::default(),
     }
 }
 

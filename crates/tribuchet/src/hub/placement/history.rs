@@ -27,10 +27,15 @@
 //! Placement ranks by memory and cores only; the running seconds, the
 //! OOM kills and the level are logged at dispatch, and no replay has yet
 //! shown a ranking that weighs them doing better.
+//!
+//! A build's running seconds on a worker of speed factor 1 (speed.rs)
+//! are the median of each run's times its worker's factor; it is
+//! expected to run them over a worker's factor there (Expected::secs_on).
 
 use std::collections::{HashMap, VecDeque};
 use std::iter;
 
+use super::speed::Speed;
 use crate::proto::BuildUsage;
 
 /// Runs kept per key and prefix (a class keeps CLASS_WINDOW).
@@ -78,16 +83,25 @@ impl Level {
 }
 
 /// A build's expected demand, its running seconds where a run of its
-/// level succeeded, the level, and the OOM kills among its key's runs.
+/// level succeeded (the median as they ran, which the dispatch row
+/// records, and on a worker of speed factor 1), the level, and the OOM
+/// kills among its key's runs.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::hub) struct Expected {
     pub(in crate::hub) demand: Demand,
     pub(in crate::hub) secs: Option<f64>,
+    pub(in crate::hub) unit_secs: Option<f64>,
     pub(in crate::hub) level: Level,
     pub(in crate::hub) oom: u32,
 }
 
 impl Expected {
+    /// Its running seconds on a worker of speed factor `speed`
+    /// (History::speed), where a run of its level succeeded.
+    pub(in crate::hub) fn secs_on(&self, speed: f64) -> Option<f64> {
+        self.unit_secs.map(|s| s / speed)
+    }
+
     /// The guess with nothing learned: one core and 1 GiB, or for a
     /// build that declares big-parallel the median of the 33 such builds
     /// the hub ran on 2026-10-15..25, 17.8 cores and 38.5 GiB.
@@ -99,6 +113,7 @@ impl Expected {
                 memory: gib * GIB,
             },
             secs: None,
+            unit_secs: None,
             level: Level::Prior,
             oom: 0,
         }
@@ -106,19 +121,21 @@ impl Expected {
 }
 
 /// One run as the worker measured it: peak bytes, CPU and running
-/// milliseconds, and whether it succeeded.
+/// milliseconds, whether it succeeded, and its worker's index in Speed
+/// where the record names it.
 #[derive(Clone, Copy, Debug, PartialEq)]
-struct Run(u64, u64, u64, bool);
+struct Run(u64, u64, u64, bool, Option<u16>);
 
 impl Run {
     /// None where the worker measured nothing (it reports 0 then).
-    fn of(u: &BuildUsage, ok: bool) -> Option<Self> {
+    fn of(u: &BuildUsage, ok: bool, worker: Option<u16>) -> Option<Self> {
         let running = u.wall_ms.saturating_sub(u.frozen_ms);
         (u.peak_memory_bytes > 0).then_some(Self(
             u.peak_memory_bytes,
             u.cpu_usec / 1000,
             running,
             ok,
+            worker,
         ))
     }
 
@@ -128,7 +145,7 @@ impl Run {
     /// with no CPU time as NaN, negative on x86 and least full in a rank.
     #[allow(clippy::cast_precision_loss)]
     fn timed(self) -> Option<(f64, f64)> {
-        let Self(_, cpu, running, ok) = self;
+        let Self(_, cpu, running, ok, _) = self;
         (ok && running > 0).then(|| (cpu as f64 / running as f64, running as f64 / 1000.0))
     }
 }
@@ -164,31 +181,40 @@ impl Runs {
         self.oom = self.oom.saturating_add(u32::from(oom));
     }
 
-    /// Medians of cores and running seconds over the runs that
-    /// succeeded, if one did.
-    fn timing(&self) -> Option<(f64, f64)> {
-        let timed: Vec<(f64, f64)> = self.runs.iter().filter_map(|r| r.timed()).collect();
+    /// Medians over the runs that succeeded, if one did, of cores,
+    /// running seconds, and those times their worker's factor in `speed`.
+    fn timing(&self, speed: &Speed) -> Option<(f64, f64, f64)> {
+        let timed = |r: &Run| r.timed().map(|(c, s)| (c, s, s * speed.of(r.4)));
+        let timed: Vec<(f64, f64, f64)> = self.runs.iter().filter_map(timed).collect();
         let cores = median(timed.iter().map(|t| t.0).collect())?;
-        Some((cores, median(timed.iter().map(|t| t.1).collect())?))
+        let secs = median(timed.iter().map(|t| t.1).collect())?;
+        Some((cores, secs, median(timed.iter().map(|t| t.2).collect())?))
     }
 
     /// Peaks as `stat` sees them, cores and seconds; a level without a
     /// succeeded run takes `fallback`'s cores and no seconds.
     #[allow(clippy::cast_precision_loss)]
-    fn expected(&self, level: Level, peak: fn(&[u64]) -> u64, fallback: f64) -> Option<Expected> {
+    fn expected(
+        &self,
+        level: Level,
+        peak: fn(&[u64]) -> u64,
+        fallback: f64,
+        speed: &Speed,
+    ) -> Option<Expected> {
         let peaks: Vec<u64> = self.runs.iter().map(|r| r.0).collect();
         if peaks.is_empty() {
             return None;
         }
-        let (cores, secs) = self
-            .timing()
-            .map_or((fallback, None), |(c, s)| (c, Some(s)));
+        let (cores, secs, unit_secs) = self
+            .timing(speed)
+            .map_or((fallback, None, None), |(c, s, u)| (c, Some(s), Some(u)));
         Some(Expected {
             demand: Demand {
                 cores,
                 memory: peak(&peaks) as f64,
             },
             secs,
+            unit_secs,
             level,
             oom: self.oom,
         })
@@ -245,6 +271,11 @@ pub(in crate::hub) struct Build<'a> {
     pub(in crate::hub) declared: bool,
 }
 
+/// A run as a comparison of two histories reads it: peak, CPU ms,
+/// running ms, succeeded, its worker's name; or a speed factor, last.
+#[cfg(test)]
+pub(in crate::hub) type Entry = (u64, u64, u64, bool, Option<String>, f64);
+
 /// Entries are never dropped: the fold of the build record (record.rs).
 #[derive(Clone, Default)]
 pub(in crate::hub) struct History {
@@ -255,38 +286,66 @@ pub(in crate::hub) struct History {
     prefixes: HashMap<String, Runs>,
     /// "system/declared" (true or false) to the class's runs.
     classes: HashMap<String, Runs>,
+    /// The workers' speed factors, from the keys' runs that teach it.
+    speed: Speed,
+}
+
+/// Where a run ran, as the record names it: its worker, and whether it
+/// teaches speed (speed::taught).
+#[derive(Clone, Copy)]
+pub(in crate::hub) struct On<'a> {
+    pub(in crate::hub) worker: &'a str,
+    pub(in crate::hub) taught: bool,
 }
 
 impl History {
     pub(in crate::hub) fn expect(&self, b: &Build) -> Expected {
         let class = self.classes.get(&format!("{}/{}", b.system, b.declared));
         let prior = Expected::prior(b.declared);
+        let speed = &self.speed;
         let fallback = class
-            .and_then(Runs::timing)
+            .and_then(|c| c.timing(speed))
             .map_or(prior.demand.cores, |t| t.0);
         let pname = b.name.map(pname);
         let key = pname.and_then(|p| self.keys.get(&format!("{}/{p}", b.system)));
         let by_prefix =
             || prefixes(pname?).find_map(|pre| self.prefixes.get(&format!("{}/{pre}", b.system)));
-        key.and_then(|r| r.expected(Level::Key, largest, fallback))
-            .or_else(|| by_prefix()?.expected(Level::Prefix, largest, fallback))
-            .or_else(|| class?.expected(Level::Class, p90, fallback))
+        key.and_then(|r| r.expected(Level::Key, largest, fallback, speed))
+            .or_else(|| by_prefix()?.expected(Level::Prefix, largest, fallback, speed))
+            .or_else(|| class?.expected(Level::Class, p90, fallback, speed))
             .unwrap_or(prior)
+    }
+
+    /// Worker `name`'s speed factor (speed.rs): 1 for one never compared.
+    /// Read by the dispatch log line only, so far.
+    pub(in crate::hub) fn speed(&self, name: &str) -> f64 {
+        self.speed.factor(name)
+    }
+
+    /// Every worker's name, speed factor and comparisons' decayed weight.
+    pub(in crate::hub) fn speeds(&self) -> Vec<(String, f64, f64)> {
+        self.speed.factors()
     }
 
     /// Learn from a build's run: the worker's usage and its exit code. A
     /// failed run teaches nothing (in the replay, learning failed runs'
     /// peaks lengthened waits), an OOM-killed one its peak, as a lower
-    /// bound. Each delivered result is a run: on the journal above, one
-    /// build of 360,131 results was delivered twice, under two ids: the
-    /// watchdog restarted the hub, the build was submitted anew, and its
-    /// worker resumed it.
-    pub(in crate::hub) fn record(&mut self, b: &Build, exit_code: i32, u: &BuildUsage) {
+    /// bound. Each delivered result is a run (one build of 360,131 on the
+    /// journal above was delivered twice, after a watchdog restart). A run
+    /// `on` a named worker keeps it; a succeeded one taught teaches speed.
+    pub(in crate::hub) fn record(
+        &mut self,
+        b: &Build,
+        exit_code: i32,
+        u: &BuildUsage,
+        on: Option<On>,
+    ) {
         let oom = u.oom_killed;
         if exit_code != 0 && !oom {
             return;
         }
-        let Some(run) = Run::of(u, !oom) else {
+        let worker = on.map(|on| self.speed.worker(on.worker));
+        let Some(run) = Run::of(u, !oom, worker) else {
             return;
         };
         let class = format!("{}/{}", b.system, b.declared);
@@ -296,6 +355,10 @@ impl History {
             .push(run, oom, CLASS_WINDOW);
         if let Some(p) = b.name.map(pname) {
             let key = format!("{}/{p}", b.system);
+            let taught = (on.zip(worker)).filter(|(on, _)| on.taught);
+            if let (Some((_, w)), Some((_, secs))) = (taught, run.timed()) {
+                self.speed.learn(&key, w, secs);
+            }
             self.keys.entry(key).or_default().push(run, oom, WINDOW);
             for pre in iter::once(p).chain(prefixes(p)) {
                 self.prefixes
@@ -313,26 +376,35 @@ impl History {
     }
 
     /// Every entry's runs, oldest first, as (peak, CPU ms, running ms,
-    /// succeeded), and its OOM kills, by "keys/", "prefixes/" or
-    /// "classes/" and its name: what a comparison of two histories reads.
+    /// succeeded, worker), and its OOM kills, by "keys/", "prefixes/" or
+    /// "classes/" and its name, and every worker's speed factor and
+    /// comparisons as "speed/" and its name: what a comparison of two
+    /// histories reads.
     #[cfg(test)]
-    pub(in crate::hub) fn entries(&self) -> HashMap<String, (Vec<(u64, u64, u64, bool)>, u32)> {
+    pub(in crate::hub) fn entries(&self) -> HashMap<String, (Vec<Entry>, u32)> {
         let tables = [
             ("keys", &self.keys),
             ("prefixes", &self.prefixes),
             ("classes", &self.classes),
         ];
+        let name = |w: Option<u16>| w.map(|w| self.speed.name(w).to_owned());
         let runs = |r: &Runs| {
             r.runs
                 .iter()
-                .map(|&Run(p, c, t, ok)| (p, c, t, ok))
+                .map(|&Run(p, c, t, ok, w)| (p, c, t, ok, name(w), 0.0))
                 .collect()
         };
+        let speeds = self.speed.factors().into_iter().map(|(n, f, c)| {
+            let entry = (0, 0, 0, true, None, f);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            (format!("speed/{n}"), (vec![entry], c as u32))
+        });
         (tables.into_iter())
             .flat_map(|(t, m)| {
                 m.iter()
                     .map(move |(k, r)| (format!("{t}/{k}"), (runs(r), r.oom)))
             })
+            .chain(speeds)
             .collect()
     }
 }

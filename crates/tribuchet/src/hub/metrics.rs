@@ -507,6 +507,7 @@ mod tests {
             loss: None,
             deferred: None,
             expected: Expected::prior(false),
+            placed: Default::default(),
         };
         state.queue.lock().await.push_back(job("x86_64-linux"));
         state.queue.lock().await.push_back(job("x86_64-linux"));

@@ -264,6 +264,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 loss: None,
                 deferred: None,
                 expected: Expected::prior(false),
+                placed: Default::default(),
             };
             job.expected = self.state.placement.lock().unwrap().expect(&job);
             tracing::info!(

@@ -17,7 +17,7 @@ use super::Loss;
 use super::chunkcache::ChunkCache;
 use super::losses;
 use super::metrics::Metrics;
-use super::placement::{Expected, Placement};
+use super::placement::{Expected, Placed, Placement};
 use super::relay::{DAEMON_ANSWER, DaemonEvidence};
 use crate::config::NixConfig;
 use crate::fsutil::io_ctx;
@@ -81,10 +81,11 @@ pub(super) struct Job {
     /// When it was first passed over for another worker (placement::
     /// Rooms): none since it last entered the queue.
     pub(super) deferred: Option<Instant>,
-    /// What it is expected to use, from the history as it was submitted:
-    /// take_job's scan reads it under the queue lock, where it takes no
-    /// placement lock.
+    /// What it is expected to use, from the history as it was submitted
+    /// (take_job's scan reads it under the queue lock, not placement's).
     pub(super) expected: Expected,
+    /// Its latest dispatch, as its run's speed reads it (placement::dispatch).
+    pub(super) placed: Placed,
 }
 
 impl Job {

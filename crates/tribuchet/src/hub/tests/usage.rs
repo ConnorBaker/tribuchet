@@ -11,6 +11,9 @@ use super::rank::{declare, sized_worker};
 use super::*;
 use crate::proto::{BuildResult, BuildUsage};
 
+#[path = "usage/speed.rs"]
+mod speed;
+
 /// A build's usage line names the worker whose session ran it, its
 /// system, and the scratch path of the output it is known by (see
 /// `named_output`).

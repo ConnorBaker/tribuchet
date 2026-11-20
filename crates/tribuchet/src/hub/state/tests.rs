@@ -41,6 +41,7 @@ fn queued(system: &str, replay: Arc<Replay>) -> Job {
         loss: None,
         deferred: None,
         expected: Expected::prior(false),
+        placed: Default::default(),
     }
 }
 

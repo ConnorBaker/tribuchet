@@ -12,7 +12,7 @@ use rusqlite::types::Value;
 
 use super::Admission;
 use super::naming::drv_name;
-use super::record::{Recorder, Rest, Row, int, now_ms, result_row, val};
+use super::record::{Recorder, Rest, Row, int, now_ms, result_row, taught_row, val};
 use super::state::{HubState, Job};
 use crate::proto::{BuildUsage, Register};
 
@@ -20,12 +20,19 @@ use crate::proto::{BuildUsage, Register};
 mod history;
 #[path = "placement/rank.rs"]
 mod rank;
+#[path = "placement/speed.rs"]
+mod speed;
 #[cfg(test)]
 pub(super) use history::Level;
-pub(super) use history::{Build, Demand, Expected, History};
+pub(super) use history::{Build, Demand, Expected, History, On};
+#[cfg(test)]
+pub(super) use history::{Entry, pname};
 #[cfg(test)]
 pub(super) use rank::GRACE;
 pub(super) use rank::{Room, Rooms, Size};
+#[cfg(test)]
+pub(super) use speed::BOUND;
+pub(super) use speed::{Placed, QUIET, quiet};
 
 /// What history knows `job` by.
 pub(super) fn build_of(job: &Job) -> Build<'_> {
@@ -102,19 +109,34 @@ impl Placement {
         self.history.expect(&build_of(job))
     }
 
-    /// Learn from a finished run of `job`, and append it to the record,
-    /// in one step: the history stays the record's fold. The send never
-    /// waits.
-    pub(super) fn learn(&mut self, job: &Job, exit_code: i32, u: &BuildUsage, rest: Rest) {
-        let build = build_of(job);
-        self.history.record(&build, exit_code, u);
-        self.append(result_row(&build, exit_code, u, rest));
+    /// `job`'s expected running seconds on worker `worker` (by name):
+    /// its expectation's, on a worker of speed factor 1, over the
+    /// worker's factor (speed.rs). For a decider weighing finish times;
+    /// none reads it yet, but the dispatch log line.
+    pub(super) fn secs_on(&self, job: &Job, worker: &str) -> Option<f64> {
+        job.expected.secs_on(self.history.speed(worker))
     }
 
-    /// Hand `row` to the record's writer, if there is one.
-    pub(super) fn append(&self, row: Row) {
+    /// Learn from a finished run of `job`, and append it to the record,
+    /// in one step: the history stays the record's fold. The send never
+    /// waits. The run teaches speed as its dispatch decided (Placed),
+    /// which the record keeps beside its row, committed with it
+    /// (record::taught_row).
+    pub(super) fn learn(&mut self, job: &Job, exit_code: i32, u: &BuildUsage, rest: Rest) {
+        let build = build_of(job);
+        let taught = rest.placed.quiet;
+        let on = (rest.worker.as_deref()).map(|worker| On { worker, taught });
+        self.history.record(&build, exit_code, u, on);
+        self.append(vec![
+            result_row(&build, exit_code, u, rest),
+            taught_row(taught),
+        ]);
+    }
+
+    /// Hand `rows` to the record's writer as one, if there is one.
+    pub(super) fn append(&self, rows: Vec<Row>) {
         if let Some(record) = &self.record {
-            record.send(row);
+            record.send_all(rows);
         }
     }
 
@@ -156,24 +178,25 @@ fn room(id: u64, s: &Session) -> Room {
 }
 
 /// Count `job`'s expected demand against worker session `to` (id and
-/// name); log the dispatch, and append its record row, with the
-/// declaration that admitted it, its features, how many other workers
-/// that serve it have an idle agent, what it is expected to use, and the
-/// worker's size and expected load with it. Over-memory is only logged:
-/// nothing holds a build back for memory (DESIGN.md, Placement).
+/// name); log it and append its record row: the declaration that
+/// admitted it, its features, the other serving workers with an idle
+/// agent, what it is expected to use, and the worker's size and load
+/// with it (the line adds the worker's speed and the build's seconds
+/// there, which nothing reads yet). Over-memory is only logged
+/// (DESIGN.md, Placement). Whether its run teaches speed (Placed).
 pub(super) fn dispatch(
     state: &HubState,
     to: (u64, &str),
     job: &Job,
     resumed: bool,
     admission: &Mutex<Admission>,
-) {
+) -> Placed {
     let (capacity, assignments, free, sent) = {
         let a = admission.lock().unwrap();
         (a.capacity, a.assignments, a.free, a.sent)
     };
     let e = job.expected;
-    let (idle_elsewhere, room, record) = {
+    let (idle_elsewhere, room, record, secs_on, speed) = {
         let workers = state.worker_caps.lock().unwrap();
         let mut placement = state.placement.lock().unwrap();
         let room = placement.dispatched(to.0, job);
@@ -182,10 +205,16 @@ pub(super) fn dispatch(
         };
         let rooms = placement.rooms();
         let idle = rooms.iter().filter(|r| r.id != to.0 && r.idle > 0);
-        (idle.filter(serves).count(), room, placement.record.clone())
+        let idle = idle.filter(serves).count();
+        let (secs_on, speed) = (placement.secs_on(job, to.1), placement.history.speed(to.1));
+        (idle, room, placement.record.clone(), secs_on, speed)
     };
     let load = room.as_ref().map(|r| r.load);
     let memory = room.as_ref().and_then(|r| r.size.memory);
+    let placed = Placed {
+        quiet: !resumed
+            && (room.as_ref()).is_some_and(|r| quiet(r.load.cores, e.demand.cores, r.size.cores)),
+    };
     if let Some(record) = record {
         let values = vec![
             Value::Integer(now_ms()),
@@ -230,6 +259,8 @@ pub(super) fn dispatch(
         expect_mem = bytes(e.demand.memory),
         expect_cores = round3(e.demand.cores),
         expect_secs = e.secs.map(round3),
+        speed = round3(speed),
+        expect_secs_on = secs_on.map(round3),
         oom_runs = e.oom,
         load_mem = load.map(|l| bytes(l.memory)),
         load_cores = load.map(|l| round3(l.cores)),
@@ -248,6 +279,7 @@ pub(super) fn dispatch(
             "placed over predicted memory"
         );
     }
+    placed
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]

@@ -513,6 +513,7 @@ mod tests {
             loss: None,
             deferred: None,
             expected: Expected::prior(false),
+            placed: Default::default(),
         }
     }
 

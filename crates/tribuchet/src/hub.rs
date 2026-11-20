@@ -364,7 +364,7 @@ async fn worker_loop(
     let sess = Arc::new(WorkerSession::new(register.worker_name.clone()));
 
     'outer: loop {
-        let (job, resumed) = loop {
+        let (mut job, resumed) = loop {
             if out_tx.is_closed() || route.is_finished() {
                 break 'outer;
             }
@@ -391,7 +391,7 @@ async fn worker_loop(
             }
         };
         let to = (worker_id, register.worker_name.as_str());
-        placement::dispatch(&state, to, &job, resumed, &admission);
+        job.placed = placement::dispatch(&state, to, &job, resumed, &admission);
         // Tell the attach client where its build runs.
         job.replay
             .publish(attach_event::Event::Dispatched(
