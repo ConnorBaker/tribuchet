@@ -27,10 +27,13 @@ pub fn io_ctx(step: &'static str, path: &Path) -> impl FnOnce(io::Error) -> io::
     move |e| io::Error::new(e.kind(), format!("{step} {}: {e}", path.display()))
 }
 
-/// Replace `path` with `content` at once: written beside it, synced,
-/// renamed, and the rename synced with its directory.
+/// Replace `path` with `content` at once: written beside it (its name
+/// and .tmp, which no other file's write shares), synced, renamed, and the
+/// rename synced with its directory.
 pub fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
-    let tmp = path.with_extension("tmp");
+    let mut tmp = path.as_os_str().to_owned();
+    tmp.push(".tmp");
+    let tmp = PathBuf::from(tmp);
     {
         let mut f = fs::File::create(&tmp).map_err(io_ctx("creating", &tmp))?;
         f.write_all(content.as_bytes())?;
@@ -117,6 +120,21 @@ mod tests {
         for key in ["fil", "MemAvailable", "bad", "absent"] {
             assert_eq!(stat_field(text, key), None, "{key}");
         }
+    }
+
+    /// Writes to two files of one stem, as nix.conf and the farm could be,
+    /// never share a temporary file.
+    #[test]
+    fn an_atomic_write_leaves_another_files_temporary_alone() {
+        let t = tempfile::tempdir().unwrap();
+        let other = t.path().join("hub.tmp");
+        fs::write(&other, "the other write's").unwrap();
+        write_atomic(&t.path().join("hub.json"), "farm").unwrap();
+        assert_eq!(fs::read_to_string(&other).unwrap(), "the other write's");
+        assert_eq!(
+            fs::read_to_string(t.path().join("hub.json")).unwrap(),
+            "farm"
+        );
     }
 
     /// An atomic write syncs its directory after the rename, so the new

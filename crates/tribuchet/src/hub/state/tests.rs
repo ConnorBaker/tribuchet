@@ -155,6 +155,7 @@ fn a_stuck_nix_conf_write_holds_neither_its_caller_nor_worker_caps() {
         attach_program: "/attach".into(),
         oversubscribe_percent: 100,
         max_jobs_cap: 1,
+        farm_path: None,
     }));
     let state = Arc::new(state);
     let (tx, rx) = std_mpsc::channel();

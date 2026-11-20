@@ -13,7 +13,7 @@ use super::state::{WorkerCaps, unserved};
 use crate::fsutil::write_atomic;
 
 /// System -> the features a worker honors for it.
-type Systems = BTreeMap<String, BTreeSet<String>>;
+pub(super) type Systems = BTreeMap<String, BTreeSet<String>>;
 
 /// What a client whose Nix cannot build the request is told when no known
 /// worker builds `system` with `features` (L11).
@@ -118,6 +118,11 @@ impl Known {
             .flat_map(BTreeMap::keys)
             .map(String::as_str)
             .collect())
+    }
+
+    /// `f` of the known workers, by name, under this set's lock.
+    pub(super) fn with_workers<T>(&self, f: impl FnOnce(&BTreeMap<String, Systems>) -> T) -> T {
+        f(&self.workers.lock().unwrap())
     }
 
     /// Whether a known worker serves `system` with `features` (WorkerCaps::serves).

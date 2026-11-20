@@ -114,6 +114,7 @@ async fn heartbeat_updates_the_advertised_capacity() {
         attach_program: "/attach".into(),
         oversubscribe_percent: 100,
         max_jobs_cap: 256,
+        farm_path: None,
     }));
     let state = Arc::new(state);
     let caps = WorkerCaps {

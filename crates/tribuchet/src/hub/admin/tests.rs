@@ -1,3 +1,4 @@
+use std::fs;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -43,6 +44,35 @@ async fn retire(state: &Arc<HubState>, name: &str) -> Result<(), Code> {
     (svc.decommission(request).await)
         .map(|_| ())
         .map_err(|s| s.code())
+}
+
+/// The farm file follows a worker's life through the hub's own writer: at
+/// max-jobs x 200% while connected, 0 once it leaves, gone once retired.
+#[tokio::test]
+async fn the_farm_file_follows_a_worker_from_connect_to_decommission() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("farm.json");
+    let mut state = HubState::for_test(Duration::from_secs(30));
+    state.started_at = Instant::now().checked_sub(Duration::from_mins(1)).unwrap();
+    state.farm = Some(HubState::farm_writer(path.clone(), 200));
+    let state = Arc::new(state);
+    let file = || fs::read_to_string(&path).unwrap_or_default();
+    let written = async |want: &str| {
+        for _ in (0..1000).take_while(|_| file() != want) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        file()
+    };
+    let at = |jobs: u32| {
+        format!("{{\"machines\":[{{\"jobs\":{jobs},\"systems\":{{\"x86_64-linux\":[]}}}}]}}\n")
+    };
+    let w = register(&state, "w", &[]);
+    assert_eq!(written(&at(2)).await, at(2));
+    drop(w);
+    assert_eq!(written(&at(0)).await, at(0));
+    assert_eq!(retire(&state, "w").await, Ok(()));
+    let none = "{\"machines\":[]}\n";
+    assert_eq!(written(none).await, none);
 }
 
 /// `tribuchet decommission` reaches the hub's HubAdmin over its socket and

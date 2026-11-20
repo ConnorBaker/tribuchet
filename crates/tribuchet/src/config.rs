@@ -166,6 +166,13 @@ pub struct NixConfig {
     /// to local execution.
     #[serde(default = "default_max_jobs_cap")]
     pub max_jobs_cap: u32,
+    /// When set, the hub also writes its known workers as a farm, for a
+    /// nix-grpc-daemon that hands it builds to admit them by (its
+    /// --farm-file): per worker, the features it honors for each system,
+    /// and its max-jobs scaled by `oversubscribe_percent` (at least 1), 0
+    /// while it is not connected.
+    #[serde(default)]
+    pub farm_path: Option<PathBuf>,
 }
 
 fn default_oversubscribe_percent() -> u32 {
