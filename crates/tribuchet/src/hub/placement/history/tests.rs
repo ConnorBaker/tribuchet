@@ -19,6 +19,7 @@ fn usage(cores: u64, secs: u64, gib: u64) -> BuildUsage {
         peak_memory_bytes: gib << 30,
         oom_killed: false,
         frozen_ms: 0,
+        profile: None,
     }
 }
 

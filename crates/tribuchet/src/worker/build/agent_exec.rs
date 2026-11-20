@@ -276,7 +276,7 @@ pub(in crate::worker) fn supervise_agent(
         }
         thread::sleep(Duration::from_millis(200));
     }
-    let (code, usage) = match waiter.join() {
+    let (code, mut usage): (_, Usage) = match waiter.join() {
         Ok(Ok(n)) => (n.exit_code, n.into()),
         Ok(Err(e)) => {
             aborted.get_or_insert(format!("agent connection lost: {}", chain(&e)));
@@ -287,6 +287,7 @@ pub(in crate::worker) fn supervise_agent(
             (1, Usage::default())
         }
     };
+    usage.profile = tracking.profile().map(Into::into);
     tracing::info!(id = st.build_id, exit_code = code, aborted = ?aborted, "builder finished");
     let (exit_code, error, outputs) = if let Some(reason) = aborted {
         (1, reason, vec![])

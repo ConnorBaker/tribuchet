@@ -64,6 +64,8 @@ pub(super) fn available(roots: &Roots) -> Option<u64> {
 
 /// What a build pins, and the headroom of each capped cgroup above it.
 pub(super) struct Held {
+    /// memory.current, where it could be read.
+    pub(super) current: Option<u64>,
     pins: u64,
     caps: Vec<(PathBuf, u64)>,
 }
@@ -75,6 +77,7 @@ pub(super) struct Held {
 /// pin, or the room for it, is unknown.
 pub(super) fn held(dir: &Path, roots: &Roots) -> Option<Held> {
     let unknown = Held {
+        current: None,
         pins: u64::MAX,
         caps: Vec::new(),
     };
@@ -92,6 +95,7 @@ pub(super) fn held(dir: &Path, roots: &Roots) -> Option<Held> {
         return Some(unknown);
     }
     Some(Held {
+        current: Some(current),
         pins: current.saturating_sub(build.file),
         caps: above
             .iter()

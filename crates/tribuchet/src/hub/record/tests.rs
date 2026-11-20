@@ -276,3 +276,44 @@ fn a_record_not_ours_is_never_written() {
     }
     assert!(fs::read(&wal).unwrap() == wal_before, "the WAL written");
 }
+
+/// A record written before profiles (user_version 1, no profile table)
+/// is opened, folded and written as before, and gains the table: the
+/// deployed record needs no migration, and a hub that predates profiles
+/// still knows the record (known() names only result and dispatch).
+#[test]
+fn a_record_from_before_profiles_gains_their_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record.sqlite");
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(SCHEMA)
+        .unwrap();
+    {
+        let db = Connection::open(&path).unwrap();
+        insert(&db, &result("a", 1)).unwrap();
+    }
+    let opened = open(&path);
+    assert_eq!(opened.history.len().0, 1, "the old rows are folded");
+    let tables: i64 = reader(&path)
+        .query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'profile'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 1, "no profile table once opened");
+    let record = opened.record.clone().expect("written by this hub");
+    let p = BuildProfile {
+        running_usec: vec![200_000],
+        cpu_usec: vec![100_000],
+        runnable_milli: vec![500],
+        memory_bytes: vec![9],
+    };
+    record.send(profile_row(1, "a", &p));
+    committed(&record);
+    drop(record);
+    shut(opened);
+    assert_eq!(rows(&path, "profile"), 1);
+    assert!(known(&reader(&path)).unwrap());
+}

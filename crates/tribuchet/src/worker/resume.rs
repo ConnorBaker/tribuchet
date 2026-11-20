@@ -487,6 +487,7 @@ impl ResumeState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::proto::{BuildProfile, BuildUsage};
 
     mod lifecycle;
 
@@ -513,13 +514,22 @@ mod tests {
             peak_memory_bytes: 1 << 30,
             oom_killed: true,
             frozen_ms: 500,
+            profile: Some(
+                BuildProfile {
+                    running_usec: vec![200_000],
+                    cpu_usec: vec![450_000],
+                    runnable_milli: vec![2500],
+                    memory_bytes: vec![1 << 30],
+                }
+                .into(),
+            ),
         };
         let st = BuildState::Finished {
             dedupe_key: "k".into(),
             build_id: "b".into(),
             run: Some(RunId { epoch: 1, seq: 2 }),
             exit_code: 1,
-            usage: u,
+            usage: u.clone(),
             error: String::new(),
             outputs: vec![],
         };
@@ -527,6 +537,16 @@ mod tests {
         let Ok(BuildState::Finished { usage, run, .. }) = serde_json::from_str(&json) else {
             panic!("finished state did not round trip");
         };
-        assert_eq!((usage, run), (u, Some(RunId { epoch: 1, seq: 2 })));
+        assert_eq!((usage, run), (u.clone(), Some(RunId { epoch: 1, seq: 2 })));
+        // And the usage report carries the profile to the hub.
+        let sent = BuildUsage::from(u).profile.unwrap();
+        assert_eq!(
+            (sent.running_usec, sent.cpu_usec),
+            (vec![200_000], vec![450_000])
+        );
+        assert_eq!(
+            (sent.runnable_milli, sent.memory_bytes),
+            (vec![2500], vec![1 << 30])
+        );
     }
 }
