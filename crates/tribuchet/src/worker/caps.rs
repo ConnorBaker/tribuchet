@@ -9,7 +9,7 @@ use std::thread;
 use super::WorkerCtx;
 use crate::config::WorkerConfig;
 use crate::fsutil::stat_field;
-use crate::proto::{BuildAssignment, NETWORK, SystemCaps};
+use crate::proto::{BUILDER_RPC, BuildAssignment, NETWORK, SystemCaps};
 
 /// Nix's `uid-range` system feature: a full 65536-uid range with the
 /// builder as in-namespace root (containers, systemd-nspawn).
@@ -39,6 +39,10 @@ fn local_features(native: bool, opts: &WorkerConfig, ctx: &WorkerCtx) -> Vec<Str
         }
         if opts.spawn_agents == 0 {
             features.push("uid-range".to_owned());
+        }
+        // A producer's listener reaches only an attach on this host (DD12).
+        if ctx.handoffs.is_some() {
+            features.push(BUILDER_RPC.to_owned());
         }
     }
     features
@@ -177,6 +181,26 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         assert_eq!(advertised(true), [true, true]);
+        assert_eq!(advertised(false), [false, false]);
+    }
+
+    /// DT12 (DD12): builder-rpc-v0 is advertised where, and only where, the
+    /// worker serves the handoff socket, for its native system.
+    #[test]
+    fn builder_rpc_v0_only_with_the_handoff_socket() {
+        let opts: WorkerConfig =
+            toml::from_str("hub = \"x\"\nsystems = [\"x86_64-linux\", \"aarch64-linux\"]").unwrap();
+        let advertised = |handoff: bool| {
+            let dir = tempfile::tempdir().unwrap();
+            let mut ctx = WorkerCtx::for_test(dir.path(), 1, vec![]).unwrap();
+            let c = Arc::get_mut(&mut ctx).unwrap();
+            c.handoffs = handoff.then(Arc::default);
+            c.emulators.insert("aarch64-linux".into(), "/qemu".into());
+            (system_caps(&opts, &ctx).iter())
+                .map(|c| c.features.iter().any(|f| f == BUILDER_RPC))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(advertised(true), [cfg!(target_os = "linux"), false]);
         assert_eq!(advertised(false), [false, false]);
     }
 }

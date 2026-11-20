@@ -17,7 +17,7 @@ use sandbox_proto::agent::{SCRATCH_DIR_PARAM, StartRequest};
 
 use super::sampler::PeakSampler;
 use super::{Build, Error, Options, make_readable, spawn_plain, stage_scratch};
-use crate::errors::{Result, err_ctx};
+use crate::errors::{Result, err_ctx, err_msg};
 use crate::fsutil::force_remove_dir_all;
 use crate::sd;
 
@@ -32,6 +32,17 @@ impl Confinement {
     }
 
     pub(super) fn kill_block(&self) {}
+}
+
+/// Producers (builder-rpc-v0) run on Linux workers only (DD12).
+pub(super) fn rpc_listener(
+    _confinement: &Confinement,
+    _build_dir: &Path,
+    _name: &str,
+) -> Result<OwnedFd> {
+    Err(err_msg(
+        "producers (builder-rpc-v0) are built on Linux workers only",
+    ))
 }
 
 /// macOS has no cgroup freezer.

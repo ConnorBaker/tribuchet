@@ -60,6 +60,7 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>) {
                 usage,
                 error,
                 outputs,
+                handoff_expired,
             }) => {
                 tracing::info!(id = build_id, "adopted finished build awaiting delivery");
                 let fin = FinishedBuild {
@@ -69,6 +70,7 @@ pub(super) async fn adopt_builds(ctx: &Arc<WorkerCtx>) {
                     outputs,
                     dir: dir.clone(),
                     finished_at: Instant::now(),
+                    handoff_expired,
                 };
                 ResumableBuild::insert_run(ctx, dedupe_key, (build_id, run), dir, Some(fin));
             }
@@ -439,6 +441,9 @@ pub(super) enum BuildState {
         usage: Usage,
         error: String,
         outputs: Vec<PackedOutput>,
+        /// Absent from a state persisted before it.
+        #[serde(default)]
+        handoff_expired: bool,
     },
 }
 
@@ -466,6 +471,11 @@ pub(super) struct ResumeState {
     pub(super) max_silent_secs: u64,
     /// Socket of the agent that owns the build, for re-adoption.
     pub(super) agent_socket: PathBuf,
+    /// A producer's run (builder-rpc-v0), whose listener a restarted
+    /// worker finds handed off or kills it (handoff.rs); absent from a
+    /// state persisted before it.
+    #[serde(default)]
+    pub(super) producer: bool,
 }
 
 impl ResumeState {
@@ -532,12 +542,40 @@ mod tests {
             usage: u.clone(),
             error: String::new(),
             outputs: vec![],
+            handoff_expired: true,
         };
         let json = serde_json::to_string(&st).unwrap();
-        let Ok(BuildState::Finished { usage, run, .. }) = serde_json::from_str(&json) else {
+        let Ok(BuildState::Finished {
+            usage,
+            run,
+            handoff_expired,
+            ..
+        }) = serde_json::from_str(&json)
+        else {
             panic!("finished state did not round trip");
         };
         assert_eq!((usage, run), (u.clone(), Some(RunId { epoch: 1, seq: 2 })));
+        assert!(handoff_expired, "a handoff expiry did not round trip");
+        // persist_finished writes it, for a restarted worker to deliver.
+        let dir = tempfile::tempdir().unwrap();
+        let fin = FinishedBuild {
+            exit_code: 1,
+            usage: Usage::default(),
+            error: String::new(),
+            outputs: vec![],
+            dir: dir.path().to_owned(),
+            finished_at: Instant::now(),
+            handoff_expired: true,
+        };
+        persist_finished("k", ("b", None), &fin);
+        let json = fs::read_to_string(dir.path().join("state.json")).unwrap();
+        let Ok(BuildState::Finished {
+            handoff_expired, ..
+        }) = serde_json::from_str(&json)
+        else {
+            panic!("no finished state persisted");
+        };
+        assert!(handoff_expired, "persisted without its handoff expiry");
         // And the usage report carries the profile to the hub.
         let sent = BuildUsage::from(u).profile.unwrap();
         assert_eq!(

@@ -78,6 +78,7 @@ fn resume_state(id: &str, socket: PathBuf) -> ResumeState {
         deadline_unix: unix_now() + 3600,
         max_silent_secs: 0,
         agent_socket: socket,
+        producer: false,
     }
 }
 
@@ -512,6 +513,7 @@ fn persisted_running_state_round_trips() {
         deadline_unix: 7,
         max_silent_secs: 13,
         agent_socket: PathBuf::from("/run/agent.sock"),
+        producer: false,
     };
     st.persist(dir.path()).unwrap();
     let json = fs::read_to_string(dir.path().join("state.json")).unwrap();

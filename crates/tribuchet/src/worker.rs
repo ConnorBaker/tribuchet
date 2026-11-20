@@ -20,6 +20,7 @@ mod build;
 #[cfg(test)]
 pub(crate) use build::chunk_tests;
 mod caps;
+mod handoff;
 #[cfg(test)]
 mod held_tests;
 mod lease;
@@ -116,6 +117,8 @@ struct WorkerCtx {
     /// The daemon socket negotiation connects to: None, the default one.
     daemon_socket: Option<PathBuf>,
     chunks: Arc<ChunkStore>,
+    /// Producers' listeners, where this worker serves the handoff socket.
+    handoffs: Option<Arc<handoff::Handoffs>>,
 }
 
 impl WorkerCtx {
@@ -193,6 +196,9 @@ impl WorkerCtx {
             _ => {}
         }
         e.cancelled = false;
+        if let Some(h) = &self.handoffs {
+            h.retoken(&a.dedupe_key, &a.handoff_token);
+        }
         // No result goes to the new session before it is told it resumed.
         let n = NonZeroU64::MIN.saturating_add(ADOPTIONS.fetch_add(1, Ordering::Relaxed));
         (e.adoption, e.resuming) = (n.get(), true);
@@ -453,6 +459,7 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         agents: lease::Pool::new(opts.agent_sockets.clone(), opts.max_jobs.max(1) as usize),
         arbiter: arbiter::Arbiter::new(),
         daemon_socket: None,
+        handoffs: handoff::start(&opts)?,
     });
 
     // Ready once local setup is done, not once the hub answers: the
@@ -542,6 +549,7 @@ mod tests {
                 import_jobs: 1,
                 daemon_socket: None,
                 chunks: Arc::new(chunks),
+                handoffs: None,
             }))
         }
     }

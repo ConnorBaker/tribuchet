@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
+use super::validate::rpc_socket;
 use super::{ActiveBuild, pack_outputs, unix_now};
 use crate::errors::{Result, chain, err_ctx, err_msg};
 use crate::fsutil::io_ctx;
@@ -26,7 +27,7 @@ use crate::worker::caps::requires_uid_range;
 use crate::worker::lease::Lease;
 use crate::worker::logtail::tail_log;
 use crate::worker::resume::{FinishedBuild, ResumeState, Usage, persist_finished};
-use crate::worker::{WorkerCtx, agents, sandbox};
+use crate::worker::{WorkerCtx, agents, handoff, sandbox};
 
 impl ActiveBuild {
     /// Lease a per-uid agent and run the build there. The agent
@@ -81,6 +82,7 @@ impl ActiveBuild {
             outputs,
             dir: self.dir.clone(),
             finished_at: Instant::now(),
+            handoff_expired: false,
         }
     }
 
@@ -91,7 +93,27 @@ impl ActiveBuild {
         timeout: Duration,
     ) -> Result<FinishedBuild> {
         let a = &self.assignment;
-        let outputs: Vec<String> = a.outputs.values().cloned().collect();
+        // A producer gets a socket to its client's store (DD3), served
+        // only where a handoff socket hands its listener on (DD12), and
+        // packs no outputs: it submits them to the client itself (DD6).
+        let rpc_socket = rpc_socket(a)?;
+        let handoffs = self.ctx.handoffs.as_ref().filter(|_| rpc_socket.is_some());
+        if rpc_socket.is_some() && handoffs.is_none() {
+            // No attach can fetch its listener here: a loss, as an expiry.
+            return Ok(FinishedBuild {
+                exit_code: 1,
+                usage: Usage::default(),
+                error: handoff::NO_SUCH_RUN.into(),
+                outputs: vec![],
+                dir: self.dir.clone(),
+                finished_at: Instant::now(),
+                handoff_expired: true,
+            });
+        }
+        let outputs: Vec<String> = match rpc_socket {
+            Some(_) => Vec::new(),
+            None => a.outputs.values().cloned().collect(),
+        };
         // The agent-side confinement of the builder: a seatbelt
         // profile on macOS, the namespace sandbox spec on Linux. The
         // spec doubles as the packing/resume state, so the Linux one
@@ -112,7 +134,8 @@ impl ActiveBuild {
         );
         #[cfg(target_os = "linux")]
         let (profile, sandbox_json, mut spec) = {
-            let spec = self.build_spec()?;
+            let mut spec = self.build_spec()?;
+            spec.outputs.clone_from(&outputs);
             (String::new(), Some(serde_json::to_string(&spec)?), spec)
         };
         // Re-pack the staged tmp dir: the agent unpacks it into its own
@@ -131,6 +154,7 @@ impl ActiveBuild {
             sandbox_json,
             outputs: outputs.clone(),
             memory_max_bytes: self.ctx.build_memory_max_bytes,
+            rpc_socket: rpc_socket.clone(),
         };
         // The builder writes dir/build.log directly through this fd.
         let log_w = fs::OpenOptions::new()
@@ -146,8 +170,13 @@ impl ActiveBuild {
             || self.tell_waiting(),
         );
         self.ctx.wait_for_agent(&a.dedupe_key, false);
-        let (socket, build) = started?;
+        let (socket, mut build) = started?;
         drop(log_w);
+        if let Some(handoffs) = handoffs {
+            let listener = (build.listener.take())
+                .ok_or_else(|| err_msg("the agent sent no listener for the producer's socket"))?;
+            handoffs.ready(&a.dedupe_key, &a.handoff_token, listener, &self.dir);
+        }
         tracing::info!(
             id = a.build_id,
             pid = build.pid,
@@ -189,6 +218,7 @@ impl ActiveBuild {
             deadline_unix: deadline(started_unix, timeout, a.timeout_secs),
             max_silent_secs: a.max_silent_secs,
             agent_socket: socket.clone(),
+            producer: rpc_socket.is_some(),
         };
         if let Err(e) = resume.persist(&self.dir) {
             tracing::warn!(id = a.build_id, "persisting resume state: {}", chain(&e));
@@ -253,7 +283,7 @@ pub(in crate::worker) fn supervise_agent(
     // The exit notice arrives on the lease connection. Wait for it on
     // its own thread so the abort conditions keep being polled.
     let waiter = thread::spawn(move || build.wait_exit());
-    let mut aborted: Option<String> = None;
+    let (mut aborted, mut expired): (Option<String>, bool) = (None, false);
     let mut silence = Silence::default();
     while !waiter.is_finished() {
         if aborted.is_none() {
@@ -263,8 +293,12 @@ pub(in crate::worker) fn supervise_agent(
             let silent = silence.observe(&log_path, Instant::now(), frozen);
             let silent = (!max_silent.is_zero() && silent > max_silent)
                 .then(|| format!("build produced no output for {}s", max_silent.as_secs()));
-            if let Some(r) = ctx.abort_reason(&st.dedupe_key, &log_path, timed_out, silent) {
-                aborted = Some(r);
+            // A producer's listener that reached no attach (DD10).
+            let lapsed = st.producer
+                && (ctx.handoffs.as_ref()).is_none_or(|h| h.lapsed(&st.dedupe_key, &dir));
+            let reason = ctx.abort_reason(&st.dedupe_key, &log_path, timed_out, silent);
+            if let Some(r) = lapsed.then(|| handoff::EXPIRED.to_owned()).or(reason) {
+                (aborted, expired) = (Some(r), lapsed);
                 if let Err(e) = agents::kill(socket, &st.build_id) {
                     tracing::warn!(
                         id = st.build_id,
@@ -322,6 +356,7 @@ pub(in crate::worker) fn supervise_agent(
         outputs,
         dir,
         finished_at: Instant::now(),
+        handoff_expired: expired,
     };
     // On disk before the agent forgets the build: a worker stopped while
     // Cleanup runs leaves a result to deliver, not a running build no

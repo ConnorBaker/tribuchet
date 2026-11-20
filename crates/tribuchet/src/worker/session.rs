@@ -461,10 +461,17 @@ fn launch_build(build: ActiveBuild, mut lease: Lease, env: &LaunchEnv<'_>) {
     // gone by then misses it, as one gone just after it would.
     let (build_id, run) = (build.assignment.build_id.clone(), build.assignment.run);
     let started = msg(worker_message::Msg::Started(Started { build_id, run }));
+    // A producer's attach, told at Started, waits for its listener (DD10).
+    if let Some(h) = &ctx.handoffs {
+        h.expect(&key, &build.assignment.handoff_token, &build.dir);
+    }
     tokio::task::spawn_blocking(move || {
         let _ = out_tx.blocking_send(started);
         let fin = execute_to_finished(&build, &mut lease, &out_tx, build_timeout);
         drop((build, lease));
+        if let Some(h) = &ctx.handoffs {
+            h.forget(&key);
+        }
         record_finished(&ctx, &key, fin);
     });
 }

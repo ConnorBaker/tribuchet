@@ -255,6 +255,8 @@ pub(in crate::worker) struct FinishedBuild {
     /// Build dir holding the chunk frames, removed after delivery.
     pub(in crate::worker) dir: PathBuf,
     pub(in crate::worker) finished_at: Instant,
+    /// A producer's run killed as its listener reached no attach (DD10).
+    pub(in crate::worker) handoff_expired: bool,
 }
 
 /// One NAR chunk as a zstd frame at `off..off+len` in a frames file.
@@ -331,6 +333,7 @@ pub(in crate::worker) fn persist_finished(
         usage: fin.usage.clone(),
         error: fin.error.clone(),
         outputs: fin.outputs.clone(),
+        handoff_expired: fin.handoff_expired,
     };
     let tmp = fin.dir.join("state.json.tmp");
     if let Ok(json) = serde_json::to_vec(&state)
@@ -363,6 +366,7 @@ pub(in crate::worker) fn execute_to_finished(
                 outputs: vec![],
                 dir: build.dir.clone(),
                 finished_at: Instant::now(),
+                handoff_expired: false,
             }
         })
 }
@@ -378,7 +382,7 @@ fn deliver(
         build_id: build_id.into(),
         run,
         exit_code: fin.exit_code,
-        handoff_expired: false,
+        handoff_expired: fin.handoff_expired,
         usage: Some(fin.usage.clone().into()),
         outputs: fin
             .outputs
