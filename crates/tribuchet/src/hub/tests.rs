@@ -29,6 +29,7 @@ mod isolation;
 mod order;
 mod rank;
 mod reconnect;
+mod share;
 pub(crate) mod slow_link;
 use slow_link::spawn_session;
 mod unlisted;

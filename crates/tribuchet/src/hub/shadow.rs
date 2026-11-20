@@ -73,6 +73,9 @@ pub(super) struct Client {
     pub(super) id: sem::Client,
     /// Whether its own Nix can build the key (canLocal).
     pub(super) can_local: bool,
+    /// Who it is, as its request names it (BuildRequest.client): what a
+    /// fair share is kept for (placement/objective.rs).
+    pub(super) owner: Option<Arc<str>>,
 }
 
 impl Drop for Client {
@@ -88,6 +91,12 @@ impl Drop for Client {
 }
 
 impl Client {
+    /// It, named `owner` (BuildRequest.client).
+    pub(super) fn owned(mut self, owner: Option<&Arc<str>>) -> Self {
+        self.owner = owner.cloned();
+        self
+    }
+
     pub(super) fn untracked(can_local: bool) -> Self {
         let (shadow, key, id) = (None, 0, 0);
         Self {
@@ -95,6 +104,7 @@ impl Client {
             key,
             id,
             can_local,
+            owner: None,
         }
     }
 }

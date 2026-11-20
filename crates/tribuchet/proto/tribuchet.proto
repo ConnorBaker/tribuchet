@@ -385,6 +385,10 @@ message BuildRequest {
   // its build.json says, false with network; unset when Nix does not say.
   // Not part of the build.
   optional bool can_local = 14;
+  // Who asked for the build: the client a fair share is kept for
+  // (hub/placement/objective.rs). Its build.json's, else the nix-daemon
+  // connection running attach. Not part of the build.
+  optional string client = 15;
 }
 
 message AttachEvent {

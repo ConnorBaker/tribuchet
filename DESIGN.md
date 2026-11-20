@@ -431,9 +431,7 @@ put into the queue at its place by due as it is queued or requeued
 (`objective::enqueue`, a binary search), and the take scans from the
 front, as before. With every path equal the order is the one builds came
 in, FIFO. Each dispatch logs the build's `path` and `waited` beside
-`expect_below`. Fairness between clients is not in it: that needs each
-build's originating client, which nix-grpc-store, opening a nix-daemon
-connection per build, does not forward yet.
+`expect_below`.
 
 *Why not its own seconds.* With b's own seconds in its path, builds
 nothing follows go longest first, and in a class few workers serve the
@@ -466,6 +464,27 @@ worker admits is outside this: admission skips a build, it does not
 order it, and under memory admission a large build can be skipped while
 smaller ones behind it fill a worker; that wait is admission's.
 
+*Share, logged, not in the order.* Each dispatch logs, beside `path`,
+`waited` and `expect_below`, the build's `share`: the least, over the
+clients still waiting for it, of the client's dominant share (Dominant
+Resource Fairness, Ghodsi et al., NSDI 2011), the larger of the expected
+cores and the expected memory that the builds placed and not settled
+hold for the client, over the connected workers' cores and memory (a
+worker that reports none counts none). A placed build holds for the
+clients waiting for it as it is placed, each once, until it settles or
+its worker's session closes (kept as builds are placed and settle,
+`objective::Charges`, not recomputed). The clients no request names are
+one client, unknown to the hub, charged as one. Share is not in the
+order because nix-grpc-store, whose builder opens a nix-daemon
+connection per build, makes each build its own client, holding nothing
+while it waits: a client the hub names by its connection to the hub's
+daemon, holding a running build, would wait behind every one of them
+without bound. Share enters the order once nix-grpc-store forwards each
+build's originating client. nix-grpc-store also decides fairness itself
+(its scheduler places the next build for the client with the fewest
+placed, 37094d0); with the hub the one admission and placement owner,
+that layer's fairness should then pass builds through.
+
 *What the hub learns of dependants* (`hub/placement/downstream.rs`). Nix
 hands the hub a build only once its inputs exist, so a waiting build's
 dependants are never queued beside it. A run that succeeds lists its
@@ -494,6 +513,21 @@ not its final one), a producer this hub did not run (substituted, or
 built elsewhere), and one older than its key's last 8 runs. It is not in
 the record: a restarted hub learns it anew. It keeps the output paths of
 each key's last 8 runs and a chain of keys for each.
+
+*Who the client is.* A request carries `client`: build.json's, where the
+Nix writing it says, else the nix-daemon connection that runs attach (Nix
+starts an external builder from the process serving the connection that
+asked for the build), named by boot, pid and start time. A client of the
+hub's daemon is then a client here; the hub logs it as `owner` on the
+build's queueing line. No Nix writes build.json's field yet. It is not
+part of the build: a second client joins the first's build, and a
+worker's assignment does not carry it (it is built field by field from
+the request, this left out). The clients not named are one client,
+charged as one: an attach older than the field, during a mixed rollout,
+and an attach on a hub without /proc (darwin), or whose /proc hides its
+parent's (hidepid). An attach whose parent exited before it read it is
+named, by its new parent (init, or a subreaper): it is charged as that
+client, shared with every other such attach.
 
 *Keys are pnames.* `below` is kept per history key, as the history keeps
 seconds, so builds of one pname share it: every fetchFromGitHub source is

@@ -1,4 +1,4 @@
-//! The order a worker takes queued builds in.
+//! The order a worker takes queued builds in, and each client's share.
 //!
 //! A waiting build's urgency is its wait plus its path:
 //!
@@ -22,11 +22,27 @@
 //! came less than path(c) - path(b) seconds after b. No stream of later
 //! builds keeps b waiting: one arriving more than the longest path learned
 //! after b goes behind it. Memory admission skipping b is outside this.
+//!
+//! - **share**: the least, among the clients still waiting for a build, of
+//!   its dominant share (Dominant Resource Fairness, Ghodsi et al., NSDI
+//!   2011): the larger of the expected cores and the expected memory that
+//!   the builds placed and not settled hold for the client, over the
+//!   connected workers' cores and memory (a worker that reports none
+//!   counts none). A placed build holds for the clients waiting for it as
+//!   it was placed, each once, until it settles (`Charges`). The clients
+//!   no request names are one client, unknown, charged as one. Share is
+//!   logged at each dispatch and is not in the order: behind
+//!   nix-grpc-store, which opens a nix-daemon connection per build, each
+//!   build is its own client and holds nothing while it waits, so a client
+//!   the hub can name would wait behind every one of them, without bound.
+//!   It enters the order once nix-grpc-store forwards each build's
+//!   originating client.
 
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, HashMap, VecDeque};
+use std::sync::Arc;
 use std::time::Instant;
 
-use super::Expected;
+use super::{Demand, Expected};
 use crate::hub::state::Job;
 
 /// The expected seconds learned to follow it.
@@ -54,16 +70,79 @@ pub(in crate::hub) fn enqueue(queue: &mut VecDeque<Job>, job: Job) {
     queue.insert(at, job);
 }
 
+/// The clients a build holds for: each waiting for it, once.
+pub(in crate::hub) fn owners(job: &Job) -> Vec<Option<Arc<str>>> {
+    let all = job.replay.owners();
+    let one: BTreeSet<_> = all.into_iter().collect();
+    one.into_iter().collect()
+}
+
+/// What the builds placed and not settled hold for each client, and how
+/// many builds; None, the clients no request named, pooled.
+#[derive(Default)]
+pub(in crate::hub) struct Charges {
+    of: HashMap<Option<Arc<str>>, (Demand, usize)>,
+}
+
+impl Charges {
+    /// A build placed for `owners`, holding `d`.
+    pub(in crate::hub) fn charge(&mut self, owners: &[Option<Arc<str>>], d: Demand) {
+        for o in owners {
+            let (sum, n) = self.of.entry(o.clone()).or_default();
+            (*sum, *n) = (sum.plus(d), *n + 1);
+        }
+    }
+
+    /// That build settled.
+    pub(in crate::hub) fn release(&mut self, owners: &[Option<Arc<str>>], d: Demand) {
+        for o in owners {
+            if let Some((sum, n)) = self.of.get_mut(o) {
+                *n -= 1;
+                *sum = Demand {
+                    cores: sum.cores - d.cores,
+                    memory: sum.memory - d.memory,
+                };
+                if *n == 0 {
+                    self.of.remove(o);
+                }
+            }
+        }
+    }
+
+    /// How many clients the placed builds hold for: each with one left.
+    #[cfg(test)]
+    pub(in crate::hub) fn clients(&self) -> usize {
+        self.of.len()
+    }
+
+    /// The least dominant share, of the farm's `total`, among the clients
+    /// waiting for `job` now; 0 for none.
+    pub(in crate::hub) fn least(&self, job: &Job, total: Demand) -> f64 {
+        let frac = |x: f64, of: f64| if of > 0.0 { x / of } else { 0.0 };
+        let share = |o: &Option<Arc<str>>| {
+            self.of.get(o).map_or(0.0, |(d, _)| {
+                frac(d.cores, total.cores).max(frac(d.memory, total.memory))
+            })
+        };
+        (job.replay.owners().iter())
+            .map(share)
+            .reduce(f64::min)
+            .unwrap_or(0.0)
+    }
+}
+
 /// The terms of a waiting build, as a dispatch logs them (module doc).
 #[derive(Clone, Copy)]
 pub(in crate::hub) struct Priority {
+    pub(in crate::hub) share: f64,
     pub(in crate::hub) path: f64,
     pub(in crate::hub) wait: f64,
 }
 
 impl Priority {
-    pub(in crate::hub) fn of(job: &Job, now: Instant) -> Self {
+    pub(in crate::hub) fn of(job: &Job, share: f64, now: Instant) -> Self {
         Self {
+            share,
             path: path(&job.expected),
             wait: now.saturating_duration_since(job.queued_at).as_secs_f64(),
         }

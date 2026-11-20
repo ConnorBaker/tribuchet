@@ -278,7 +278,11 @@ fn seated(
         cores: load.0,
         memory: load.1 * GIB,
     };
-    session.committed.insert("in-flight".into(), in_flight);
+    let held = placement::Placed {
+        demand: in_flight,
+        owners: Vec::new(),
+    };
+    session.committed.insert("in-flight".into(), held);
     drop(placement);
     (guard, caps)
 }

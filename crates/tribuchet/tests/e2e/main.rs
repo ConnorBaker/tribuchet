@@ -23,6 +23,7 @@
 
 mod arbiter;
 mod canlocal;
+mod client;
 mod daemon;
 mod fod_ipv6;
 mod harness;

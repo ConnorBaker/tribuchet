@@ -21,6 +21,8 @@ pub(super) struct Listener {
     id: sem::Client,
     /// Where in the log it was declined (Defer), once it was.
     declined: Arc<OnceLock<usize>>,
+    /// Who it is (Client::owner).
+    owner: Option<Arc<str>>,
 }
 
 impl Listener {
@@ -36,6 +38,7 @@ impl Listener {
             can_local: client.can_local,
             id: client.id,
             declined: declined.clone(),
+            owner: client.owner.clone(),
         };
         (listener, declined)
     }
@@ -47,6 +50,14 @@ impl Listener {
 }
 
 impl Replay {
+    /// The clients still waiting, each by the name its request gave it;
+    /// None for one whose request named none.
+    pub(in crate::hub) fn owners(&self) -> Vec<Option<Arc<str>>> {
+        let clients = self.clients.lock().unwrap();
+        let waiting = clients.iter().filter(|l| l.waits());
+        waiting.map(|l| l.owner.clone()).collect()
+    }
+
     /// Whether each client still waiting can build the key itself.
     pub(in crate::hub) fn can_local(&self) -> Vec<bool> {
         let clients = self.clients.lock().unwrap();

@@ -29,7 +29,7 @@ pub(super) use downstream::Downstream;
 #[cfg(test)]
 pub(super) use history::Level;
 pub(super) use history::{Build, Demand, Expected, History};
-use objective::Priority;
+use objective::{Charges, Priority};
 #[cfg(test)]
 pub(super) use rank::GRACE;
 pub(super) use rank::{Room, Rooms, Size};
@@ -70,13 +70,20 @@ pub(super) fn size_of(register: &Register) -> Size {
     }
 }
 
+/// A build handed to a session and not yet settled: what it is expected
+/// to use, and the clients it holds a share for, those waiting for it as
+/// it was placed (objective.rs).
+pub(super) struct Placed {
+    pub(super) demand: Demand,
+    pub(super) owners: Vec<Option<Arc<str>>>,
+}
+
 /// A worker session as placement sees it.
 pub(super) struct Session {
     pub(super) admission: Arc<Mutex<Admission>>,
     pub(super) size: Size,
-    /// What the builds handed to it and not yet settled are expected to
-    /// use, by build id.
-    pub(super) committed: HashMap<String, Demand>,
+    /// The builds handed to it and not yet settled, by build id.
+    pub(super) committed: HashMap<String, Placed>,
     /// The builds, by id, that placement left elsewhere or to the asker
     /// only for the load of this session's clientless builds (Rooms's
     /// wants) since the clientless decider last read them.
@@ -90,7 +97,7 @@ pub(super) struct Session {
 
 impl Session {
     pub(super) fn load(&self) -> Demand {
-        (self.committed.values()).fold(Demand::default(), |sum, d| sum.plus(*d))
+        (self.committed.values()).fold(Demand::default(), |sum, h| sum.plus(h.demand))
     }
 }
 
@@ -107,6 +114,17 @@ pub(super) struct Placement {
     /// The session taking no new build until it is empty, for a lost key
     /// waiting to run alone (D4, state/take.rs).
     pub(super) drain: Option<u64>,
+    /// What the placed builds hold for each client.
+    pub(super) charges: Charges,
+}
+
+/// What a build placed on `s` holds of the farm: a worker that reports no
+/// memory counts none, in the total or a share.
+fn counted(s: &Session, d: Demand) -> Demand {
+    Demand {
+        memory: s.size.memory.map_or(0.0, |_| d.memory),
+        ..d
+    }
 }
 
 impl Placement {
@@ -124,7 +142,11 @@ impl Placement {
     }
 
     pub(super) fn close(&mut self, id: u64) {
-        self.sessions.remove(&id);
+        if let Some(s) = self.sessions.remove(&id) {
+            for p in s.committed.values() {
+                self.charges.release(&p.owners, counted(&s, p.demand));
+            }
+        }
         if self.drain == Some(id) {
             self.drain = None;
         }
@@ -136,6 +158,18 @@ impl Placement {
             below,
             ..self.history.expect(&build_of(job))
         }
+    }
+
+    /// The least dominant share of the farm among the clients waiting for
+    /// `job` (objective.rs).
+    pub(super) fn share(&self, job: &Job) -> f64 {
+        let total = (self.sessions.values()).fold(Demand::default(), |t, s| {
+            t.plus(Demand {
+                cores: s.size.cores,
+                memory: s.size.memory.unwrap_or(0.0),
+            })
+        });
+        self.charges.least(job, total)
     }
 
     /// Learn from a finished run of `job`, and append it to the record,
@@ -167,7 +201,12 @@ impl Placement {
     /// demand counts there until it settles. The session's room with it.
     pub(super) fn dispatched(&mut self, session: u64, job: &Job, alone: bool) -> Option<Room> {
         let s = self.sessions.get_mut(&session)?;
-        s.committed.insert(job.id.clone(), job.expected.demand);
+        let (demand, owners) = (job.expected.demand, objective::owners(job));
+        self.charges.charge(&owners, counted(s, demand));
+        // A build is settled before it is placed again (hub.rs,
+        // supervise_job), so it replaces none.
+        s.committed
+            .insert(job.id.clone(), Placed { demand, owners });
         if alone {
             s.alone = Some(job.id.clone());
         }
@@ -177,7 +216,9 @@ impl Placement {
     /// The build left its worker: finished, failed, requeued or given up.
     pub(super) fn settled(&mut self, session: u64, build_id: &str) {
         if let Some(s) = self.sessions.get_mut(&session) {
-            s.committed.remove(build_id);
+            if let Some(p) = s.committed.remove(build_id) {
+                self.charges.release(&p.owners, counted(s, p.demand));
+            }
             if s.alone.as_deref() == Some(build_id) {
                 s.alone = None;
             }
@@ -214,7 +255,7 @@ impl Placement {
         let rooms = self.sessions.iter().map(|(id, s)| {
             let theirs = s.committed.iter().filter(|(b, _)| clientless.contains(*b));
             Room {
-                clientless: theirs.fold(Demand::default(), |sum, (_, d)| sum.plus(*d)),
+                clientless: theirs.fold(Demand::default(), |sum, (_, h)| sum.plus(h.demand)),
                 ..room(*id, s)
             }
         });
@@ -250,17 +291,22 @@ pub(super) fn dispatch(
         (a.capacity, a.assignments, a.free, a.sent)
     };
     let e = job.expected;
-    let p = Priority::of(job, Instant::now());
-    let (idle_elsewhere, room, record) = {
+    let (idle_elsewhere, room, record, p) = {
         let workers = state.worker_caps.lock().unwrap();
         let mut placement = state.placement.lock().unwrap();
+        let p = Priority::of(job, placement.share(job), Instant::now());
         let room = placement.dispatched(to.0, job, state.lost.has(&job.key));
         let serves = |r: &&Room| {
             (workers.get(&r.id)).is_some_and(|c| c.serves(&job.req.system, &job.features))
         };
         let rooms = placement.rooms();
         let idle = rooms.iter().filter(|r| r.id != to.0 && r.idle > 0);
-        (idle.filter(serves).count(), room, placement.record.clone())
+        (
+            idle.filter(serves).count(),
+            room,
+            placement.record.clone(),
+            p,
+        )
     };
     let load = room.as_ref().map(|r| r.load);
     let memory = room.as_ref().and_then(|r| r.size.memory);
@@ -309,6 +355,7 @@ pub(super) fn dispatch(
         expect_cores = round3(e.demand.cores),
         expect_secs = e.secs.map(round3),
         expect_below = round3(e.below),
+        share = round3(p.share),
         path = round3(p.path),
         waited = round3(p.wait),
         oom_runs = e.oom,

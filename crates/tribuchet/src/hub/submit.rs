@@ -111,12 +111,13 @@ async fn read_submission(
 pub(super) fn dedupe_key(req: &BuildRequest, tmp_dir_pack: &[u8]) -> String {
     // The build, not its client's limits: a client asking other limits joins
     // the build in flight, which keeps those of the request that dispatched
-    // it, as Nix's own path locks do. Zero fields are not encoded, so keys
-    // are those from before the limits were sent.
+    // it, as Nix's own path locks do; and a client of another name. Zero
+    // fields are not encoded, so keys are those from before these were sent.
     let req = BuildRequest {
         timeout_secs: 0,
         max_silent_secs: 0,
         can_local: None,
+        client: None,
         ..req.clone()
     };
     let mut h = Sha256::new();
@@ -233,6 +234,8 @@ impl attach_hub_server::AttachHub for AttachSvc {
         }
 
         let paths: Vec<String> = req.outputs.values().cloned().collect();
+        let owner: Option<Arc<str>> = req.client.as_deref().map(Arc::from);
+        let asks = |sys| (self.state.shadow.submit(&key, sys, can_local)).owned(owner.as_ref());
         let rx = loop {
             // Registered before the checks so a release in between
             // is not missed.
@@ -252,7 +255,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
             if let Some(replay) = existing {
                 let sys = (req.system.as_str(), features.as_slice());
                 let client = || {
-                    let client = self.state.shadow.submit(&key, sys, can_local);
+                    let client = asks(sys);
                     tracing::info!(key, client = client.id, "deduplicating build submission");
                     client
                 };
@@ -279,7 +282,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 continue;
             };
             let sys = (req.system.as_str(), features.as_slice());
-            let client = self.state.shadow.submit(&key, sys, can_local);
+            let client = asks(sys);
             let first = client.id;
             let rx = replay.subscribe_as(client).await;
             let mut job = Job {
@@ -304,6 +307,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 client = first,
                 system = job.req.system,
                 drv = drv_name(&job.req).unwrap_or_default(),
+                owner = job.req.client.as_deref().unwrap_or_default(),
                 "queueing build"
             );
             Metrics::inc(&self.state.metrics.submitted);
@@ -405,6 +409,7 @@ mod tests {
             timeout_secs: 600,
             max_silent_secs: 60,
             can_local: Some(true),
+            client: Some("boot/1/2".into()),
             ..base_request()
         };
         assert_eq!(a, dedupe_key(&req, b""));
