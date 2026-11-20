@@ -1,8 +1,9 @@
 # Worker and agent units shared by the NixOS module and the flakelet.
 # The worker runs unprivileged and leases every build to a per-uid,
 # socket-activated agent, which owns the builder process and its user
-# namespace, so builds survive worker restarts. Users are DynamicUser:
-# a host that defines tribuchet / tribuchet-agent-N statically wins.
+# namespace, so builds survive worker restarts. The worker is DynamicUser,
+# each agent a userdb record its generator writes (nss-systemd): a host
+# that defines tribuchet / tribuchet-agent-N statically wins.
 {
   pkgs,
   lib,
@@ -18,7 +19,8 @@
 }:
 let
   auto = agents == "auto";
-  agentIds = map toString (lib.range 1 agents);
+  # agent i's user and group, a userdb record the generator writes
+  agentUser = "tribuchet-agent-";
   agentSocket = i: "${agentUnit}${i}.socket";
   stateDir = "/var/lib/tribuchet/a%i";
   # ExecStart cannot do arithmetic or resolve the worker's uid
@@ -49,20 +51,28 @@ let
       done
     exit 0
   '';
+  # The agents' users are userdb records: without nss-systemd no agent
+  # could start. Refuse to start the worker instead, saying why.
+  checkAgentUser = pkgs.writeShellScript "${workerUnit}-check-agent-user" ''
+    for db in passwd group; do
+      ${lib.getExe' pkgs.getent "getent"} "$db" ${agentUser}1 >/dev/null || {
+        echo "agent user ${agentUser}1 not in $db: the agents' users are systemd userdb records in /run/userdb, which resolve only on systemd 249 or later with systemd (nss-systemd) on the $db line of /etc/nsswitch.conf" >&2
+        exit 1
+      }
+    done
+  '';
 in
 {
   # Not under a RuntimeDirectory: systemd creates the socket parents and
   # nothing removes them while agents keep running across worker stops.
   agentSocketsDir = "/run/tribuchet/agents";
 
-  generators = lib.optionalAttrs auto {
-    agents = pkgs.writeShellScript "tribuchet-agents" ''
-      exec ${lib.getExe' package "tribuchet"} agent-generator \
-        --worker-unit ${workerUnit}.service --template ${agentSocket ""} "$@"
-    '';
-  };
-
-  agentInstances = lib.optionals (!auto) agentIds;
+  generators.agents = pkgs.writeShellScript "tribuchet-agents" ''
+    exec ${lib.getExe' package "tribuchet"} agent-generator \
+      --worker-unit ${workerUnit}.service --template ${agentSocket ""} \
+      ${lib.optionalString (!auto) "--count ${toString agents}"} \
+      --user-prefix ${agentUser} --uid-base ${toString agentUidBase} "$@"
+  '';
 
   # The socket mode is open because the agent itself only accepts
   # connections from the worker uid.
@@ -85,17 +95,24 @@ in
     restartIfChanged = false;
     serviceConfig = {
       ExecStart = "${agentStart} %i";
-      DynamicUser = true;
-      User = "tribuchet-agent-%i";
-      # Not StateDirectory: DynamicUser would move it below the 0700
-      # /var/lib/private, out of reach for the worker and the uid block.
+      # Not DynamicUser: it forces RestrictSUIDSGID, whose filter
+      # narrows the builds' system calls below Nix's (openat2 ENOSYS).
+      # What else it implied stays, written out.
+      User = "${agentUser}%i";
+      # true, not DynamicUser's "disconnected": systemd before 257
+      # ignores that value and leaves /tmp shared
+      PrivateTmp = true;
+      RemoveIPC = true;
+      ProtectSystem = "strict";
+      ProtectHome = "read-only";
+      NoNewPrivileges = true;
+      # The worker and the uid block reach into the state dir.
       # Traverse-only: the per-build scratch dirs are world-writable for
       # the block, but their names are random.
-      ExecStartPre = [
-        # scratch may belong to a previous DynamicUser uid
-        "+${pkgs.coreutils}/bin/rm -rf ${stateDir}/scratch"
-        "+${pkgs.coreutils}/bin/install -d -m 0711 -o tribuchet-agent-%i -g tribuchet-agent-%i ${stateDir}"
-      ];
+      StateDirectory = "tribuchet/a%i";
+      StateDirectoryMode = "0711";
+      # scratch a killed agent left
+      ExecStartPre = "+${pkgs.coreutils}/bin/rm -rf ${stateDir}/scratch";
       ReadWritePaths = "/var/lib/tribuchet";
       # Writing the uid/gid maps of the agent's user namespace needs
       # CAP_SETUID/CAP_SETGID over the uid block, dropped right after.
@@ -130,14 +147,15 @@ in
   workerServiceConfig = {
     description = "tribuchet build worker";
     wantedBy = [ "multi-user.target" ];
-    # the agent sockets must exist before the worker leases builds
-    wants = lib.optionals (!auto) (map agentSocket agentIds);
-    after = lib.optionals (!auto) (map agentSocket agentIds);
+    # checkAgentUser needs user lookups up, NixOS's nscd included
+    # (systemd.special(7))
+    after = [ "nss-user-lookup.target" ];
     serviceConfig = {
       Type = "notify";
       DynamicUser = true;
       User = "tribuchet";
       WatchdogSec = "30";
+      ExecStartPre = checkAgentUser;
       ExecStart = "${lib.getExe' package "tribuchet"} worker --config ${workerToml}";
       # Each agent thaws its build when the worker's lease on it ends, as
       # the worker exits however it ended; this thaws, as root, what an

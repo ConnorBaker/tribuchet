@@ -196,6 +196,7 @@
             protobuf
             (treefmtFor pkgs).config.build.wrapper
           ];
+          buildInputs = pkgs.lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.libseccomp;
           PROTOC = "${pkgs.protobuf}/bin/protoc";
           RUSTFLAGS = "--cfg tokio_unstable";
         };

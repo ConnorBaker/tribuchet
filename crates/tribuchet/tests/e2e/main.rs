@@ -31,6 +31,7 @@ mod history;
 mod oom;
 mod pairs;
 mod spread;
+mod syscalls;
 
 use std::time::Instant;
 

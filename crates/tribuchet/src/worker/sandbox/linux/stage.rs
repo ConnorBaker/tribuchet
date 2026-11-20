@@ -36,7 +36,9 @@ use std::process::exit;
 use std::{env, mem, ptr};
 
 use super::super::{SandboxSpec, binfmt};
-use super::{create_mount_points, exit_status_file, net_config, setup_error_file, write_skeleton};
+use super::{
+    create_mount_points, exit_status_file, net_config, seccomp, setup_error_file, write_skeleton,
+};
 
 use crate::fsutil::io_ctx;
 
@@ -400,7 +402,8 @@ fn setup(p: &SetupParams) -> io::Result<()> {
         fs::write("/proc/self/uid_map", "1000 0 1").map_err(ioerr("nested uid_map"))?;
         fs::write("/proc/self/gid_map", "100 0 1").map_err(ioerr("nested gid_map"))?;
     }
-    Ok(())
+    // Nix's system-call filter, under the no_new_privs set above
+    seccomp::load()
 }
 
 /// Bind the sandbox root over itself, populate it with input/device

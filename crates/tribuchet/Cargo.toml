@@ -48,6 +48,8 @@ sd-notify = "0.5.0"
 [target.'cfg(target_os = "linux")'.dependencies]
 # User-mode NAT datapath for fixed-output build network isolation.
 presto-pasta.workspace = true
+# Nix's build-sandbox system-call filter, through the library Nix uses.
+libseccomp.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # getpeereid on the agent socket needs nix's socket module.

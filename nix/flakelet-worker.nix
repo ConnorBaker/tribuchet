@@ -49,9 +49,7 @@
     in
     {
       inherit (units) generators;
-      sockets."agent@" = units.agentSocketConfig // {
-        instances = units.agentInstances;
-      };
+      sockets."agent@" = units.agentSocketConfig;
       services."agent@" = units.agentServiceConfig;
       services.${name} = units.workerServiceConfig;
 
