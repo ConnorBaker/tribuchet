@@ -33,13 +33,11 @@ use std::env;
 use std::error;
 use std::fs;
 use std::io::{self, IsTerminal};
-use std::num::NonZero;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 #[cfg(test)]
 use std::slice;
-use std::thread;
 
 use clap::{Parser, Subcommand};
 use errors::{Error, err_ctx, err_msg};
@@ -111,7 +109,7 @@ enum Command {
         #[arg(long)]
         dedicated_uid: bool,
     },
-    /// systemd generator: want one agent socket per CPU.
+    /// systemd generator: want one agent socket per CPU, and a spare.
     AgentGenerator {
         /// Unit the sockets are ordered before and wanted by, e.g. tribuchet-worker.service.
         #[arg(long)]
@@ -119,7 +117,7 @@ enum Command {
         /// Socket template, e.g. tribuchet-agent@.socket.
         #[arg(long)]
         template: String,
-        /// Exactly this many agents instead of one per CPU.
+        /// Exactly this many agents instead of one per CPU and a spare.
         #[arg(long)]
         count: Option<usize>,
         /// Agent i's user and group is <user-prefix>i ...
@@ -207,8 +205,7 @@ fn run() -> Result<(), Error> {
             uid_base,
             dirs,
         } => {
-            let n =
-                count.unwrap_or_else(|| thread::available_parallelism().map_or(1, NonZero::get));
+            let n = count.unwrap_or_else(config::auto_agents);
             agent_units_and_users(
                 &worker_unit,
                 &template,
