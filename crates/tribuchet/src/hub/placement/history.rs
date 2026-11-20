@@ -34,7 +34,7 @@ use std::iter;
 use crate::proto::BuildUsage;
 
 /// Runs kept per key and prefix (a class keeps CLASS_WINDOW).
-const WINDOW: usize = 8;
+pub(super) const WINDOW: usize = 8;
 /// Runs kept per class, the guess for a key with no run and no prefix:
 /// its peak is their 90th percentile, a wider sample's tail; with 10 runs
 /// or fewer, their largest.
@@ -78,13 +78,15 @@ impl Level {
 }
 
 /// A build's expected demand, its running seconds where a run of its
-/// level succeeded, the level, and the OOM kills among its key's runs.
+/// level succeeded, the level, the OOM kills among its key's runs, and the
+/// running seconds learned to follow it (placement/downstream.rs).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::hub) struct Expected {
     pub(in crate::hub) demand: Demand,
     pub(in crate::hub) secs: Option<f64>,
     pub(in crate::hub) level: Level,
     pub(in crate::hub) oom: u32,
+    pub(in crate::hub) below: f64,
 }
 
 impl Expected {
@@ -101,6 +103,7 @@ impl Expected {
             secs: None,
             level: Level::Prior,
             oom: 0,
+            below: 0.0,
         }
     }
 }
@@ -191,6 +194,7 @@ impl Runs {
             secs,
             level,
             oom: self.oom,
+            below: 0.0,
         })
     }
 }
@@ -245,6 +249,11 @@ pub(in crate::hub) struct Build<'a> {
     pub(in crate::hub) declared: bool,
 }
 
+/// The key of a build named `name` for `system`: its system and pname.
+pub(in crate::hub) fn key(system: &str, name: &str) -> String {
+    format!("{system}/{}", pname(name))
+}
+
 /// Entries are never dropped: the fold of the build record (record.rs).
 #[derive(Clone, Default)]
 pub(in crate::hub) struct History {
@@ -265,10 +274,11 @@ impl History {
             .and_then(Runs::timing)
             .map_or(prior.demand.cores, |t| t.0);
         let pname = b.name.map(pname);
-        let key = pname.and_then(|p| self.keys.get(&format!("{}/{p}", b.system)));
+        let of_key = b.name.and_then(|n| self.keys.get(&key(b.system, n)));
         let by_prefix =
             || prefixes(pname?).find_map(|pre| self.prefixes.get(&format!("{}/{pre}", b.system)));
-        key.and_then(|r| r.expected(Level::Key, largest, fallback))
+        of_key
+            .and_then(|r| r.expected(Level::Key, largest, fallback))
             .or_else(|| by_prefix()?.expected(Level::Prefix, largest, fallback))
             .or_else(|| class?.expected(Level::Class, p90, fallback))
             .unwrap_or(prior)
@@ -294,9 +304,9 @@ impl History {
             .entry(class)
             .or_default()
             .push(run, oom, CLASS_WINDOW);
-        if let Some(p) = b.name.map(pname) {
-            let key = format!("{}/{p}", b.system);
-            self.keys.entry(key).or_default().push(run, oom, WINDOW);
+        if let Some(name) = b.name {
+            let p = pname(name);
+            (self.keys.entry(key(b.system, name)).or_default()).push(run, oom, WINDOW);
             for pre in iter::once(p).chain(prefixes(p)) {
                 self.prefixes
                     .entry(format!("{}/{pre}", b.system))

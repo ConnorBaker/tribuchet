@@ -62,6 +62,7 @@ fn expecting(cores: f64, gib: f64) -> Expected {
         secs: None,
         level: Level::Key,
         oom: 0,
+        below: 0.0,
     }
 }
 

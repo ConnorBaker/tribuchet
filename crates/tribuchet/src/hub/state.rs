@@ -16,6 +16,7 @@ use super::known::Known;
 use super::losses::{self, Loss};
 use super::lost::Lost;
 use super::metrics::Metrics;
+use super::placement::objective::enqueue;
 use super::placement::{Expected, Placement};
 use super::relay::{DAEMON_ANSWER, DaemonEvidence};
 use super::runs::Runs;
@@ -73,7 +74,8 @@ pub(super) struct Job {
     /// Losses in transport (hub/losses.rs): capped so a build the farm
     /// cannot move goes back to its clients.
     pub(super) transport_losses: u32,
-    /// When the job last entered the queue, for the queue-wait histogram.
+    /// When the job last entered the queue: its wait, in the queue's
+    /// order (placement/objective.rs) and the queue-wait histogram.
     pub(super) queued_at: Instant,
     /// The loss of the build with its worker's session, which the next
     /// dispatch settles (hub/losses.rs), with how far its run got. Until
@@ -369,7 +371,7 @@ impl HubState {
     pub(super) async fn requeue(self: &Arc<Self>, mut job: Job) {
         (job.queued_at, job.deferred) = (Instant::now(), None);
         job.restart_outputs().await;
-        self.queue.lock().await.push_back(job);
+        enqueue(&mut *self.queue.lock().await, job);
         self.notify.notify_waiters();
         self.hold_unservable().await;
     }

@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use rusqlite::types::Value;
 
@@ -16,16 +17,27 @@ use super::record::{Recorder, Rest, Row, int, now_ms, profile_row, result_row, v
 use super::state::{HubState, Job, Replay};
 use crate::proto::{BuildUsage, Register};
 
+#[path = "placement/downstream.rs"]
+mod downstream;
 #[path = "placement/history.rs"]
 mod history;
+#[path = "placement/objective.rs"]
+pub(super) mod objective;
 #[path = "placement/rank.rs"]
 mod rank;
+pub(super) use downstream::Downstream;
 #[cfg(test)]
 pub(super) use history::Level;
 pub(super) use history::{Build, Demand, Expected, History};
+use objective::Priority;
 #[cfg(test)]
 pub(super) use rank::GRACE;
 pub(super) use rank::{Room, Rooms, Size};
+
+/// The history key of `job`, if its name could be read.
+fn key_of(job: &Job) -> Option<String> {
+    drv_name(&job.req).map(|n| history::key(&job.req.system, n))
+}
 
 /// What history knows `job` by.
 pub(super) fn build_of(job: &Job) -> Build<'_> {
@@ -88,6 +100,8 @@ pub(super) struct Placement {
     pub(super) sessions: HashMap<u64, Session>,
     /// What builds used, by key: the record's fold.
     pub(super) history: History,
+    /// What follows builds of each key, learned from their dependants.
+    pub(super) downstream: Downstream,
     /// Where the record's rows go; None where the hub holds no record.
     pub(super) record: Option<Recorder>,
     /// The session taking no new build until it is empty, for a lost key
@@ -117,7 +131,11 @@ impl Placement {
     }
 
     pub(super) fn expect(&self, job: &Job) -> Expected {
-        self.history.expect(&build_of(job))
+        let below = key_of(job).map_or(0.0, |k| self.downstream.below(&k));
+        Expected {
+            below,
+            ..self.history.expect(&build_of(job))
+        }
     }
 
     /// Learn from a finished run of `job`, and append it to the record,
@@ -126,6 +144,11 @@ impl Placement {
     pub(super) fn learn(&mut self, job: &Job, exit_code: i32, u: &BuildUsage, rest: Rest) {
         let build = build_of(job);
         self.history.record(&build, exit_code, u);
+        if let Some(key) = key_of(job).filter(|_| exit_code == 0 && !u.oom_killed) {
+            let secs = self.history.expect(&build).secs.unwrap_or(0.0);
+            let outputs = job.req.outputs.values().cloned();
+            (self.downstream).learn(&key, secs, outputs, &job.req.input_paths);
+        }
         let profile = (u.profile.as_ref()).map(|p| profile_row(rest.at_ms, &rest.id, p));
         self.append(result_row(&build, exit_code, u, rest));
         if let Some(row) = profile {
@@ -227,6 +250,7 @@ pub(super) fn dispatch(
         (a.capacity, a.assignments, a.free, a.sent)
     };
     let e = job.expected;
+    let p = Priority::of(job, Instant::now());
     let (idle_elsewhere, room, record) = {
         let workers = state.worker_caps.lock().unwrap();
         let mut placement = state.placement.lock().unwrap();
@@ -284,6 +308,9 @@ pub(super) fn dispatch(
         expect_mem = bytes(e.demand.memory),
         expect_cores = round3(e.demand.cores),
         expect_secs = e.secs.map(round3),
+        expect_below = round3(e.below),
+        path = round3(p.path),
+        waited = round3(p.wait),
         oom_runs = e.oom,
         load_mem = load.map(|l| bytes(l.memory)),
         load_cores = load.map(|l| round3(l.cores)),

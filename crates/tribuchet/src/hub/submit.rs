@@ -14,6 +14,7 @@ use super::known::refusal;
 use super::metrics::Metrics;
 use super::naming::drv_name;
 use super::placement::Expected;
+use super::placement::objective::enqueue;
 use super::state::{HubState, Inflight, Job, Replay, Servability, unserved};
 use crate::proto::{
     AttachEvent, BuildMessage, BuildRequest, DECLINE_EXIT_CODE, NETWORK, attach_event,
@@ -306,7 +307,7 @@ impl attach_hub_server::AttachHub for AttachSvc {
                 "queueing build"
             );
             Metrics::inc(&self.state.metrics.submitted);
-            self.state.queue.lock().await.push_back(job);
+            enqueue(&mut *self.state.queue.lock().await, job);
             self.state.notify.notify_waiters();
             break rx;
         };
