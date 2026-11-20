@@ -26,13 +26,22 @@ enum Ends {
     /// It was never answered, and its worker is not back: no run started,
     /// so no mark, in either.
     Unanswered,
+    /// A producer's listener reached no attach (handoff_expired): a known
+    /// cause, so no mark, in either (DD10).
+    Expired,
 }
 
 /// A started run that ends with no known cause marks its key in the live
 /// hub as in the core (D4), however it ends.
 #[tokio::test]
 async fn a_run_lost_with_no_known_cause_marks_its_key_as_the_core_does() {
-    for ends in [Ends::Back, Ends::Away, Ends::Gone, Ends::Unanswered] {
+    for ends in [
+        Ends::Back,
+        Ends::Away,
+        Ends::Gone,
+        Ends::Unanswered,
+        Ends::Expired,
+    ] {
         let state = Arc::new(HubState::for_test(Duration::from_millis(100)));
         let _other = register(&state, "w2", &[]);
         let w1 = Register {
@@ -55,6 +64,15 @@ async fn a_run_lost_with_no_known_cause_marks_its_key_as_the_core_does() {
         if let Ends::Unanswered = ends {
             said.clear();
         }
+        if let Ends::Expired = ends {
+            said.push(worker_message::Msg::Result(BuildResult {
+                build_id: id.clone(),
+                run: run_id,
+                exit_code: 1,
+                handoff_expired: true,
+                ..BuildResult::default()
+            }));
+        }
         if let Ends::Gone = ends {
             said.push(worker_message::Msg::ResultGone(ResultGone {
                 build_id: id,
@@ -71,11 +89,11 @@ async fn a_run_lost_with_no_known_cause_marks_its_key_as_the_core_does() {
                 tokio::time::sleep(Duration::from_millis(150)).await;
                 None
             }
-            Ends::Gone => None,
+            Ends::Gone | Ends::Expired => None,
         };
         let taken = state.take_job(&caps("w2"), None).await;
         assert!(taken.is_some(), "{ends:?}: not taken");
-        let marked = !matches!(ends, Ends::Unanswered);
+        let marked = !matches!(ends, Ends::Unanswered | Ends::Expired);
         assert_eq!(state.lost.has(&key), marked, "{ends:?}: the live hub");
         assert_eq!(
             state.shadow.isolated(&key),

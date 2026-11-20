@@ -574,6 +574,134 @@ hub, the lesser of the two applying.
 A kernel without that count (`frozen_usec`, before Linux 6.18) is
 reported at start, and nothing is frozen there.
 
+## Dynamic-derivation producers
+
+A producer is a derivation requiring `builder-rpc-v0`: its builder gets
+a socket to the client's store (`NIX_REMOTE`), through which it adds
+objects and submits its outputs while it runs. Under Tribuchet its
+builder runs on a worker, and attach carries each connection on that
+socket to the client's. The code cites these labels: DD for the design,
+DT for its tests, apart from SEMANTICS-7's D and U.
+
+* **DD1, detection.** A build is a producer iff its
+  requiredSystemFeatures has `builder-rpc-v0` (`proto::producer`, which
+  attach, hub and worker all ask). `NIX_REMOTE` never decides: a
+  recursive-nix build has one too.
+* **DD2, sole judge.** The client's Nix judges every operation a producer
+  makes; Tribuchet carries each connection's bytes unchanged, in order,
+  both ways, and parses none.
+* **DD3, sandbox socket.** A producer's `NIX_REMOTE` must be
+  `unix://<tmpDirInSandbox>/<name>`, as Nix sets it; anything else is
+  refused. Only a producer gets a listening socket there, bound by the
+  agent as the builder's uid, mode 0600.
+* **DD4, a connection each.** attach splices each accepted connection to
+  one of its own to the client's socket, by a task of its own, both
+  ways, half-close as half-close: a stalled connection delays no other.
+* **DD5, client socket.** build.json's tmpDir (topTmpDir/build) joined
+  with `NIX_REMOTE`'s basename; never a constant.
+* **DD6, no outputs.** A producer's run returns no scratch outputs and
+  claims no scratch path: what it builds it submits to the client's Nix.
+* **DD7, attach exits last.** At a worker's exit code, attach splices each
+  connection still queued on the listener and exits once every splice
+  ended, since Nix checks the submissions once attach exits. At the
+  hub's decline (222) the run was lost and may still run: attach aborts
+  its splices instead, so nothing of it reaches the client after.
+* **DD8, RelayStarted.** Before a run's first byte reaches the client,
+  attach sends RelayStarted naming a handoff token of the run it holds
+  and waits for the hub's acknowledgement naming it, or for the run's end
+  (a worker's exit code), after which no fresh run follows. The hub
+  records and acknowledges only a token of the run current now (its
+  fresh start's or a resume's), so a splice of a run gone never marks
+  another: a run lost or requeued is current no more. A resubmission
+  after a hub restart carries `relay_started`, applied before any take
+  can see the build. A fresh run closes attach's gate: its bytes wait
+  for an acknowledgement naming it.
+* **DD8a, one farm run behind one attach.** Once RelayStarted was
+  acknowledged, a loss of the run is never followed by a fresh run; a
+  resume, the same run, goes on. The hub answers as `hub_cannot` does: a
+  client whose build.json says `canBuildLocally` is declined (222), and
+  its Nix rebuilds the producer in a fresh builder; every other client
+  fails, told why. The acknowledgement and every loss take one lock: an
+  acknowledgement first, and the loss settles the build so; a loss first
+  (or a requeue), and the lost run's tokens are acknowledged no more. The
+  loss is decided at three points: a loss of a started run its worker
+  says is gone, a fresh take of the build, and a worker staging afresh a
+  build handed it by key. A loss before the first byte follows the loss
+  policy. A fixed-output producer is never declined, so its
+  relayed loss fails the build (DD1b). This is a policy, not Nix's: a
+  rerun behind the same client socket would find the lost run's added
+  objects valid, and a second submission of an output is refused.
+  Whether a fresh run before the first byte is worth RelayStarted (its
+  gate, acknowledgements and token lists), rather than declining every
+  producer whose started run is lost, is unmeasured: producers were not
+  deployed when it was built. The fleet's record then, over 21.6 days,
+  had 290 of 1,560,434 builds (0.019%) dispatched afresh after a loss,
+  an upper bound that counts losses before Started too. Re-measure it
+  once producers run, on the hub's record (producers dispatched afresh
+  after a loss, of all producers):
+  `SELECT count(*), sum(n > 1) FROM (SELECT id, count(*) AS n FROM
+  dispatch WHERE resumed = 0 AND ',' || features || ',' LIKE
+  '%,builder-rpc-v0,%' GROUP BY id);`
+* **DD9, identity includes the client.** A producer's request carries
+  `attach_id`, 16 random bytes per attach process kept across its
+  reconnects, which is in the dedupe key (`relay_started`, drvPath and
+  canLocal are not): an attach reconnecting rejoins its own run, another
+  goal never joins it. A producer's request without one is refused.
+* **DD10, listener custody.** The listener goes from the agent to the
+  worker to attach, every holder but the last closing its copy; it is
+  close-on-exec, so neither the setup stage nor the builder holds it. The
+  worker records `handed_off` in the run's dir only once the send
+  succeeded. It expects the run before it says Started, so attach's
+  request waits for the listener however long the agent takes to start
+  the builder. Unfetched `HANDOFF_DEADLINE` (60 s) after the StartReply,
+  or found by a restarted worker without `handed_off`, the run is killed
+  and reported `handoff_expired` (as is a producer on a worker serving no
+  handoff socket): a loss before the first byte, in transport (how the
+  farm moved it, never counted against the run nor isolating its key).
+  A resume retoken gives a listener not yet handed off its deadline
+  again. A listener attach fails to fetch is such a loss, not a failure:
+  attach goes on. RelayReady{fresh} of another run makes attach close the
+  listener it holds, abort its splices and close its gate (none carried a
+  byte, by DD8: a fresh run follows only a loss before any
+  acknowledgement); one naming a token of the run held changes nothing.
+  A client joining a producer in flight (its attach reconnecting) is
+  replayed the latest fresh RelayReady and each resume's after it, as
+  published, none of a run a fresh start replaced.
+* **DD11, handoff authority.** The worker hands a run's listener, once,
+  only to a request with that run's handoff token: 16 random bytes per
+  dispatch, which the hub sends the worker in the assignment and the
+  build's attach in RelayReady, and never logs. A resume retokens the
+  run. An empty token names no run.
+* **DD12, routing.** Only a worker serving the handoff socket advertises
+  `builder-rpc-v0`, for its native system. Set that socket only on the
+  hub's host, where attach runs; the module then passes attach its path.
+  Where attach has none, it declines a producer (222) whose Nix can build
+  it or does not say. A producer placed on another worker is never
+  fetched: attach is refused, "no such run on the local worker", and the
+  run expires (DD10). That worker is not gated on its hub's version:
+  on the hub's host both come from one configuration, so one predating
+  producers meets an advertising worker only within a switch.
+* **DD1b, fixed-output producers.** Nix lets a fixed-output derivation be
+  a producer; Tribuchet builds it as a fixed-output build with the
+  socket, refusing nothing of its own. Stock Nix completes none (an
+  object named as the output waits on that output's path; one named
+  otherwise is refused), and Tribuchet answers as stock Nix does.
+* **R1, drvPath.** build.json's drvPath, where Nix writes it, goes to the
+  `queueing build` log line and the record's `drv_path` table, and to
+  nothing the hub decides.
+* **OQ1, a relayed loss for a client that cannot build it.** (c): attach
+  refuses, before submitting anything, a producer whose build.json says
+  `canBuildLocally: false`. (a) for a client whose Nix does not say, at a
+  relayed loss only: the hub takes it for one that cannot there, so a
+  loss after the first byte fails the build, told why. Everywhere else
+  (admission, a loss before the first byte) unsaid is taken as can, as
+  for any build without network.
+
+Their tests are labelled in their doc comments: DT1 and DT2 (DD4), DT3
+(DD7), DT4 (DD8), DT7 (DD9, DD6), DT8 (DD11), DT9 (DD10's record), DT10 (DD6), DT11
+(DD5), DT12 (DD1, DD3, DD12), DT13 (DD3's mode), DT14 (DD10's copies), DT15 (DD10's
+deadline), DT16 (DD10's fresh), DT17 and DT20 (DD8a), DT19 (R1).
+
 ## Known limitations (MVP)
 
 * Workers run up to `max-jobs` concurrent builds over one session.
@@ -595,6 +723,10 @@ reported at start, and nothing is frozen there.
   stays connected but reads nothing keeps its stream until it exits.
 * An output delivery fails its build when the hub's chunk cache cannot
   store or read back a chunk of it.
+* A producer's attach reads no hub event while it fetches a run's
+  listener. A fetch that comes before the agent started the builder
+  waits on the worker until the listener arrives or the run ends, a wait
+  bounded by the worker's progress, not by a deadline of its own.
 * A freeze still counts against wall-clock timers the worker does not
   own. A build's own (test drivers, watchdogs): one whose tests time
   out by the wall clock fails if it is frozen longer than their slack.

@@ -4,25 +4,19 @@ use std::collections::{HashMap, VecDeque};
 use std::mem;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use tokio::sync::{Mutex, Notify, mpsc};
 use tokio::time::Instant;
 use tonic::Status;
 
-/// How long after its build ends a client catching up can count on the
-/// outputs staying in the hub's cache. UNMEASURED: no client stalled in
-/// the deployed hub journal it could be sized from. Past it the
-/// catch-up goes on while the chunks last, else the client resubmits.
-const CATCH_UP_PIN: Duration = Duration::from_mins(10);
-
 use super::{EventTx, MAX_REPLAY_BYTES, SUB_CHANNEL_SLACK};
-use crate::chunker::Recipe;
-use crate::chunkstore::{Hash, PinGuard};
-use crate::hub::chunkcache::ChunkCache;
+use crate::chunkstore::Hash;
 use crate::hub::shadow::Client;
 use crate::proto::{AttachEvent, DECLINE_EXIT_CODE, OutputNar, attach_event};
+pub(in crate::hub) use kept::KeptOutputs;
+use kept::unpin_after;
 use listener::Listener;
 
 /// Said to a client that missed log lines, before what follows them.
@@ -66,6 +60,20 @@ pub(in crate::hub) struct Replay {
     held: AtomicBool,
     /// Clients that joined so far.
     joins: AtomicUsize,
+    /// A producer's run as its attach relays it (hub/producer.rs, DD8,
+    /// DD8a): one lock, so that a RelayStarted and a loss are ordered.
+    pub(in crate::hub) relay: StdMutex<RelayRun>,
+}
+
+/// A producer's run as its attach relays it.
+#[derive(Default)]
+pub(in crate::hub) struct RelayRun {
+    /// The handoff tokens of the run current now, from its fresh start
+    /// through each resume; none once it was lost.
+    pub(in crate::hub) tokens: Vec<Vec<u8>>,
+    /// Its attach said the run reached the client (RelayStarted,
+    /// acknowledged): no fresh run of it may follow.
+    pub(in crate::hub) started: bool,
 }
 
 #[derive(Default)]
@@ -116,6 +124,8 @@ struct ReplayInner {
     subs: Vec<EventTx>,
     /// The cap was reached: warned once.
     overflowed: bool,
+    /// The place in the log of the latest fresh RelayReady.
+    last_fresh: Option<usize>,
 }
 
 struct Held {
@@ -136,7 +146,9 @@ fn cost(ev: &AttachEvent) -> usize {
             | attach_event::Event::OutputRestart(s)
             | attach_event::Event::Dispatched(s),
         ) => s.len(),
-        Some(attach_event::Event::ExitCode(_)) | None => 0,
+        Some(attach_event::Event::RelayReady(r)) => r.handoff_token.len(),
+        Some(attach_event::Event::RelayStartedAck(t)) => t.len(),
+        _ => 0,
     }
 }
 
@@ -144,34 +156,6 @@ fn cost(ev: &AttachEvent) -> usize {
 struct Output {
     restart: usize,
     chunks: usize,
-}
-
-/// A delivery's outputs, pinned in the hub's chunk cache so a
-/// subscriber that missed them can be sent them again.
-pub(in crate::hub) struct KeptOutputs {
-    cache: Arc<ChunkCache>,
-    outputs: Vec<(String, Arc<Recipe>)>,
-    /// Released at a requeue, or CATCH_UP_PIN after the build ends.
-    pin: StdMutex<Option<PinGuard>>,
-}
-
-impl KeptOutputs {
-    pub(in crate::hub) fn new(
-        cache: Arc<ChunkCache>,
-        outputs: Vec<(String, Arc<Recipe>)>,
-        pin: PinGuard,
-    ) -> Self {
-        Self {
-            cache,
-            outputs,
-            pin: StdMutex::new(Some(pin)),
-        }
-    }
-
-    /// Leave the outputs' chunks to the cache.
-    fn unpin(&self) {
-        drop(self.pin.lock().unwrap().take());
-    }
 }
 
 fn event(ev: attach_event::Event) -> AttachEvent {
@@ -186,6 +170,8 @@ struct Cursor {
     told: bool,
     /// It missed some of the log, or came after the build's end.
     behind: bool,
+    /// One past the last event published as it joined.
+    joined: usize,
 }
 
 enum Next {
@@ -274,6 +260,15 @@ impl ReplayInner {
                     let ended = self.ended.filter(|_| c.behind);
                     return Next::Verdict(held.event.clone(), ended);
                 }
+                // Published before the client joined (a producer's attach
+                // reconnecting): none of a run a fresh start replaced. The
+                // latest fresh start's and each resume after go as
+                // published: attach keeps a listener it holds (DD10).
+                Some(attach_event::Event::RelayReady(_))
+                    if i < c.joined && self.last_fresh.is_some_and(|f| i < f) =>
+                {
+                    continue;
+                }
                 _ => return Next::Send(held.event.clone()),
             }
         }
@@ -332,10 +327,16 @@ impl ReplayInner {
 /// Behind what the log keeps while the build runs, it is refused
 /// (EXHAUSTED), which attach does not retry. Declined, it is sent the log
 /// before its decline, then exit 222. The client leaves as it ends.
-async fn read(replay: Arc<Replay>, tx: EventTx, _client: Client, declined: Arc<OnceLock<usize>>) {
+async fn read(
+    replay: Arc<Replay>,
+    tx: EventTx,
+    (_client, joined): (Client, usize),
+    declined: Arc<OnceLock<usize>>,
+) {
     let id = &replay.id;
     let mut c = Cursor {
         behind: replay.inner.lock().await.ended.is_some(),
+        joined,
         ..Cursor::default()
     };
     loop {
@@ -406,15 +407,6 @@ async fn read(replay: Arc<Replay>, tx: EventTx, _client: Client, declined: Arc<O
     inner.subs.retain(|s| !s.same_channel(&tx));
 }
 
-/// Release a finished build's outputs from the cache's pin once
-/// CATCH_UP_PIN has passed, whoever still holds them.
-async fn unpin_after(kept: Weak<KeptOutputs>) {
-    tokio::time::sleep(CATCH_UP_PIN).await;
-    if let Some(kept) = kept.upgrade() {
-        kept.unpin();
-    }
-}
-
 impl Replay {
     pub(in crate::hub) fn new(id: String) -> Self {
         Self {
@@ -436,6 +428,7 @@ impl Replay {
                 let out = inner.paths.entry(o.store_path.clone()).or_default();
                 (nth, out.chunks) = (out.chunks, out.chunks + 1);
             }
+            Some(attach_event::Event::RelayReady(r)) if r.fresh => inner.last_fresh = Some(i),
             Some(attach_event::Event::OutputRestart(path)) => {
                 let restart = Output {
                     restart: i,
@@ -499,7 +492,7 @@ impl Replay {
             clients.push(listener);
             self.held.store(false, Ordering::Relaxed);
             self.joins.fetch_add(1, Ordering::Relaxed);
-            (client, declined)
+            ((client, self.published.load(Ordering::Acquire)), declined)
         };
         self.hold.lock().unwrap().clientless = None;
         // Before the reader, which takes it out when it ends.
@@ -580,6 +573,8 @@ impl Replay {
     }
 }
 
+#[path = "replay/kept.rs"]
+mod kept;
 #[path = "replay/listener.rs"]
 mod listener;
 

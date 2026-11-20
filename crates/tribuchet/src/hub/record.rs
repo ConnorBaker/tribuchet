@@ -55,6 +55,11 @@ const PROFILE: &str = "CREATE TABLE IF NOT EXISTS profile (at_ms INTEGER NOT NUL
   id TEXT NOT NULL, running_usec TEXT NOT NULL, cpu_usec TEXT NOT NULL, runnable TEXT NOT NULL, \
   memory TEXT NOT NULL);";
 
+/// The hub's build id joined to the client's `.drv` (build.json's
+/// drvPath, where Nix writes it): added to a record of either age.
+const DRV_PATH: &str = "CREATE TABLE IF NOT EXISTS drv_path (at_ms INTEGER NOT NULL, \
+    id TEXT NOT NULL, key TEXT, drv_path TEXT NOT NULL);";
+
 /// A row for table `table`: its values, in the schema's column order.
 pub(in crate::hub) struct Row {
     pub(in crate::hub) table: &'static str,
@@ -309,6 +314,8 @@ fn take(path: &Path) -> Result<Option<(Connection, File, (History, u64))>> {
     }
     let folded = fold(&conn)?;
     conn.execute_batch(PROFILE)?;
+    // Only into a record ours (fold read it as one).
+    conn.execute_batch(DRV_PATH)?;
     let mode: String = conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
     if !mode.eq_ignore_ascii_case("wal") {
         return Err(err_msg(format!("journal_mode {mode}, not WAL")));

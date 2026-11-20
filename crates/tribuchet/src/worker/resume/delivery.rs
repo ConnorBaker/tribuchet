@@ -378,6 +378,7 @@ fn deliver(
         build_id: build_id.into(),
         run,
         exit_code: fin.exit_code,
+        handoff_expired: false,
         usage: Some(fin.usage.clone().into()),
         outputs: fin
             .outputs

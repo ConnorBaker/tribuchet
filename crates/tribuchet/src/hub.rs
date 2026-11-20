@@ -45,6 +45,7 @@ mod metrics;
 mod model;
 mod naming;
 mod placement;
+mod producer;
 mod record;
 mod relay;
 #[cfg(test)]
@@ -488,7 +489,10 @@ async fn supervise_job(
     // A worker that no longer lists a build it resumed, or dropped its
     // result, lost it as much as one whose session died, though the
     // session lives on. Either half of the session failing is its death.
-    let gone = matches!(err, Error::Unlisted | Error::ResultGone);
+    let gone = matches!(
+        err,
+        Error::Unlisted | Error::ResultGone | Error::HandoffExpired
+    );
     let silent = matches!(err, Error::Silent);
     let session_dead =
         gone || silent || router.is_closed() || out_tx.is_closed() || bulk.is_closed();
@@ -517,6 +521,12 @@ async fn supervise_job(
         tracing::warn!(id = job.id, "assignment not sent, requeueing build: {err}");
         Metrics::inc(&state.metrics.requeued);
         state.requeue(job).await;
+        return;
+    }
+    if matches!(err, Error::Relayed) {
+        // A fresh run of a relayed producer: stopped before it staged.
+        let _ = cancel(&out_tx, &job).await;
+        let _ = producer::lost_relayed(&state, job, "staged afresh").await;
         return;
     }
     if let Error::Missing(path) = &err {

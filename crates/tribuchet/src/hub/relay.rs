@@ -8,9 +8,24 @@ mod serve;
 mod staging;
 pub(super) use daemon::{ANSWER as DAEMON_ANSWER, Evidence as DaemonEvidence};
 use outputs::{deliver_outputs, verify_set};
+
+/// verify_set over output paths with empty recipes, for the producer tests.
+#[cfg(test)]
+pub(super) fn verify_set_for_test(
+    reported: Vec<String>,
+    requested: &BTreeMap<String, String>,
+) -> Result<()> {
+    let manifests = reported.into_iter().map(|store_path| Manifest {
+        store_path,
+        ..Default::default()
+    });
+    verify_set(manifests.collect(), requested).map(drop)
+}
 pub(super) use staging::WorkerSession;
 use staging::{Staging, stream_tmp_dir};
 
+#[cfg(test)]
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -20,10 +35,13 @@ use tonic::Status;
 use super::losses::{Dispatch, Run};
 use super::metrics::Metrics;
 use super::naming::drv_name;
+use super::producer;
 use super::record::Rest;
 use super::state::{HubState, Job, Replay};
 use super::{SILENCE_TIMEOUT, cancel};
 use crate::errors::{Error, Result, err_msg};
+#[cfg(test)]
+use crate::proto::Manifest;
 use crate::proto::{
     BuildAssignment, BuildResult, DECLINE_EXIT_CODE, HubMessage, ResultAck, attach_event,
     hub_message, worker_message,
@@ -60,6 +78,7 @@ pub(super) async fn run_job(
     tracing::debug!(id = job.id, %run, "assigning a run");
     state.shadow.assigned(&run, &job.key, worker);
     dispatch.run = Some(run.clone());
+    let token = producer::token(job);
     send(
         out_tx,
         hub_message::Msg::Assignment(BuildAssignment {
@@ -80,6 +99,7 @@ pub(super) async fn run_job(
             timeout_secs: req.timeout_secs,
             max_silent_secs: req.max_silent_secs,
             run: Some(run),
+            handoff_token: token.clone(),
         }),
     )
     .await?;
@@ -140,11 +160,13 @@ pub(super) async fn run_job(
                 state
                     .shadow
                     .resumed(dispatch.run.as_ref(), r.run.as_ref(), &job.key);
+                producer::relay_ready(job, &token, false).await;
             }
             worker_message::Msg::Started(s) => {
                 dispatch.reached = dispatch.reached.max(Run::Started);
                 staging.summarize(s.run.as_ref());
                 state.shadow.started(s.run.as_ref());
+                producer::relay_ready(job, &token, true).await;
             }
             worker_message::Msg::ResultGone(g) => {
                 state.shadow.gone("result gone", g.run.as_ref());
@@ -157,6 +179,9 @@ pub(super) async fn run_job(
                 // The build's bulk goes on the session's other connection,
                 // once the worker has answered its assignment: none of it
                 // can overtake the assignment then.
+                if job.replay.relayed() {
+                    return Err(Error::Relayed);
+                }
                 if !dispatch.staged {
                     state.shadow.need(dispatch.run.as_ref());
                     stream_tmp_dir(&job.id, &job.tmp_dir_pack, &sess.bulk).await?;
@@ -190,6 +215,12 @@ pub(super) async fn run_job(
                         "build usage"
                     );
                 }
+                if res.handoff_expired {
+                    dispatch.expired = true;
+                    state.shadow.abort("handoff expired", res.run.as_ref());
+                    ack_result(out_tx, job).await;
+                    return Err(Error::HandoffExpired);
+                }
                 if !state.outcome_in(&job.id) {
                     // Given up before its result came: no longer ours.
                     state
@@ -203,7 +234,7 @@ pub(super) async fn run_job(
                     return publish_worker_failure(state, out_tx, job, &res).await;
                 }
                 dispatch.reached = Run::Finished;
-                let outputs = verify_set(res.outputs, &job.req.outputs)?;
+                let outputs = verify_set(res.outputs, &producer::outputs(job))?;
                 deliver_outputs(state, job, out_tx, &mut in_rx, outputs).await?;
                 state.shadow.fetched(job, res.run.as_ref());
                 state.lost.clear(&job.key);

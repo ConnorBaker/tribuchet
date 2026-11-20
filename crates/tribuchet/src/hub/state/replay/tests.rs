@@ -4,8 +4,11 @@ use std::collections::HashMap;
 use std::iter;
 use std::sync::Arc;
 
+use super::kept::CATCH_UP_PIN;
 use super::*;
+use crate::chunker::Recipe;
 use crate::chunkstore::io_hook;
+use crate::hub::chunkcache::ChunkCache;
 use crate::hub::model;
 use crate::hub::state::HubState;
 use crate::hub::state::queue_tests::hub_knowing;

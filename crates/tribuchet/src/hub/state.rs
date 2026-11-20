@@ -368,7 +368,10 @@ impl HubState {
     /// telling attach clients to drop any half-streamed output NARs
     /// (the next attempt re-streams them from the start), and leaving
     /// their chunks to the cache while it waits, held or not.
+    /// A producer's run is current no more, unless it reached its client
+    /// (DD8).
     pub(super) async fn requeue(self: &Arc<Self>, mut job: Job) {
+        job.replay.run_lost();
         (job.queued_at, job.deferred) = (Instant::now(), None);
         job.restart_outputs().await;
         enqueue(&mut *self.queue.lock().await, job);

@@ -6,6 +6,7 @@ use std::time::Instant;
 
 use super::losses::{Charge, Run};
 use super::{HubState, Job, WorkerCaps, losses};
+use crate::hub::producer;
 use crate::proto::CancelBuild;
 
 /// The builds a worker session holds from before, by dedupe key: the
@@ -182,6 +183,11 @@ impl HubState {
                 self.finish(&job).await;
                 continue;
             }
+            // A fresh take of a relayed producer: no fresh run (DD8a).
+            let Some(j) = producer::lost_relayed(self, job, "taken afresh").await else {
+                continue;
+            };
+            job = j;
             // Its last worker did not resume it: this starts it over. A
             // run it started ended without an outcome if that worker is
             // back without it; one not back may run it still, a loss in

@@ -37,6 +37,14 @@ pub enum Error {
     /// it (ResultGone): lost in transport, its session alive.
     #[error("the worker no longer has the build's result")]
     ResultGone,
+    /// A producer's run ended without its listener reaching an attach
+    /// (BuildResult.handoff_expired): it reached no client, a loss.
+    #[error("no attach fetched the producer's listener in time")]
+    HandoffExpired,
+    /// The worker stages afresh a producer whose run reached its client:
+    /// a fresh run behind the same attach, which never starts (DD8a).
+    #[error("a relayed producer's run would start afresh")]
+    Relayed,
     /// Given up, then dispatched again by its key to the same worker,
     /// which delivers to that dispatch: nothing more for this one.
     #[error("a later dispatch took the build over")]

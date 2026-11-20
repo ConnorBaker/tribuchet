@@ -233,6 +233,11 @@ message BuildAssignment {
   uint64 timeout_secs = 15;
   uint64 max_silent_secs = 16;
   RunId run = 17;
+  // A producer's (builder-rpc-v0) run: 16 random bytes per dispatch, which
+  // the hub also sends that build's attach (RelayReady) and nobody else.
+  // The worker hands the run's listener only to a holder of it. Never
+  // logged. Empty for every other build.
+  bytes handoff_token = 18;
 }
 
 message TmpDirArchive {
@@ -275,6 +280,10 @@ message BuildResult {
   // What the build used on the worker; all 0 when unknown.
   BuildUsage usage = 6;
   RunId run = 7;
+  // A producer's run killed because no attach fetched its listener in
+  // time, or because a restarted worker found it never handed off: the
+  // run reached no client, so the hub settles it as a loss, not a result.
+  bool handoff_expired = 8;
 }
 
 message BuildUsage {
@@ -352,7 +361,28 @@ message BuildMessage {
   oneof msg {
     BuildRequest request = 1;
     TmpDirChunk tmp_dir = 2;
+    // A producer's attach, before it writes the first byte of the run to
+    // its client's socket; the hub acknowledges it (relay_started_ack).
+    RelayStarted relay_started = 3;
   }
+}
+
+// Names the run whose bytes are about to reach the client: a token the
+// hub gave that run (RelayReady). The hub records and acknowledges only
+// one of the run current now, so a stale splice never marks another run.
+message RelayStarted {
+  bytes handoff_token = 1;
+}
+
+// Where a producer's attach fetches the run's listener: the worker's
+// handoff socket, with this token. `fresh`: the run was staged afresh
+// (not resumed), so a listener attach holds is of a run now gone, unless
+// the token is one of its own. A client joining after it (an attach
+// reconnecting to the same hub) is replayed the latest fresh one and each
+// resume's after it, as published.
+message RelayReady {
+  bytes handoff_token = 1;
+  bool fresh = 2;
 }
 
 message TmpDirChunk {
@@ -389,6 +419,16 @@ message BuildRequest {
   // (hub/placement/objective.rs). Its build.json's, else the nix-daemon
   // connection running attach. Not part of the build.
   optional string client = 15;
+  // A producer's (builder-rpc-v0): 16 random bytes per attach process,
+  // kept across its reconnects. Part of the build: another client's goal
+  // never joins this one's run.
+  bytes attach_id = 16;
+  // The hub acknowledged this attach's RelayStarted: the run reached the
+  // client. Not part of the build.
+  bool relay_started = 17;
+  // build.json's drvPath, where Nix writes it: logged and recorded only,
+  // never in the key or admission. Not part of the build.
+  optional string drv_path = 18;
 }
 
 message AttachEvent {
@@ -406,6 +446,9 @@ message AttachEvent {
     // Name of the worker the build was dispatched to, for the client
     // to report where the build runs.
     string dispatched = 7;
+    RelayReady relay_ready = 8;
+    // The hub recorded the attach's RelayStarted: its handoff_token.
+    bytes relay_started_ack = 9;
   }
 }
 

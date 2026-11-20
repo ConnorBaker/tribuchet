@@ -500,6 +500,7 @@ async fn fail_build(
             outputs: vec![],
             error: err,
             usage: None,
+            handoff_expired: false,
         })))
         .await?;
     Ok(())

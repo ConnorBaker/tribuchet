@@ -135,6 +135,9 @@ fn request(build: BuildJson) -> (BuildRequest, Option<bool>) {
         max_silent_secs: build.max_silent_time,
         can_local,
         client: build.client.or_else(daemon_connection),
+        attach_id: Vec::new(),
+        relay_started: false,
+        drv_path: build.drv_path,
     };
     (req, told)
 }
@@ -285,7 +288,8 @@ async fn attempt_build(
                 cleanup_unpackers(&mut unpackers).await;
                 return Err(err_msg(format!("remote build failed: {e}")));
             }
-            None => {}
+            Some(attach_event::Event::RelayReady(_) | attach_event::Event::RelayStartedAck(_))
+            | None => {}
         }
     }
 }
