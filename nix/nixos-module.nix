@@ -39,10 +39,16 @@ let
     {
       agent-sockets-dir = workerUnits.agentSocketsDir;
     }
+    // lib.optionalAttrs (worker.handoffSocket != null) {
+      handoff-socket = toString worker.handoffSocket;
+      handoff-gid = config.users.groups.${hub.socketGroup}.gid or null;
+    }
     // worker.settings
   );
   attachWrapper = pkgs.writeShellScript "tribuchet-attach" ''
-    exec ${lib.getExe' hub.package "tribuchet"} attach "$1" --socket ${hub.socketPath}
+    exec ${lib.getExe' hub.package "tribuchet"} attach "$1" --socket ${hub.socketPath}${
+      lib.optionalString (worker.handoffSocket != null) " --handoff-socket ${worker.handoffSocket}"
+    }
   '';
 in
 {
@@ -181,6 +187,18 @@ in
       type = lib.types.either lib.types.ints.positive (lib.types.enum [ "auto" ]);
       default = "auto";
       description = "Build agent count, or \"auto\" for one per CPU and a spare, decided at boot.";
+    };
+    handoffSocket = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      example = "/run/tribuchet-worker/handoff.sock";
+      description = ''
+        Serve dynamic-derivation producers (builder-rpc-v0) on this
+        worker: it hands each producer run's listener to the hub's attach
+        on this host over this socket, reachable by the hub's socket group,
+        and advertises builder-rpc-v0. Set it only on the hub's host,
+        where attach runs; this host's hub then hands it to attach.
+      '';
     };
     agentUidBase = lib.mkOption {
       type = lib.types.int;
@@ -351,6 +369,25 @@ in
         tribuchet-worker = workerUnits.workerServiceConfig // {
           restartTriggers = [ workerToml ];
         };
+      };
+    })
+
+    (lib.mkIf (worker.enable && worker.handoffSocket != null) {
+      assertions = [
+        {
+          assertion = lib.hasPrefix "/run/" (toString worker.handoffSocket);
+          message = "services.tribuchet-worker.handoffSocket must be under /run/, its RuntimeDirectory.";
+        }
+        {
+          assertion = config.users.groups.${hub.socketGroup}.gid or null != null;
+          message = "the hub's socketGroup ${hub.socketGroup} needs a fixed gid for the handoff socket.";
+        }
+      ];
+      # The handoff socket's directory, and the group it is given to.
+      systemd.services.tribuchet-worker.serviceConfig = {
+        RuntimeDirectory = lib.removePrefix "/run/" (dirOf (toString worker.handoffSocket));
+        RuntimeDirectoryMode = "0755";
+        SupplementaryGroups = [ hub.socketGroup ];
       };
     })
   ];

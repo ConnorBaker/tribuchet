@@ -1,0 +1,6 @@
+# The package's test phase (nix/package.nix). A test past 300 s is
+# terminated and fails the run, so a hung test frees its builder's slot.
+# Chosen, not measured: the slowest tests wait out 10 s bounds of their own.
+[profile.default]
+slow-timeout = { period = "60s", terminate-after = 5 }
+fail-fast = false

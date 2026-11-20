@@ -4,6 +4,7 @@
   craneLib,
   protobuf,
   busybox-sandbox-shell,
+  cargo-nextest,
   jq,
   libseccomp,
 }:
@@ -15,6 +16,7 @@ let
     fileset = lib.fileset.unions [
       (root + "/Cargo.toml")
       (root + "/Cargo.lock")
+      (root + "/.config/nextest.toml")
       (root + "/crates")
     ];
   };
@@ -63,11 +65,16 @@ craneLib.buildPackage (
   // {
     inherit cargoArtifacts;
     passthru = { inherit cargoArtifacts e2eTests; };
+    # Each test in a process of its own, terminated past its time
+    # (.config/nextest.toml): a hung test fails the build instead of
+    # holding a builder's slot.
+    nativeBuildInputs = commonArgs.nativeBuildInputs ++ [ cargo-nextest ];
+    cargoTestCommand = "cargo nextest run --cargo-profile release --no-tests=fail";
   }
   // lib.optionalAttrs stdenv.hostPlatform.isDarwin {
     # sandbox_init is not permitted inside the Nix build sandbox;
     # `nix develop -c cargo test` runs it
-    cargoTestExtraArgs = "-- --skip=worker::agents::tests::seatbelt_profile_confines_the_builder";
+    cargoTestExtraArgs = "-- --skip worker::agents::tests::seatbelt_profile_confines_the_builder";
   }
   // lib.optionalAttrs stdenv.hostPlatform.isLinux {
     # default network backend for fixed-output builds

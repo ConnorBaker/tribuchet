@@ -10,6 +10,8 @@
   # long serial run, and only nspawn seeds the ~900 MB container closure
   # into the VM stores.
   phase,
+  # The dyndrv phase's Nix (flake.nix).
+  nixDyndrv ? null,
 }:
 {
   pkgs,
@@ -27,7 +29,17 @@ let
     let
       f = ./tests + "/phase-${phase}.nix";
     in
-    if builtins.pathExists f then import f { inherit pkgs lib tribuchet; } else { };
+    if builtins.pathExists f then
+      import f {
+        inherit
+          pkgs
+          lib
+          tribuchet
+          nixDyndrv
+          ;
+      }
+    else
+      { };
   # one agent socket per agent: per core and a spare with agents = "auto",
   # whose worker takes one build per core
   inherit (nodes.worker.virtualisation) cores;
