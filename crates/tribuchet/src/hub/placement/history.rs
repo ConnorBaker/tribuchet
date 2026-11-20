@@ -9,13 +9,16 @@
 //! 2026-10-28T22:55Z to 2026-11-06T01:19Z, 1,922,660 lines with 360,131
 //! usage lines (the live journal has rotated since), 360,122 of them of
 //! builds whose system it names, each predicted from the builds that
-//! finished before it was queued by a model of this file. The key had
-//! runs for 98.3 % of them, a prefix for 1.4 %, the class for 0.3 %, the
-//! prior for 4 builds.
+//! finished before it was queued by a model of this file as it was
+//! before memory admission, when a failed run taught nothing and an
+//! OOM-killed one
+//! taught the class and prefixes; these figures, and those below, were
+//! not measured again under the rule here. The key had runs for 98.3 % of
+//! them, a prefix for 1.4 %, the class for 0.3 %, the prior for 4 builds.
 //!
-//! Each key keeps its last WINDOW runs that succeeded or were OOM-killed:
-//! - memory: the largest peak among them (an OOM-killed run's peak is a
-//!   lower bound on what it needed, and enters as such). Of the 2,462
+//! Each key keeps its last WINDOW runs:
+//! - memory: the largest peak among them (a run that did not succeed
+//!   enters as its own peak: Runs::learn, History::record). Of the 2,462
 //!   builds that succeeded peaking at 8 GiB or more it covered 1,348,
 //!   reserving 1.16x what those used (2.33x over all builds); the max of
 //!   4 runs covered 1,067, the last run 620, the median 484, the max of
@@ -29,6 +32,7 @@
 //! shown a ranking that weighs them doing better.
 
 use std::collections::{HashMap, VecDeque};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::iter;
 
 use crate::proto::BuildUsage;
@@ -167,6 +171,26 @@ impl Runs {
         self.oom = self.oom.saturating_add(u32::from(oom));
     }
 
+    /// Add `run` to a key's or a prefix's last WINDOW, whose memory is a
+    /// largest peak. A censored run peaking no higher than a success there
+    /// is not added, which would push measured runs out; the smallest such
+    /// success moves to the newest place instead, so a peak no lower than
+    /// the censored one stays as long as that run would have.
+    fn learn(&mut self, run: Run, oom: bool) {
+        let covers = |r: &&Run| r.3 && r.0 >= run.0;
+        let cover = (self.runs.iter().enumerate())
+            .filter(|(_, r)| !run.3 && covers(r))
+            .min_by_key(|(_, r)| r.0)
+            .map(|(i, _)| i);
+        match cover.and_then(|i| self.runs.remove(i)) {
+            Some(r) => {
+                self.runs.push_back(r);
+                self.oom = self.oom.saturating_add(u32::from(oom));
+            }
+            None => self.push(run, oom, WINDOW),
+        }
+    }
+
     /// Medians of cores and running seconds over the runs that
     /// succeeded, if one did.
     fn timing(&self) -> Option<(f64, f64)> {
@@ -175,21 +199,32 @@ impl Runs {
         Some((cores, median(timed.iter().map(|t| t.1).collect())?))
     }
 
-    /// Peaks as `stat` sees them, cores and seconds; a level without a
-    /// succeeded run takes `fallback`'s cores and no seconds.
+    /// The peak `level` takes, cores and seconds; a level without a
+    /// succeeded run takes `fallback`'s cores and no seconds. A key takes
+    /// its largest peak, censored or not (its own runs: a bound); a
+    /// prefix, the largest of the peaks that succeeded, with none, its
+    /// largest (a pname's peak censored above its siblings' is its own
+    /// bound, no other pname's guess, as a runaway's); a class, its 90th
+    /// percentile (quantile).
     #[allow(clippy::cast_precision_loss)]
-    fn expected(&self, level: Level, peak: fn(&[u64]) -> u64, fallback: f64) -> Option<Expected> {
-        let peaks: Vec<u64> = self.runs.iter().map(|r| r.0).collect();
-        if peaks.is_empty() {
-            return None;
-        }
+    fn expected(&self, level: Level, fallback: f64) -> Option<Expected> {
+        let largest = |succeeded: bool| {
+            (self.runs.iter().filter(|r| r.3 || !succeeded))
+                .map(|r| r.0)
+                .max()
+        };
+        let peak = match level {
+            Level::Key => largest(false),
+            Level::Prefix => largest(true).or_else(|| largest(false)),
+            Level::Class | Level::Prior => quantile(&self.runs, 0.9),
+        }?;
         let (cores, secs) = self
             .timing()
             .map_or((fallback, None), |(c, s)| (c, Some(s)));
         Some(Expected {
             demand: Demand {
                 cores,
-                memory: peak(&peaks) as f64,
+                memory: peak as f64,
             },
             secs,
             level,
@@ -199,14 +234,33 @@ impl Runs {
     }
 }
 
-fn largest(peaks: &[u64]) -> u64 {
-    peaks.iter().copied().max().unwrap_or(0)
-}
-
-fn p90(peaks: &[u64]) -> u64 {
-    let mut s = peaks.to_vec();
-    s.sort_unstable();
-    s[(s.len() * 9 / 10).min(s.len() - 1)]
+/// The `q`-quantile of peaks by Kaplan-Meier (JASA 53, 1958), a run that
+/// did not succeed right-censored at its peak, a success first at a tie.
+/// Where censoring leaves it short of `q`, the `q`-quantile of all peaks,
+/// a lower bound, as each build needs at least its peak, and no lower
+/// than the last success: the quantile is above it. Uncensored, the
+/// k-th smallest peak for the least k with k/n above `q`.
+#[allow(
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss
+)]
+fn quantile(runs: &VecDeque<Run>, q: f64) -> Option<u64> {
+    let mut obs: Vec<(u64, bool)> = runs.iter().map(|r| (r.0, r.3)).collect();
+    obs.sort_by_key(|&(peak, ok)| (peak, !ok));
+    let (n, mut survives) = (obs.len(), 1.0);
+    for (i, &(peak, ok)) in obs.iter().enumerate() {
+        if ok {
+            survives *= 1.0 - 1.0 / (n - i) as f64;
+            if survives <= 0.0 || 1.0 - survives > q + 1e-9 {
+                return Some(peak);
+            }
+        }
+    }
+    let k = ((q + 1e-9) * n as f64).floor() as usize;
+    let last = obs.iter().filter(|o| o.1).map(|o| o.0).max();
+    obs.get(k.min(n.saturating_sub(1)))
+        .map(|o| o.0.max(last.unwrap_or(0)))
 }
 
 /// The pname: the name up to the first dash-part that does not start
@@ -264,9 +318,38 @@ pub(in crate::hub) struct History {
     prefixes: HashMap<String, Runs>,
     /// "system/declared" (true or false) to the class's runs.
     classes: HashMap<String, Runs>,
+    /// How many runs it has learned.
+    learned: u64,
+    /// Each entry's name (entry), to the count of runs learned when a run
+    /// last changed it: what an expectation read of it (Read) still holds.
+    touched: HashMap<u64, u64>,
+}
+
+/// What an expectation was read from: the runs learned then, and the
+/// entries it read (entry). It holds while none of them has learned a
+/// run since (History::fresh).
+#[derive(Clone, Debug)]
+pub(in crate::hub) struct Read {
+    at: u64,
+    entries: Vec<u64>,
+}
+
+/// An entry's name as `touched` keeps it: its kind (key, prefix, class)
+/// and name, hashed. Two names that hash alike only make a read stale
+/// sooner.
+fn entry(kind: u8, name: &str) -> u64 {
+    let mut h = DefaultHasher::new();
+    (kind, name).hash(&mut h);
+    h.finish()
 }
 
 impl History {
+    /// A key none of whose runs succeeded takes the guess of the first of
+    /// its prefixes and class with a run that succeeded, else the prior, no
+    /// lower than its largest peak: a failed run bounds its own build's
+    /// need from below, and says nothing of how far above, so neither it
+    /// nor its kin's failures stand in for a measured need.
+    #[allow(clippy::cast_precision_loss)]
     pub(in crate::hub) fn expect(&self, b: &Build) -> Expected {
         let class = self.classes.get(&format!("{}/{}", b.system, b.declared));
         let prior = Expected::prior(b.declared);
@@ -274,46 +357,99 @@ impl History {
             .and_then(Runs::timing)
             .map_or(prior.demand.cores, |t| t.0);
         let pname = b.name.map(pname);
-        let of_key = b.name.and_then(|n| self.keys.get(&key(b.system, n)));
-        let by_prefix =
-            || prefixes(pname?).find_map(|pre| self.prefixes.get(&format!("{}/{pre}", b.system)));
-        of_key
-            .and_then(|r| r.expected(Level::Key, largest, fallback))
-            .or_else(|| by_prefix()?.expected(Level::Prefix, largest, fallback))
-            .or_else(|| class?.expected(Level::Class, p90, fallback))
-            .unwrap_or(prior)
+        let key = pname.and_then(|p| self.keys.get(&format!("{}/{p}", b.system)));
+        let some = |r: &&Runs| r.runs.iter().any(|r| r.3);
+        let succeeded = key.filter(some);
+        let failed = key.filter(|_| succeeded.is_none());
+        let measured = |r: &&Runs| failed.is_none() || some(r);
+        let by_prefix = || {
+            prefixes(pname?).find_map(|pre| {
+                (self.prefixes.get(&format!("{}/{pre}", b.system))).filter(measured)
+            })
+        };
+        let e = succeeded
+            .and_then(|r| r.expected(Level::Key, fallback))
+            .or_else(|| by_prefix()?.expected(Level::Prefix, fallback))
+            .or_else(|| class.filter(measured)?.expected(Level::Class, fallback))
+            .unwrap_or(prior);
+        match failed.and_then(|r| Some((r.runs.iter().map(|r| r.0).max()?, r.oom))) {
+            Some((peak, oom)) => Expected {
+                demand: Demand {
+                    memory: e.demand.memory.max(peak as f64),
+                    ..e.demand
+                },
+                level: Level::Key,
+                oom,
+                ..e
+            },
+            None => e,
+        }
     }
 
-    /// Learn from a build's run: the worker's usage and its exit code. A
-    /// failed run teaches nothing (in the replay, learning failed runs'
-    /// peaks lengthened waits), an OOM-killed one its peak, as a lower
-    /// bound. Each delivered result is a run: on the journal above, one
-    /// build of 360,131 results was delivered twice, under two ids: the
-    /// watchdog restarted the hub, the build was submitted anew, and its
-    /// worker resumed it.
-    pub(in crate::hub) fn record(&mut self, b: &Build, exit_code: i32, u: &BuildUsage) {
-        let oom = u.oom_killed;
-        if exit_code != 0 && !oom {
-            return;
+    /// `b`'s expectation, and what it read: its key alone where the key
+    /// has a success with timing, else also its prefixes and class.
+    pub(in crate::hub) fn read(&self, b: &Build) -> (Expected, Read) {
+        let e = self.expect(b);
+        let pname = b.name.map(pname);
+        let key = pname.map(|p| format!("{}/{p}", b.system));
+        let runs = key.as_ref().and_then(|k| self.keys.get(k));
+        let own = runs.is_some_and(|r| r.runs.iter().any(|r| r.3) && r.timing().is_some());
+        let mut entries: Vec<u64> = key.iter().map(|k| entry(0, k)).collect();
+        if !own {
+            let pres = pname.into_iter().flat_map(prefixes);
+            entries.extend(pres.map(|p| entry(1, &format!("{}/{p}", b.system))));
+            entries.push(entry(2, &format!("{}/{}", b.system, b.declared)));
         }
-        let Some(run) = Run::of(u, !oom) else {
+        let at = self.learned;
+        (e, Read { at, entries })
+    }
+
+    /// Whether what `r` read is still the history's: none of its entries
+    /// has learned a run since.
+    pub(in crate::hub) fn fresh(&self, r: &Read) -> bool {
+        (r.entries.iter()).all(|h| self.touched.get(h).is_none_or(|at| *at <= r.at))
+    }
+
+    /// Learn from a build's run: its key, its pname's prefixes and its
+    /// class. One that failed or was OOM-killed is right-censored at its
+    /// own peak (Runs::expected, quantile): it teaches memory only, no
+    /// timing. A run the worker measured nothing of teaches nothing.
+    pub(in crate::hub) fn record(&mut self, b: &Build, exit_code: i32, u: &BuildUsage) {
+        self.learned += 1;
+        let (ok, oom) = (exit_code == 0 && !u.oom_killed, u.oom_killed);
+        let run = Run::of(u, ok);
+        if let (Some(key), Some(r)) = (Self::key_of(b), run) {
+            self.touched.insert(entry(0, &key), self.learned);
+            self.keys.entry(key).or_default().learn(r, oom);
+        }
+        let Some(run) = run else {
             return;
         };
         let class = format!("{}/{}", b.system, b.declared);
-        self.classes
-            .entry(class)
-            .or_default()
-            .push(run, oom, CLASS_WINDOW);
-        if let Some(name) = b.name {
-            let p = pname(name);
-            (self.keys.entry(key(b.system, name)).or_default()).push(run, oom, WINDOW);
-            for pre in iter::once(p).chain(prefixes(p)) {
-                self.prefixes
-                    .entry(format!("{}/{pre}", b.system))
-                    .or_default()
-                    .push(run, oom, WINDOW);
-            }
+        self.touched.insert(entry(2, &class), self.learned);
+        (self.classes.entry(class).or_default()).push(run, oom, CLASS_WINDOW);
+        let pname = b.name.map(pname);
+        for pre in pname
+            .into_iter()
+            .flat_map(|p| iter::once(p).chain(prefixes(p)))
+        {
+            let name = format!("{}/{pre}", b.system);
+            self.touched.insert(entry(1, &name), self.learned);
+            (self.prefixes.entry(name).or_default()).learn(run, oom);
         }
+    }
+
+    /// Whether a run of `b`'s key has succeeded, its usage measured: until
+    /// one has, its builds go one at a time (Placement::held_for_key), as
+    /// what a failed or unmeasured run taught is no measure of them.
+    pub(in crate::hub) fn ran(&self, b: &Build) -> bool {
+        let key = Self::key_of(b).and_then(|k| self.keys.get(&k));
+        key.is_some_and(|r| r.runs.iter().any(|r| r.3))
+    }
+
+    /// The key `b` is known by, "system/pname", if its name could be read.
+    pub(in crate::hub) fn key_of(b: &Build) -> Option<String> {
+        b.name.map(|n| key(b.system, n))
     }
 
     /// Its keys, and its entries: keys, prefixes and classes.

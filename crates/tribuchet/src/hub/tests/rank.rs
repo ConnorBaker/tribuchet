@@ -8,10 +8,13 @@ use std::pin::{Pin, pin};
 
 use tokio::sync::futures::Notified;
 
-use crate::proto::BuildResult;
-use placement::{Demand, Expected, GRACE, Level, Room, Rooms, Size};
+use crate::proto::{BuildResult, BuildUsage};
+use placement::{Demand, Expected, GRACE, Level, Placed, Room, Rooms, Size};
 
+mod charges;
 mod clientless;
+mod memory;
+mod reserve;
 
 const GIB: f64 = 1_073_741_824.0;
 
@@ -66,11 +69,38 @@ fn expecting(cores: f64, gib: f64) -> Expected {
     }
 }
 
+/// `j` named `name`, expected to use `e`: at the key level, as a run of
+/// its key taught, which a take reads afresh.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+fn taught(state: &HubState, j: &mut Job, name: &str, e: Expected) {
+    j.req.outputs = [("out".to_owned(), format!("/nix/store/{H}-{name}"))].into();
+    if e.level == Level::Key {
+        let wall = e.secs.unwrap_or(1.0) * 1000.0;
+        let usage = BuildUsage {
+            wall_ms: wall as u64,
+            cpu_usec: (e.demand.cores * wall * 1000.0) as u64,
+            peak_memory_bytes: e.demand.memory as u64,
+            ..Default::default()
+        };
+        let mut p = state.placement.lock().unwrap();
+        p.history.record(&placement::build_of(j), 0, &usage);
+    }
+    j.expected = e;
+}
+
+/// The queued build `n` has waited AGE: a worker may be kept for it.
+async fn aged(state: &HubState, n: usize) {
+    let mut q = state.queue.lock().await;
+    let j = q.iter_mut().find(|j| j.id == id(n)).unwrap();
+    j.queued_at = Instant::now().checked_sub(placement::AGE).unwrap();
+}
+
 /// Queue build `n`, named `name`, expected to use `e`, with a client.
 async fn queue(state: &HubState, n: usize, name: &str, e: Expected) -> Client {
     let mut j = job(n, Arc::new(Replay::default()));
-    j.req.outputs = [("out".to_owned(), format!("/nix/store/{H}-{name}"))].into();
-    j.expected = e;
+    taught(state, &mut j, name, e);
+    // Stamped as a submit stamps it (submit.rs, Placement::refresh).
+    state.placement.lock().unwrap().stamp(&mut j);
     let client = j.replay.subscribe().await;
     state.queue.lock().await.push_back(j);
     state.notify.notify_waiters();
@@ -138,6 +168,8 @@ fn a_size_is_the_registered_cores_and_memory() {
         size,
         load: Demand::default(),
         clientless: Demand::default(),
+        empty: true,
+        only_clientless: false,
     };
     let rooms = [(1, size(Some(4), 2, None)), (2, size(None, 0, None))].map(room);
     let mut rooms = Rooms::new(1, rooms.to_vec());
@@ -152,7 +184,8 @@ fn a_size_is_the_registered_cores_and_memory() {
 async fn a_resumed_build_counts_until_its_supervision_ends() {
     let state = Arc::new(HubState::for_test(Duration::from_secs(30)));
     let mut j = job(0, Arc::new(Replay::default()));
-    j.expected = expecting(3.0, 1.0);
+    taught(&state, &mut j, "resumed-0", expecting(3.0, 1.0));
+    state.placement.lock().unwrap().stamp(&mut j);
     let _client = j.replay.subscribe().await;
     state.queue.lock().await.push_back(j);
     let mut w = connect(&state, "w", 1, &["k0"]);
@@ -181,7 +214,8 @@ async fn a_build_never_sent_stops_counting() {
     let state = Arc::new(HubState::for_test(Duration::from_secs(30)));
     let input = format!("/nix/store/{H}-cached");
     let mut unsendable = job(0, Arc::new(Replay::default()));
-    (unsendable.req.input_paths, unsendable.expected) = (vec![input.clone()], expecting(3.0, 1.0));
+    unsendable.req.input_paths = vec![input.clone()];
+    taught(&state, &mut unsendable, "unsendable-0", expecting(3.0, 1.0));
     let mut client = unsendable.replay.subscribe().await;
     let wanting = job(1, Arc::new(Replay::default()));
     let _wanting = wanting.replay.subscribe().await;
@@ -201,46 +235,6 @@ async fn a_build_never_sent_stops_counting() {
     drop(client);
     tokio::time::sleep(FLOOR + Duration::from_secs(6)).await;
     assert_eq!(committed_cores(&state), 0.0, "given up unsent");
-}
-
-/// The dispatch line says what a build declares and is expected to use,
-/// how many other workers that serve it have an idle agent, and the
-/// worker's size and expected load with it; a load over the worker's
-/// memory is said once more, and the build is placed all the same.
-#[tokio::test]
-async fn the_dispatch_line_names_the_expectation_and_the_room() {
-    let log = Captured;
-    let _guard = log.install();
-    let state = Arc::new(HubState::for_test(Duration::from_secs(30)));
-    let mut w1 = sized_worker(&state, "w1", 4, 8);
-    w1.to_hub.send(declare(3, 2, 0)).await.unwrap();
-    let _c0 = queue(&state, 0, "big-0", expecting(2.0, 6.0)).await;
-    assert!(w1.assignment().await.is_some(), "big-0 not assigned");
-    let line = log.line(r#"drv="big-0""#);
-    for field in [
-        r#"features="""#,
-        "idle_elsewhere=0",
-        r#"learned="key""#,
-        "expect_mem=6442450944",
-        "expect_cores=2.0",
-        "load_mem=6442450944",
-        "load_cores=2.0",
-        "memory=8589934592",
-        "cores=4.0",
-    ] {
-        assert!(line.contains(field), "{field} missing from {line}");
-    }
-    assert!(!log.has(&["placed over predicted memory"]), "big-0 fits");
-    let _c1 = queue(&state, 1, "big-1", expecting(1.0, 6.0)).await;
-    assert!(w1.assignment().await.is_some(), "big-1 held back");
-    assert!(
-        log.has(&[
-            "placed over predicted memory",
-            "load_mem=12884901888",
-            "memory=8589934592"
-        ]),
-        "big-1 over the worker's memory, unsaid"
-    );
 }
 
 /// Worker `name`, as take_job sees it with no session loop: its
@@ -278,11 +272,13 @@ fn seated(
         cores: load.0,
         memory: load.1 * GIB,
     };
-    let held = placement::Placed {
+    let in_flight = Placed {
         demand: in_flight,
         owners: Vec::new(),
+        key: None,
+        ends: None,
     };
-    session.committed.insert("in-flight".into(), held);
+    session.committed.insert("in-flight".into(), in_flight);
     drop(placement);
     (guard, caps)
 }
@@ -362,6 +358,8 @@ fn a_build_is_passed_over_within_grace_to_the_least_full_room() {
         size: SMALL,
         load: Demand { cores, memory: 0.0 },
         clientless: Demand::default(),
+        empty: false,
+        only_clientless: false,
     };
     let build = Demand {
         cores: 2.0,
@@ -466,6 +464,8 @@ fn fullness_weighs_size_and_memory_where_every_room_reported_it() {
             memory: gib * GIB,
         },
         clientless: Demand::default(),
+        empty: false,
+        only_clientless: false,
     };
     let build = Demand {
         cores: 0.5,
@@ -479,16 +479,18 @@ fn fullness_weighs_size_and_memory_where_every_room_reported_it() {
         room(1, 4.0, Some(8.0), 0.0, 3.0),
         room(2, 4.0, Some(8.0), 1.5, 0.0),
     );
-    let (b_free, b_full) = (
+    // b_most has room for the build's memory (5 + 2 of 8 GiB), so admits
+    // it, and is fuller than the asker by memory only.
+    let (b_free, b_most) = (
         room(2, 4.0, Some(8.0), 2.0, 0.0),
-        room(2, 4.0, Some(8.0), 1.0, 7.0),
+        room(2, 4.0, Some(8.0), 1.0, 5.0),
     );
     let rows = [
         ("4 cores ask", a4.clone(), b32, Some(2)),
         ("32 cores ask", a32, b4.clone(), None),
         ("reported", full.clone(), b_free, Some(2)),
         ("not reported", full, b4, None),
-        ("asker reported none", a4, b_full, Some(2)),
+        ("asker reported none", a4, b_most, Some(2)),
         ("this one counted", a64, b8, None),
         ("this one's memory counted", a_half, b_busy, Some(2)),
     ];
@@ -512,26 +514,6 @@ async fn a_requeued_build_is_passed_over_afresh() {
     state.requeue(j).await;
     let taken = state.take_job(&a_caps, Some(a.id)).await;
     assert!(taken.is_none(), "taken: its grace counted from before");
-}
-
-/// A build counts against its worker from its dispatch until its
-/// supervision settles it.
-#[tokio::test]
-async fn a_build_counts_against_its_worker_until_it_settles() {
-    let state = Arc::new(HubState::for_test(Duration::from_secs(30)));
-    let mut w = sized_worker(&state, "w1", 4, 8);
-    w.to_hub.send(declare(3, 2, 0)).await.unwrap();
-    let mut client = queue(&state, 0, "heavy-0", expecting(3.0, 1.0)).await;
-    let build_id = w.assignment().await.expect("not assigned").build_id;
-    assert_eq!(committed_cores(&state), 3.0, "dispatched");
-    let result = BuildResult {
-        build_id,
-        exit_code: 1,
-        ..Default::default()
-    };
-    w.send(worker_message::Msg::Result(result)).await;
-    while client.recv().await.is_some() {}
-    assert_eq!(committed_cores(&state), 0.0, "settled");
 }
 
 /// A queued build dropped during the scan, its client gone, makes take_job
@@ -569,7 +551,8 @@ async fn a_build_is_not_left_to_a_worker_that_does_not_serve_it() {
     });
     (state.placement.lock().unwrap()).open(b.id, Arc::new(Mutex::new(idle)), SMALL);
     let mut j = job(0, Arc::new(Replay::default()));
-    (j.features, j.expected) = (vec!["big-parallel".into()], expecting(4.0, 1.0));
+    j.features = vec!["big-parallel".into()];
+    taught(&state, &mut j, "bp-0", expecting(4.0, 1.0));
     let _client = j.replay.subscribe().await;
     state.queue.lock().await.push_back(j);
     let job = state.take_job(&a_caps, Some(a.id)).await;

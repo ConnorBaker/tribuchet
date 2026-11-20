@@ -98,6 +98,23 @@ fn run(row: &Row, problems: &mut Vec<String>) {
     limits(row.limits);
     let kills = oom_kills();
     let names = row.work.map(|w| format!("{}-{w}", row.name));
+    // Each build first alone, as a no-op (N): the hub admits a pair by
+    // the memory history expects, and both must fit the slice to co-run,
+    // the arbiter's subject. Their own keys, so learned, expect almost
+    // none, whatever another row taught their class. That relies on the
+    // no-op's peak (its shell's) not being 0: a run measured as 0 teaches
+    // nothing (Run::of), which the check of each dispatch below catches.
+    for name in &names {
+        let usage = count(Node::Hub, "tribuchet-hub", "build usage");
+        succeed(
+            Node::Hub,
+            &format!(
+                "nix-build /etc/tt/pair.nix --argstr name {name} --argstr work N --no-out-link"
+            ),
+        );
+        let learned = more_than("tribuchet-hub", "build usage", usage);
+        wait_until_succeeds(Node::Hub, &learned, 120);
+    }
     for (name, work) in names.iter().zip(row.work) {
         let started = count(Node::Worker, "tribuchet-worker", "builder started on agent");
         submit(
@@ -144,6 +161,19 @@ fn run(row: &Row, problems: &mut Vec<String>) {
         silent == 0 || frozen > silent * 1000,
         "frozen past its silence",
     );
+    for name in &names {
+        let line = succeed(
+            Node::Hub,
+            &format!(
+                "{} | grep 'dispatching build' | grep -F 'drv=\"{name}\"' | tail -n 1 || true",
+                journal("tribuchet-hub")
+            ),
+        );
+        problem(
+            line.contains("learned=\"key\""),
+            "dispatched not by its key's own runs (the no-op taught none)",
+        );
+    }
 }
 
 /// Each row, every problem reported at the end.

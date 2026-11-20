@@ -31,7 +31,8 @@
 //!   counts none). A placed build holds for the clients waiting for it as
 //!   it was placed, each once, until it settles (`Charges`). The clients
 //!   no request names are one client, unknown, charged as one. Share is
-//!   logged at each dispatch and is not in the order: behind
+//!   logged at each dispatch, as it was while the build waited (without
+//!   its own charge), and is not in the order: behind
 //!   nix-grpc-store, which opens a nix-daemon connection per build, each
 //!   build is its own client and holds nothing while it waits, so a client
 //!   the hub can name would wait behind every one of them, without bound.
@@ -116,11 +117,22 @@ impl Charges {
     }
 
     /// The least dominant share, of the farm's `total`, among the clients
-    /// waiting for `job` now; 0 for none.
-    pub(in crate::hub) fn least(&self, job: &Job, total: Demand) -> f64 {
+    /// waiting for `job` now, less `own`, a charge `job` itself holds, for
+    /// the clients it holds it for; 0 for none.
+    pub(in crate::hub) fn least(
+        &self,
+        job: &Job,
+        total: Demand,
+        own: Option<(&[Option<Arc<str>>], Demand)>,
+    ) -> f64 {
         let frac = |x: f64, of: f64| if of > 0.0 { x / of } else { 0.0 };
         let share = |o: &Option<Arc<str>>| {
             self.of.get(o).map_or(0.0, |(d, _)| {
+                let less = own.filter(|(owners, _)| owners.contains(o));
+                let d = less.map_or(*d, |(_, x)| Demand {
+                    cores: d.cores - x.cores,
+                    memory: d.memory - x.memory,
+                });
                 frac(d.cores, total.cores).max(frac(d.memory, total.memory))
             })
         };

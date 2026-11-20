@@ -1,6 +1,7 @@
 //! Which worker a queued build is left to: the least full with an idle
-//! agent, by what its builds are expected to use (history.rs) against its
-//! size. Fullness is the larger of committed cores over the worker's
+//! agent that admits it for its memory (Room::admits), by what its builds
+//! are expected to use (history.rs) against its size. Fullness is the
+//! larger of committed cores over the worker's
 //! cores and committed memory over the memory its builds may use, each
 //! with the build added. On the copy of the hub's journal of history.rs,
 //! replayed by a model with 32 cores and a slot per core on every worker,
@@ -42,17 +43,48 @@ pub(in crate::hub) struct Room {
     pub(in crate::hub) load: Demand,
     /// Of `load`, what its builds the clientless rule may give up hold.
     pub(in crate::hub) clientless: Demand,
+    /// It holds no build.
+    pub(in crate::hub) empty: bool,
+    /// It holds builds, each one the clientless rule may give up.
+    pub(in crate::hub) only_clientless: bool,
+}
+
+/// The most memory any of `rooms` reported for its builds; None where none
+/// reported any.
+pub(in crate::hub) fn largest(rooms: &[Room]) -> Option<f64> {
+    rooms.iter().filter_map(|r| r.size.memory).reduce(f64::max)
 }
 
 impl Room {
-    /// The room with its clientless builds given up.
-    fn freed(&self) -> Self {
+    /// Whether the worker admits a build expected to use `d`, for its
+    /// memory: what it holds and the build fit its builds' memory; or it
+    /// holds nothing and is the largest serving the build (`largest`), so
+    /// a build larger than every worker waits for that, and is not failed
+    /// for its size. No memory reported admits any. Cores are not tested:
+    /// the CPU arbiter shares them, and a test of them starved builds of
+    /// many cores in an offline replay of the hub's recorded placements.
+    pub(in crate::hub) fn admits(&self, d: Demand, largest: Option<f64>) -> bool {
+        let Some(m) = self.size.memory else {
+            return true;
+        };
+        self.load.memory + d.memory <= m || (self.empty && largest.is_none_or(|l| m >= l))
+    }
+
+    /// The room with its clientless builds given up: empty if they are
+    /// all it holds.
+    pub(in crate::hub) fn freed(&self) -> Self {
         let (l, c) = (self.load, self.clientless);
         let load = Demand {
             cores: l.cores - c.cores,
             memory: l.memory - c.memory,
         };
-        Self { load, ..*self }
+        let empty = self.empty || self.only_clientless;
+        Self {
+            load,
+            empty,
+            only_clientless: false,
+            ..*self
+        }
     }
 
     /// How full the worker would be with `d` added: its committed cores
@@ -103,10 +135,15 @@ impl Rooms {
             return None;
         }
         let mine = self.rooms.iter().find(|r| r.id == self.asker)?;
+        let serving: Vec<Room> = (self.rooms.iter())
+            .filter(|r| r.id == self.asker || serves(r.id))
+            .cloned()
+            .collect();
+        let largest = largest(&serving);
         let others: Vec<usize> = (0..self.rooms.len())
             .filter(|&i| {
                 let r = &self.rooms[i];
-                r.id != self.asker && r.idle > 0 && serves(r.id)
+                r.id != self.asker && r.idle > 0 && serves(r.id) && r.admits(d, largest)
             })
             .collect();
         let memory = mine.size.memory.is_some()
@@ -142,6 +179,7 @@ impl Rooms {
         let room = &mut self.rooms[best];
         room.idle -= 1;
         room.load = room.load.plus(d);
+        (room.empty, room.only_clientless) = (false, false);
         since.get_or_insert(now);
         Some(room.id)
     }

@@ -243,39 +243,57 @@ impl HubState {
         }
     }
 
-    /// For each queued build waiting for a slot, the worker sessions
-    /// that serve it: those with a client, that no session with a free
-    /// slot serves (one would take them), nor a worker's key holds, nor a
-    /// loss keeps for a worker still awaited. The queue is not held while
-    /// it asks the replays for clients.
-    async fn waiting_queued(&self) -> Vec<Vec<u64>> {
+    /// For each queued build with a client waiting for a slot, the
+    /// sessions that would take it but for one (Placement::waits), none
+    /// with a free slot, nor a key or loss keeping it for another. One that
+    /// would take none wants clientless builds given up at one worker, the
+    /// first by id, where that lets it in (wants_memory). The replays are
+    /// asked for clients off the queue's lock.
+    pub(in crate::hub) async fn waiting_queued(&self) -> Vec<Vec<u64>> {
+        let open = self.open_clientless();
+        let mut wanted = Vec::new();
         let candidates: Vec<(Arc<Replay>, Vec<u64>)> = {
-            let queue = self.queue.lock().await;
+            let mut queue = self.queue.lock().await;
             let holding = self.holding.lock().unwrap();
             let workers = self.worker_caps.lock().unwrap();
             let placement = self.placement.lock().unwrap();
-            let free: Vec<&WorkerCaps> = placement
-                .sessions
-                .iter()
+            let rooms = placement.rooms_for(0, &open).rooms;
+            let mut scan = placement.scan();
+            let free: HashSet<u64> = (placement.sessions.iter())
                 .filter(|(_, s)| s.admission.lock().unwrap().free > 0)
-                .filter_map(|(id, _)| workers.get(id))
+                .map(|(id, _)| *id)
                 .collect();
-            queue
-                .iter()
-                .filter(|j| {
-                    !j.kept(&workers, &holding)
-                        && !free.iter().any(|c| c.serves(&j.req.system, &j.features))
-                })
-                .map(|j| {
-                    let serving = workers
-                        .iter()
-                        .filter(|(_, c)| c.serves(&j.req.system, &j.features))
-                        .map(|(id, _)| *id)
+            (queue.iter_mut().filter(|j| !j.kept(&workers, &holding)))
+                .filter_map(|j| {
+                    placement.refresh(j);
+                    let j = &*j;
+                    let serves = |id| {
+                        (workers.get(&id)).is_some_and(|c| c.serves(&j.req.system, &j.features))
+                    };
+                    let mut ids: Vec<u64> =
+                        workers.keys().copied().filter(|id| serves(*id)).collect();
+                    ids.sort_unstable();
+                    let takes: Vec<u64> = (ids.iter().copied())
+                        .filter(|id| !placement.waits(j, Some(*id), serves, &mut scan))
                         .collect();
-                    (j.replay.clone(), serving)
+                    if takes.is_empty() {
+                        let mut short = ids.iter();
+                        let want = short.find(|id| placement.wants_memory(j, **id, serves, &rooms));
+                        wanted.extend(want.map(|id| (*id, j.id.clone(), j.replay.clone())));
+                    }
+                    let waiting = !takes.is_empty() && !takes.iter().any(|id| free.contains(id));
+                    waiting.then(|| (j.replay.clone(), takes))
                 })
                 .collect()
         };
+        {
+            let mut placement = self.placement.lock().unwrap();
+            for (s, id, replay) in wanted {
+                if let Some(s) = placement.sessions.get_mut(&s) {
+                    s.wants.insert(id, replay);
+                }
+            }
+        }
         let mut waiting = Vec::new();
         for (replay, serving) in candidates {
             if replay.has_subscribers().await {

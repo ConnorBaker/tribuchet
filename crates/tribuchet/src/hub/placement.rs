@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use rusqlite::types::Value;
 
@@ -25,14 +25,18 @@ mod history;
 pub(super) mod objective;
 #[path = "placement/rank.rs"]
 mod rank;
+#[path = "placement/reserve.rs"]
+mod reserve;
 pub(super) use downstream::Downstream;
 #[cfg(test)]
 pub(super) use history::Level;
-pub(super) use history::{Build, Demand, Expected, History};
+pub(super) use history::{Build, Demand, Expected, History, Read};
 use objective::{Charges, Priority};
 #[cfg(test)]
 pub(super) use rank::GRACE;
 pub(super) use rank::{Room, Rooms, Size};
+#[cfg(test)]
+pub(super) use reserve::AGE;
 
 /// The history key of `job`, if its name could be read.
 fn key_of(job: &Job) -> Option<String> {
@@ -71,11 +75,17 @@ pub(super) fn size_of(register: &Register) -> Size {
 }
 
 /// A build handed to a session and not yet settled: what it is expected
-/// to use, and the clients it holds a share for, those waiting for it as
-/// it was placed (objective.rs).
+/// to use, the clients it holds a share for, those waiting for it as it
+/// was placed (objective.rs), and its history key, which holds the key's
+/// other builds while the key has no run of its own
+/// (Placement::held_for_key).
+#[derive(Clone, Debug)]
 pub(super) struct Placed {
     pub(super) demand: Demand,
     pub(super) owners: Vec<Option<Arc<str>>>,
+    pub(super) key: Option<String>,
+    /// When it is expected to end: its dispatch and its expected seconds.
+    pub(super) ends: Option<Instant>,
 }
 
 /// A worker session as placement sees it.
@@ -97,7 +107,7 @@ pub(super) struct Session {
 
 impl Session {
     pub(super) fn load(&self) -> Demand {
-        (self.committed.values()).fold(Demand::default(), |sum, h| sum.plus(h.demand))
+        (self.committed.values()).fold(Demand::default(), |sum, c| sum.plus(c.demand))
     }
 }
 
@@ -153,15 +163,21 @@ impl Placement {
     }
 
     pub(super) fn expect(&self, job: &Job) -> Expected {
+        self.with_below(job, self.history.expect(&build_of(job)))
+    }
+
+    /// `e`, the history's expectation of `job`, with the running seconds
+    /// learned to follow `job` (downstream.rs), which the queue's order
+    /// reads (objective.rs).
+    fn with_below(&self, job: &Job, e: Expected) -> Expected {
         let below = key_of(job).map_or(0.0, |k| self.downstream.below(&k));
-        Expected {
-            below,
-            ..self.history.expect(&build_of(job))
-        }
+        Expected { below, ..e }
     }
 
     /// The least dominant share of the farm among the clients waiting for
-    /// `job` (objective.rs).
+    /// `job` (objective.rs), as they held it while `job` waited: the charge
+    /// `job` holds from its take (state/take.rs) is not in it, as a build
+    /// resumed by key (take_job_by_key) holds none before its dispatch.
     pub(super) fn share(&self, job: &Job) -> f64 {
         let total = (self.sessions.values()).fold(Demand::default(), |t, s| {
             t.plus(Demand {
@@ -169,7 +185,62 @@ impl Placement {
                 memory: s.size.memory.unwrap_or(0.0),
             })
         });
-        self.charges.least(job, total)
+        let own = (self.sessions.values()).find_map(|s| {
+            let p = s.committed.get(&job.id)?;
+            Some((p.owners.as_slice(), counted(s, p.demand)))
+        });
+        self.charges.least(job, total, own)
+    }
+
+    /// Whether `job` waits for its key: no run of the key has succeeded
+    /// with its usage measured, so `job`'s expectation is a guess (prefix,
+    /// class, prior, or no lower than a failed run's peak), and another
+    /// build of the key is taken and not settled. The end of that run ends
+    /// the wait, and a measured success ends the hold (History::ran). On
+    /// 2026-11-18 a batch guessed at 2-9 GiB used 29-44 GiB each, together.
+    pub(super) fn held_for_key(&self, job: &Job) -> bool {
+        let build = build_of(job);
+        let key = History::key_of(&build).filter(|_| !self.history.ran(&build));
+        let of_key = |c: &Placed| c.key.is_some() && c.key == key;
+        key.is_some() && (self.sessions.values()).any(|s| s.committed.values().any(of_key))
+    }
+
+    /// What `job` is expected to use: as a scan last read it, before it
+    /// asks (Placement::refresh), or afresh if it was never read.
+    pub(super) fn expected(&self, job: &Job) -> Expected {
+        match &job.expected_at {
+            Some(_) => job.expected,
+            None => self.expect(job),
+        }
+    }
+
+    /// Mark `job`'s expectation as read from the history now, as a
+    /// submit does, keeping it.
+    #[cfg(test)]
+    pub(super) fn stamp(&self, job: &mut Job) {
+        job.expected_at = Some(self.history.read(&build_of(job)).1);
+    }
+
+    /// Read `job`'s expectation afresh where what it read learned since.
+    /// Its path (`below`) is the one it was first read with, as it was
+    /// queued: the queue is kept in order by it (objective.rs, enqueue),
+    /// and a build is not moved in it.
+    pub(super) fn refresh(&self, job: &mut Job) {
+        if !job
+            .expected_at
+            .as_ref()
+            .is_some_and(|r| self.history.fresh(r))
+        {
+            let (e, r) = self.history.read(&build_of(job));
+            let e = match job.expected_at {
+                Some(_) => Expected {
+                    below: job.expected.below,
+                    ..e
+                },
+                None => self.with_below(job, e),
+            };
+            (job.expected, job.expected_at) = (e, Some(r));
+        }
     }
 
     /// Learn from a finished run of `job`, and append it to the record,
@@ -200,13 +271,24 @@ impl Placement {
     /// `job` went to `session`, `alone` if its key is lost: its expected
     /// demand counts there until it settles. The session's room with it.
     pub(super) fn dispatched(&mut self, session: u64, job: &Job, alone: bool) -> Option<Room> {
+        let key = History::key_of(&build_of(job));
         let s = self.sessions.get_mut(&session)?;
+        // A take commits a build to its session (state/take.rs) and its
+        // dispatch (dispatch, below) again: the second replaces the first,
+        // whose charge goes, so a build holds one charge until it settles.
+        if let Some(old) = s.committed.remove(&job.id) {
+            self.charges.release(&old.owners, counted(s, old.demand));
+        }
         let (demand, owners) = (job.expected.demand, objective::owners(job));
         self.charges.charge(&owners, counted(s, demand));
-        // A build is settled before it is placed again (hub.rs,
-        // supervise_job), so it replaces none.
-        s.committed
-            .insert(job.id.clone(), Placed { demand, owners });
+        let ends = (job.expected.secs).map(|s| Instant::now() + Duration::from_secs_f64(s));
+        let placed = Placed {
+            demand,
+            owners,
+            key,
+            ends,
+        };
+        s.committed.insert(job.id.clone(), placed);
         if alone {
             s.alone = Some(job.id.clone());
         }
@@ -254,8 +336,11 @@ impl Placement {
     pub(super) fn rooms_for(&self, asker: u64, clientless: &HashSet<String>) -> Rooms {
         let rooms = self.sessions.iter().map(|(id, s)| {
             let theirs = s.committed.iter().filter(|(b, _)| clientless.contains(*b));
+            let only_clientless =
+                !s.committed.is_empty() && theirs.clone().count() == s.committed.len();
             Room {
-                clientless: theirs.fold(Demand::default(), |sum, (_, h)| sum.plus(h.demand)),
+                clientless: theirs.fold(Demand::default(), |sum, (_, c)| sum.plus(c.demand)),
+                only_clientless,
                 ..room(*id, s)
             }
         });
@@ -270,6 +355,8 @@ fn room(id: u64, s: &Session) -> Room {
         size: s.size,
         load: s.load(),
         clientless: Demand::default(),
+        empty: s.committed.is_empty(),
+        only_clientless: false,
     }
 }
 
@@ -277,8 +364,9 @@ fn room(id: u64, s: &Session) -> Room {
 /// name); log the dispatch, and append its record row, with the
 /// declaration that admitted it, its features, how many other workers
 /// that serve it have an idle agent, what it is expected to use, and the
-/// worker's size and expected load with it. Over-memory is only logged:
-/// nothing holds a build back for memory (DESIGN.md, Placement).
+/// worker's size and expected load with it. Over-memory is logged: a
+/// build larger than every worker serving it goes to the largest once it
+/// is empty (Room::admits).
 pub(super) fn dispatch(
     state: &HubState,
     to: (u64, &str),

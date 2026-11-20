@@ -1,9 +1,10 @@
-//! The `spread` phase (nix/tests/phase-spread.nix): a heavy build, which
-//! declares big-parallel, submitted while another runs goes to the other
-//! worker, which has idle agents and would be less full with it: by the
-//! prior for a build that declares big-parallel in round 0, by what the
-//! earlier rounds' builds of its pname used after. Two workers, the worker VM's and one on
-//! the hub VM, each with two agents.
+//! The `spread` phase (nix/tests/phase-spread.nix): a heavy big-parallel
+//! build submitted while another of its pname runs goes to the other
+//! worker, idle and less full with it, by what the earlier rounds taught.
+//! Round 0's two are unseen pnames (one would hold `b` for its key), at a
+//! prior larger than either worker: `b` waits for the largest to empty
+//! and is taken with what `a` taught their prefix, on either worker. Two
+//! workers, the worker VM's and the hub VM's, each with two agents.
 
 use crate::harness::{Node, ended, journal, submit, succeed, wait_until_succeeds};
 
@@ -52,7 +53,10 @@ fn a_second_heavy_goes_to_the_other_worker() {
     );
     wait_until_succeeds(Node::Hub, &declared, 60);
     for round in 0..ROUNDS {
-        let [a, b] = ["a", "b"].map(|n| format!("spread-{round}-{n}"));
+        let [a, b] = ["a", "b"].map(|n| match round {
+            0 => format!("spread-{n}-0"),
+            _ => format!("spread-a-{round}-{n}"),
+        });
         launch(&a);
         let dispatched = format!(
             "{} | grep 'dispatching build' | grep -qF 'drv=\"{a}\"'",
@@ -70,8 +74,13 @@ fn a_second_heavy_goes_to_the_other_worker() {
             ["0", "0"],
             "round {round}"
         );
-        let to = [worker(&first), worker(&dispatch_line(&b))];
+        let second = dispatch_line(&b);
+        let to = [worker(&first), worker(&second)];
         println!("[spread] round {round}: {to:?}");
+        if round == 0 {
+            assert!(second.contains(r#"learned="prefix""#), "{second}");
+            continue;
+        }
         assert_ne!(
             to[0], to[1],
             "round {round}: both heavy builds on one worker"

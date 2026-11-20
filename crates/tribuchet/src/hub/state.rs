@@ -17,7 +17,7 @@ use super::losses::{self, Loss};
 use super::lost::Lost;
 use super::metrics::Metrics;
 use super::placement::objective::enqueue;
-use super::placement::{Expected, Placement};
+use super::placement::{Expected, Placement, Read};
 use super::relay::{DAEMON_ANSWER, DaemonEvidence};
 use super::runs::Runs;
 use super::shadow::Shadow;
@@ -89,6 +89,10 @@ pub(super) struct Job {
     /// take_job's scan reads it under the queue lock, where it takes no
     /// placement lock.
     pub(super) expected: Expected,
+    /// What `expected` was read from (History::read): while none of it has
+    /// learned a run since, a scan reads `expected` instead of asking the
+    /// history again. None: never read.
+    pub(super) expected_at: Option<Read>,
 }
 
 impl Job {
@@ -379,7 +383,14 @@ impl HubState {
         self.hold_unservable().await;
     }
 
+    /// A build ends with no worker's result (dropped, declined, refused):
+    /// no session holds it, so a hold its take began on its key ends.
     pub(super) async fn finish(&self, job: &Job) {
+        {
+            let mut p = self.placement.lock().unwrap();
+            let sessions: Vec<u64> = p.sessions.keys().copied().collect();
+            sessions.into_iter().for_each(|s| p.settled(s, &job.id));
+        }
         job.unlist();
         job.replay.finish().await;
     }

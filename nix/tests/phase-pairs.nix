@@ -13,6 +13,8 @@ let
     wait
   '';
   work = {
+    # nothing: each build's first run, alone (pairs.rs)
+    N = "true";
     # deadline: 18 s of wall clock; 15 s of running time
     K = "${spinners} 18";
     D = "${python} ${./pair-spin.py} 15";
