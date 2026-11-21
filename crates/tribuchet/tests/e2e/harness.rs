@@ -195,6 +195,14 @@ pub fn succeed(node: Node, cmd: &str) -> String {
     succeed_t(node, cmd, 900)
 }
 
+/// Whether `cmd` exits 0 on `node`; a timeout or an ssh transport failure is
+/// a harness error, not a no.
+pub fn succeeds(node: Node, cmd: &str) -> bool {
+    let o = run(node, cmd);
+    check_transport(&o, node, cmd);
+    o.code == 0
+}
+
 /// Run `cmd`, asserting a non-zero *command* exit, returning combined output.
 pub fn fail(node: Node, cmd: &str) -> String {
     let o = run(node, cmd);

@@ -6,18 +6,26 @@
 { pkgs, lib, ... }:
 let
   python = lib.getExe pkgs.python3;
-  # 4 threads spinning until $1 s of wall clock, printing a line every 2 s.
-  spinners = pkgs.writeShellScript "pair-spinners" ''
-    for i in 1 2 3 4; do (while [ $SECONDS -lt $1 ]; do :; done) & done
-    while [ $SECONDS -lt $1 ]; do echo "at $SECONDS s"; sleep 2; done
+  # 4 threads spinning until ./stop exists (pairs.rs makes it in the
+  # build dir) or $1 s of wall clock have passed, one saying each second.
+  hold = pkgs.writeShellScript "pair-hold" ''
+    spin() {
+      s=-1
+      while [ ! -e stop ] && [ $SECONDS -lt $1 ]; do
+        if [ "$2" ] && [ $SECONDS != $s ]; then s=$SECONDS; echo "at $s s"; fi
+      done
+    }
+    for i in 1 2 3; do spin $1 & done
+    spin $1 say
     wait
   '';
   work = {
     # nothing: each build's first run, alone (pairs.rs)
     N = "true";
-    # deadline: 18 s of wall clock; 15 s of running time
-    K = "${spinners} 18";
-    D = "${python} ${./pair-spin.py} 15";
+    # deadline: every CPU until stopped, within its 30 s timeout; 25 s of
+    # running time
+    K = "${hold} 29";
+    D = "${python} ${./pair-spin.py} 25";
     # A: 1400 MiB more at 10 CPU-s; 4 x 300 MiB for the first 6 CPU-s
     AL = "${python} ${./pair-hog.py} '4:64:20:1400@10'";
     AF = "${python} ${./pair-hog.py} '4:300:6;1:64:10'";
@@ -25,7 +33,7 @@ let
   deps = [
     pkgs.bash
     pkgs.python3
-    spinners
+    hold
     ./pair-spin.py
     ./pair-hog.py
   ];

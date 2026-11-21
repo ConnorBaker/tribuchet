@@ -6,7 +6,7 @@
 //! tests.rs; worker/build/agent_exec.rs for the clocks).
 
 use crate::harness::{
-    Node, count, ended, journal, more_than, submit, succeed, wait_until_succeeds,
+    Node, count, ended, journal, more_than, submit, succeed, succeeds, wait_until_succeeds,
 };
 
 const SLICE: &str = "/sys/fs/cgroup/system.slice/system-tribuchet\\x2dagent.slice";
@@ -17,7 +17,9 @@ struct Row {
     work: [&'static str; 2],
     /// worker.toml's build-timeout-secs and max-silent-time-secs, 0 for none.
     limits: (i64, i64),
-    /// The follower's frozen_ms: at least, at most.
+    /// The follower's frozen_ms: at least, at most. Where at least one is
+    /// asked for, the leader keeps every CPU until the follower's cgroup
+    /// has counted that long in one freeze, then is stopped.
     frozen: (i64, i64),
 }
 
@@ -33,12 +35,12 @@ const ROWS: [Row; 2] = [
         frozen: (0, 0),
     },
     // Only running time counts toward the build timeout and silence: the
-    // follower, frozen until the leader ends (more than 9 s), passes 5 s
-    // inside its timeout.
+    // follower, frozen until the leader ends (9 s by its cgroup's count,
+    // however late the freeze), passes 5 s inside its timeout.
     Row {
         name: "deadline",
         work: ["K", "D"],
-        limits: (20, 8),
+        limits: (30, 8),
         frozen: (9000, i64::MAX),
     },
 ];
@@ -75,6 +77,13 @@ fn oom_kills() -> i64 {
     .unwrap()
 }
 
+/// The value of `key`=VALUE in a log line, unquoted.
+fn field<'a>(line: &'a str, key: &str) -> Option<&'a str> {
+    line.split_whitespace()
+        .find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
+        .map(|v| v.trim_matches('"'))
+}
+
 /// Build `name`'s frozen_ms and wall_ms, as the hub's usage line has them.
 fn usage(name: &str) -> (i64, i64) {
     let line = succeed(
@@ -84,13 +93,36 @@ fn usage(name: &str) -> (i64, i64) {
             journal("tribuchet-hub")
         ),
     );
-    let field = |key: &str| {
-        line.split_whitespace()
-            .find_map(|w| w.strip_prefix(key)?.strip_prefix('='))
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(-1)
-    };
-    (field("frozen_ms"), field("wall_ms"))
+    let n = |key| field(&line, key).and_then(|v| v.parse().ok()).unwrap_or(-1);
+    (n("frozen_ms"), n("wall_ms"))
+}
+
+/// The id and the build dir of the build last started on the worker.
+fn last_started() -> (String, String) {
+    let line = succeed(
+        Node::Worker,
+        &format!(
+            "{} | grep 'builder started on agent' | tail -n 1",
+            journal("tribuchet-worker")
+        ),
+    );
+    let f = |key| field(&line, key).unwrap_or_default().to_owned();
+    (f("id"), f("scratch"))
+}
+
+/// Waits until build `id`'s cgroup has counted `ms` frozen, by its own
+/// frozen_usec, with no thaw since its freeze was asked: false if it is
+/// thawed first or not frozen that long within two minutes.
+fn held_frozen(id: &str, ms: i64) -> bool {
+    let wait = format!(
+        "u=0; until [ \"$u\" -ge {us} ]; do \
+           [ \"$u\" -gt 0 ] && [ \"$(cat \"$0/cgroup.freeze\")\" = 0 ] && exit 1; sleep 0.1; \
+           while read -r k v; do [ \"$k\" = frozen_usec ] && u=$v; done < \"$0/cgroup.stat.local\"; \
+         done; [ \"$(cat \"$0/cgroup.freeze\")\" = 1 ]",
+        us = ms * 1000
+    );
+    let cmd = format!("timeout 120 bash -c '{wait}' '{SLICE}'/*/build-{id}");
+    succeeds(Node::Worker, &cmd)
 }
 
 /// Runs `row`; any problem is pushed onto `problems`.
@@ -115,8 +147,9 @@ fn run(row: &Row, problems: &mut Vec<String>) {
         let learned = more_than("tribuchet-hub", "build usage", usage);
         wait_until_succeeds(Node::Hub, &learned, 120);
     }
+    let mut started = Vec::new();
     for (name, work) in names.iter().zip(row.work) {
-        let started = count(Node::Worker, "tribuchet-worker", "builder started on agent");
+        let before = count(Node::Worker, "tribuchet-worker", "builder started on agent");
         submit(
             name,
             &format!(
@@ -126,10 +159,20 @@ fn run(row: &Row, problems: &mut Vec<String>) {
         // Started, and a second on: the next build's start is later.
         wait_until_succeeds(
             Node::Worker,
-            &more_than("tribuchet-worker", "builder started on agent", started),
+            &more_than("tribuchet-worker", "builder started on agent", before),
             120,
         );
+        started.push(last_started());
         succeed(Node::Hub, "sleep 1");
+    }
+    // How long the follower is frozen is the leader's to hold, not the
+    // wall clock's: the arbiter freezes it some seconds into its run
+    // (worker/arbiter/policy.rs), how many depending on the host's load.
+    let held = row.frozen.0 == 0 || held_frozen(&started[1].0, row.frozen.0);
+    // Stopping the leader only shortens the row: held is its verdict. A
+    // leader that has already ended (at its own deadline) has no build dir.
+    if row.frozen.0 > 0 {
+        succeeds(Node::Worker, &format!("touch '{}/stop'", started[0].1));
     }
     succeed(Node::Hub, "sleep 7");
     let rcs = names.each_ref().map(|n| ended(n, 300));
@@ -149,7 +192,7 @@ fn run(row: &Row, problems: &mut Vec<String>) {
         "a build failed or was OOM-killed",
     );
     problem(
-        (row.frozen.0..=row.frozen.1).contains(&frozen),
+        held && (row.frozen.0..=row.frozen.1).contains(&frozen),
         "the follower's frozen time",
     );
     let (timeout, silent) = row.limits;
