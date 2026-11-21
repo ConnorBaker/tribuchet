@@ -4,7 +4,12 @@
 use std::sync::Barrier;
 use std::thread;
 
+use tonic::Request;
+
+use super::super::super::admin::AdminSvc;
 use super::*;
+use crate::proto::DecommissionRequest;
+use crate::proto::hub_admin_server::HubAdmin;
 
 /// The RelayReady events `events` brings, until one with token `last`.
 async fn readies(events: &mut Streaming<AttachEvent>, last: &[u8]) -> Vec<RelayReady> {
@@ -50,6 +55,59 @@ async fn a_relayed_producer_gone_is_settled_at_the_loss_as_its_nix_said() {
         );
         drop(tx);
         assert_eq!(verdict(&mut events).await, Some(want), "{can_local:?}");
+    }
+}
+
+/// DD8a with no known worker for it (L11′): a relayed producer requeued
+/// as its worker's session died, then that worker retired (U4), is
+/// answered as at a loss: canBuildLocally true is declined (222), false or
+/// unsaid (OQ1's fallback (a)) fails, told why.
+#[tokio::test]
+async fn a_relayed_producer_no_known_worker_serves_is_answered_as_its_nix_said() {
+    for (can_local, declined) in [(Some(true), true), (Some(false), false), (None, false)] {
+        let state = Arc::new(HubState::for_test(Duration::ZERO));
+        let w1 = worker(&state, "w1", &[]);
+        let (tx, mut events) = submit_open(&state, producer_request(can_local)).await;
+        let job = state.take_job(&w1.caps, None).await.expect("not queued");
+        relay_started(&job, &tx, &mut events).await;
+        let said = vec![started(&job)];
+        let _ = dispatch(&state, job, w1, said).await;
+        let queued = state.queue.lock().await.len();
+        assert_eq!(queued, 1, "{can_local:?}: not requeued");
+        let admin = AdminSvc {
+            state: state.clone(),
+        };
+        let retire = DecommissionRequest {
+            worker_name: "w1".into(),
+        };
+        admin.decommission(Request::new(retire)).await.unwrap();
+        drop(tx);
+        let got = verdict(&mut events).await;
+        let got = got.map(|v| v == Verdict::Declined);
+        assert_eq!(got, Some(declined), "{can_local:?}: declined");
+    }
+}
+
+/// DD8a at admission: a relayed producer resubmitted to a hub no
+/// connected worker serves (its own, known, not back since the hub
+/// restarted) is declined only to a client whose Nix said it builds it;
+/// one unsaid (OQ1's fallback (a)) or that cannot waits for the worker,
+/// queued.
+#[tokio::test]
+async fn a_relayed_resubmission_with_no_worker_is_declined_only_as_its_nix_said() {
+    for (can_local, declined) in [(Some(true), true), (Some(false), false), (None, false)] {
+        let state = Arc::new(HubState::for_test(Duration::ZERO));
+        drop(worker(&state, "w1", &[]));
+        let req = BuildRequest {
+            relay_started: true,
+            ..producer_request(can_local)
+        };
+        let (_tx, mut events) = submit_open(&state, req).await;
+        let queued = state.queue.lock().await.len();
+        assert_eq!(queued, usize::from(!declined), "{can_local:?}: queued");
+        if declined {
+            assert_eq!(verdict(&mut events).await, Some(Verdict::Declined));
+        }
     }
 }
 

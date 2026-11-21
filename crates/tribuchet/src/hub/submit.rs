@@ -228,11 +228,10 @@ impl attach_hub_server::AttachHub for AttachSvc {
         // Unsaid (a Nix or attach predating canLocal): today's rule, a
         // build without network. Never one with: declined, it would run on
         // this host's own daemon, in its network, outside every
-        // fod-network policy (§1). A producer's too: only a loss after its
-        // run reached the client fails one unsaid (OQ1's fallback (a),
-        // producer::lost_relayed).
+        // fod-network policy (§1). A producer's too, until its run reached
+        // the client, as a resubmission says (OQ1's fallback (a)).
         let is_producer = producer::is_request(&req);
-        let can_local = !req.fixed_output && req.can_local.unwrap_or(true);
+        let can_local = producer::can_local(&req, req.relay_started);
 
         // A build with network goes only to a worker that gives it a
         // network of its own; one that does not would refuse it.

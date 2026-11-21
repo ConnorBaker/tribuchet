@@ -169,6 +169,13 @@ pub(super) async fn relay_ready(job: &Job, token: &[u8], fresh: bool) {
         .await;
 }
 
+/// Whether a client is taken to build `req` itself, as its Nix said or
+/// not: never one with network (§1, DD1b); one whose Nix does not say,
+/// only before the run reached it (`relayed`, OQ1's fallback (a)).
+pub(super) fn can_local(req: &BuildRequest, relayed: bool) -> bool {
+    !req.fixed_output && req.can_local.unwrap_or(!relayed)
+}
+
 /// The loss of a producer's run, at `why`. Relayed, it is settled with no
 /// fresh run behind the same attach (DD8a), declining only a client whose
 /// Nix said it builds it (OQ1's fallback (a)), never a fixed-output one
@@ -183,7 +190,7 @@ pub(super) async fn lost_relayed(state: &HubState, job: Job, why: &str) -> Optio
         "a relayed producer's run is lost; no fresh run"
     );
     // One attach is a producer's every client (DD9): its request says.
-    let local = job.req.can_local == Some(true);
+    let local = can_local(&job.req, true);
     losses::cannot(state, job, (RELAYED, local), RELAYED_LOST.to_owned()).await;
     None
 }

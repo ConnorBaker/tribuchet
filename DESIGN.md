@@ -691,11 +691,15 @@ DT for its tests, apart from SEMANTICS-7's D and U.
   nothing the hub decides.
 * **OQ1, a relayed loss for a client that cannot build it.** (c): attach
   refuses, before submitting anything, a producer whose build.json says
-  `canBuildLocally: false`. (a) for a client whose Nix does not say, at a
-  relayed loss only: the hub takes it for one that cannot there, so a
-  loss after the first byte fails the build, told why. Everywhere else
-  (admission, a loss before the first byte) unsaid is taken as can, as
-  for any build without network.
+  `canBuildLocally: false`. (a) for a client whose Nix does not say, once
+  the run reached it: the hub takes it for one that cannot
+  (`producer::can_local`), so a relayed loss fails the build, told why,
+  as does a relayed build no known worker serves, and a relayed
+  resubmission no connected worker serves waits instead of being
+  declined. Before the first byte (a fresh admission, a loss before it)
+  unsaid is taken as can, as for any build without network. The
+  semantic core took that client as canLocal when it joined and has no
+  relayed state, so failing it is a shadow divergence (§2).
 
 Their tests are labelled in their doc comments: DT1 and DT2 (DD4), DT3
 (DD7), DT4 (DD8), DT7 (DD9, DD6), DT8 (DD11), DT9 (DD10's record), DT10 (DD6), DT11
@@ -723,6 +727,15 @@ deadline), DT16 (DD10's fresh), DT17 and DT20 (DD8a), DT19 (R1).
   stays connected but reads nothing keeps its stream until it exits.
 * An output delivery fails its build when the hub's chunk cache cannot
   store or read back a chunk of it.
+* A producer's run killed because its listener's handoff expired
+  (DD10) is recorded as its worker reports it: a `result` row with exit
+  code 1 and its usage, like a builder's failure. Placement history
+  learns nothing from it (it learns no failure), and the loss is charged
+  to transport; but the record alone cannot tell it from a failure. The
+  hub's journal can: an expired run's `build usage` line is followed by
+  `build lost in transport` for the same id, a builder's failure by
+  none. To be marked in the record if a failure-rate count over
+  producers needs it, once they are deployed.
 * A producer's attach reads no hub event while it fetches a run's
   listener. A fetch that comes before the agent started the builder
   waits on the worker until the listener arrives or the run ends, a wait

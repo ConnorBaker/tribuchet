@@ -10,6 +10,7 @@ use super::{HubState, Job, Replay, Servability, Wait};
 use crate::hub::known::refusal;
 use crate::hub::losses;
 use crate::hub::metrics::Metrics;
+use crate::hub::producer;
 use crate::hub::semantics as sem;
 use crate::proto::attach_event;
 
@@ -58,7 +59,13 @@ impl HubState {
                     Servability::Now => {}
                     Servability::ExpectedBy(at) => due = Some(due.map_or(at, |d| d.max(at))),
                     Servability::Never if !self.known.serves(&j.req.system, &j.features) => {
-                        let local = !j.req.fixed_output;
+                        // A relayed producer's one attach is its every
+                        // client (DD9): its request says (OQ1's fallback (a)).
+                        let local = if j.replay.relayed() {
+                            producer::can_local(&j.req, true)
+                        } else {
+                            !j.req.fixed_output
+                        };
                         let decided = j.replay.close(local, |declined, waiting| {
                             self.shadow.deferred("no known worker", j, declined);
                             self.shadow.refused(j, waiting);
