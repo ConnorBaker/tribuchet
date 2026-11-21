@@ -1,15 +1,22 @@
 //! Producers at the hub, as RelayStarted and RelayReady pass: DD8, DD8a at
 //! the loss, DD9's refusal and DD10's replay.
 
+use std::slice;
 use std::sync::Barrier;
 use std::thread;
 
 use tonic::Request;
 
 use super::super::super::admin::AdminSvc;
+use super::super::super::losses;
 use super::*;
+use crate::hub::shadow::Client;
 use crate::proto::DecommissionRequest;
 use crate::proto::hub_admin_server::HubAdmin;
+use crate::testlog::Captured;
+
+/// What the semantic core says of a client the hub answered otherwise.
+const DIVERGED: &str = "shadow divergence";
 
 /// The RelayReady events `events` brings, until one with token `last`.
 async fn readies(events: &mut Streaming<AttachEvent>, last: &[u8]) -> Vec<RelayReady> {
@@ -35,6 +42,8 @@ async fn readies(events: &mut Streaming<AttachEvent>, last: &[u8]) -> Vec<RelayR
 /// false or unsaid (OQ1's fallback (a)) fails, naming the cause.
 #[tokio::test]
 async fn a_relayed_producer_gone_is_settled_at_the_loss_as_its_nix_said() {
+    let log = Captured;
+    let _guard = log.install();
     let failed = Verdict::Failed(RELAYED_LOST.to_owned());
     for (can_local, want) in [
         (Some(true), Verdict::Declined),
@@ -56,6 +65,7 @@ async fn a_relayed_producer_gone_is_settled_at_the_loss_as_its_nix_said() {
         drop(tx);
         assert_eq!(verdict(&mut events).await, Some(want), "{can_local:?}");
     }
+    assert_eq!(log.count(DIVERGED), 0, "the core answered otherwise");
 }
 
 /// DD8a with no known worker for it (L11′): a relayed producer requeued
@@ -64,6 +74,8 @@ async fn a_relayed_producer_gone_is_settled_at_the_loss_as_its_nix_said() {
 /// unsaid (OQ1's fallback (a)) fails, told why.
 #[tokio::test]
 async fn a_relayed_producer_no_known_worker_serves_is_answered_as_its_nix_said() {
+    let log = Captured;
+    let _guard = log.install();
     for (can_local, declined) in [(Some(true), true), (Some(false), false), (None, false)] {
         let state = Arc::new(HubState::for_test(Duration::ZERO));
         let w1 = worker(&state, "w1", &[]);
@@ -86,6 +98,137 @@ async fn a_relayed_producer_no_known_worker_serves_is_answered_as_its_nix_said()
         let got = got.map(|v| v == Verdict::Declined);
         assert_eq!(got, Some(declined), "{can_local:?}: declined");
     }
+    assert_eq!(log.count(DIVERGED), 0, "the core answered otherwise");
+}
+
+/// A relayed producer whose resumed runs keep losing their session
+/// reaches the transport loss cap (losses::count, defer): only a client
+/// whose Nix said it builds it is declined; one unsaid (OQ1's fallback
+/// (a)) or that cannot waits on.
+#[tokio::test]
+async fn a_relayed_producer_at_the_loss_cap_is_answered_as_its_nix_said() {
+    let log = Captured;
+    let _guard = log.install();
+    for (can_local, declined) in [(Some(true), true), (Some(false), false), (None, false)] {
+        let state = Arc::new(HubState::for_test(Duration::ZERO));
+        let w1 = worker(&state, "w1", &[]);
+        let (tx, mut events) = submit_open(&state, producer_request(can_local)).await;
+        let job = state.take_job(&w1.caps, None).await.expect("not queued");
+        relay_started(&job, &tx, &mut events).await;
+        let key = job.key.clone();
+        let said = vec![started(&job)];
+        let _ = dispatch(&state, job, w1, said).await;
+        let mut resumes = 0;
+        for _ in 0..=losses::MAX_TRANSPORT_LOSSES {
+            let back = worker(&state, "w1", slice::from_ref(&key));
+            let Some(j) = state.take_job_by_key(back.id).await else {
+                break;
+            };
+            resumes += 1;
+            let r = worker_message::Msg::Resumed(Resumed {
+                build_id: j.id.clone(),
+                finished: false,
+                run: None,
+            });
+            let _ = dispatch(&state, j, back, vec![r]).await;
+        }
+        assert!(
+            resumes > losses::MAX_TRANSPORT_LOSSES,
+            "the cap not reached"
+        );
+        let decline = Event::ExitCode(DECLINE_EXIT_CODE);
+        let seen = until(&mut events, |e| *e == decline).await;
+        assert_eq!(seen, declined, "{can_local:?}: declined");
+        drop(tx);
+    }
+    assert_eq!(log.count(DIVERGED), 0, "the core answered otherwise");
+}
+
+/// A relayed producer declined where its build waits on (losses::decline:
+/// an input missing from the hub's store, state/hold.rs, or a run of the
+/// hub's daemon failing, relay/daemon.rs): only a client whose Nix said
+/// it builds it is declined.
+#[tokio::test]
+async fn a_relayed_producer_declined_as_it_waits_is_declined_only_as_its_nix_said() {
+    let log = Captured;
+    let _guard = log.install();
+    for (can_local, declined) in [(Some(true), 1), (Some(false), 0), (None, 0)] {
+        let state = Arc::new(HubState::for_test(Duration::ZERO));
+        let w1 = worker(&state, "w1", &[]);
+        let (tx, mut events) = submit_open(&state, producer_request(can_local)).await;
+        let job = state.take_job(&w1.caps, None).await.expect("not queued");
+        relay_started(&job, &tx, &mut events).await;
+        let got = losses::decline(&state, &job, "input missing").await;
+        let want = (declined > 0).then_some((declined, 0));
+        assert_eq!(got, want, "{can_local:?}");
+        drop(tx);
+    }
+    assert_eq!(log.count(DIVERGED), 0, "the core answered otherwise");
+}
+
+/// The hub cannot carry a relayed producer (losses::hub_cannot: before
+/// dispatch, or a hub-side error): a client whose Nix said it builds it
+/// is declined, one unsaid (OQ1's fallback (a)) or that cannot fails.
+#[tokio::test]
+async fn a_relayed_producer_the_hub_cannot_carry_is_answered_as_its_nix_said() {
+    let log = Captured;
+    let _guard = log.install();
+    for (can_local, declined) in [(Some(true), true), (Some(false), false), (None, false)] {
+        let state = Arc::new(HubState::for_test(Duration::ZERO));
+        let w1 = worker(&state, "w1", &[]);
+        let (tx, mut events) = submit_open(&state, producer_request(can_local)).await;
+        let job = state.take_job(&w1.caps, None).await.expect("not queued");
+        relay_started(&job, &tx, &mut events).await;
+        losses::hub_cannot(&state, job, "before dispatch", "no".into()).await;
+        drop(tx);
+        let got = verdict(&mut events).await.map(|v| v == Verdict::Declined);
+        assert_eq!(got, Some(declined), "{can_local:?}: declined");
+    }
+    assert_eq!(log.count(DIVERGED), 0, "the core answered otherwise");
+}
+
+/// A client joining a build whose run reached its client already (its
+/// attach reconnected before the acknowledgement reached it, so its
+/// request does not say relay_started) is taken as reached too: unsaid,
+/// it fails where the hub cannot carry the build.
+#[tokio::test]
+async fn a_client_joining_after_the_run_reached_its_client_is_answered_as_reached() {
+    let log = Captured;
+    let _guard = log.install();
+    for (can_local, declined) in [(Some(true), true), (None, false)] {
+        let state = Arc::new(HubState::for_test(Duration::ZERO));
+        let w1 = worker(&state, "w1", &[]);
+        let (tx, mut events) = submit_open(&state, producer_request(can_local)).await;
+        let job = state.take_job(&w1.caps, None).await.expect("not queued");
+        relay_started(&job, &tx, &mut events).await;
+        drop((tx, events));
+        let (tx, mut events) = submit_open(&state, producer_request(can_local)).await;
+        let clients = job.replay.can_local();
+        assert_eq!(clients, [declined], "{can_local:?}: the joiner");
+        losses::hub_cannot(&state, job, "before dispatch", "no".into()).await;
+        drop(tx);
+        let got = verdict(&mut events).await.map(|v| v == Verdict::Declined);
+        assert_eq!(got, Some(declined), "{can_local:?}: declined");
+    }
+    assert_eq!(log.count(DIVERGED), 0, "the core answered otherwise");
+}
+
+/// Only a producer's run is relayed: a request of another build saying
+/// its run reached the client is refused, not taken as relayed.
+#[tokio::test]
+async fn a_request_not_a_producers_saying_its_run_reached_the_client_is_refused() {
+    let state = Arc::new(HubState::for_test(Duration::ZERO));
+    let _w1 = worker(&state, "w1", &[]);
+    let req = BuildRequest {
+        required_features: Vec::new(),
+        relay_started: true,
+        ..producer_request(None)
+    };
+    let refused = try_submit_open(&state, req).await.err();
+    let refused = refused.map(|s| (s.code(), s.message().to_owned()));
+    let want = (tonic::Code::InvalidArgument, NOT_RELAYED.to_owned());
+    assert_eq!(refused, Some(want));
+    assert!(state.queue.lock().await.is_empty(), "queued");
 }
 
 /// DD8a at admission: a relayed producer resubmitted to a hub no
@@ -95,6 +238,8 @@ async fn a_relayed_producer_no_known_worker_serves_is_answered_as_its_nix_said()
 /// queued.
 #[tokio::test]
 async fn a_relayed_resubmission_with_no_worker_is_declined_only_as_its_nix_said() {
+    let log = Captured;
+    let _guard = log.install();
     for (can_local, declined) in [(Some(true), true), (Some(false), false), (None, false)] {
         let state = Arc::new(HubState::for_test(Duration::ZERO));
         drop(worker(&state, "w1", &[]));
@@ -109,6 +254,7 @@ async fn a_relayed_resubmission_with_no_worker_is_declined_only_as_its_nix_said(
             assert_eq!(verdict(&mut events).await, Some(Verdict::Declined));
         }
     }
+    assert_eq!(log.count(DIVERGED), 0, "the core answered otherwise");
 }
 
 /// DD8, DD10: the attach is told each dispatch's own handoff token as the
@@ -354,4 +500,45 @@ async fn a_loss_not_relayed_ends_the_run_at_once() {
         !job.replay.relay_started_by(&[5; 16]),
         "the lost run's RelayStarted counted before its requeue"
     );
+}
+
+/// OQ1's fallback (a) against a loss racing the acknowledgement: a loss
+/// decides under the clients' lock, so while that lock is held the run is
+/// never seen reached with a client's answer not yet switched. Held here
+/// as the RelayStarted is recorded, the run is not seen reached until it
+/// goes (an acknowledgement recording it before taking that lock is seen
+/// at once); then a loss declines no unsaid client.
+#[test]
+fn a_run_is_never_seen_reached_before_its_clients_answers_switch() {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let replay = Arc::new(Replay::new("p".into()));
+    let unsaid = Client::untracked(true).relayed(false);
+    let rx = rt.block_on(replay.subscribe_as(unsaid));
+    let token = vec![1u8; 16];
+    replay.relay.lock().unwrap().tokens.push(token.clone());
+    let held = replay.hold_clients();
+    let (r, t) = (replay.clone(), token);
+    let acker = thread::spawn(move || r.relay_started_by(&t));
+    let until = Instant::now() + Duration::from_secs(1);
+    let mut seen = false;
+    while !seen && Instant::now() < until {
+        seen = replay.relayed();
+        thread::yield_now();
+    }
+    drop(held);
+    assert!(acker.join().unwrap(), "the RelayStarted not recorded");
+    assert!(
+        !seen,
+        "the run seen reached before its clients' answers switched"
+    );
+    assert!(replay.run_lost(), "the run not reached");
+    let (declined, _) = replay.close(true, |_, _| {});
+    assert!(
+        declined.is_empty(),
+        "an unsaid client declined after a loss"
+    );
+    drop(rx);
 }

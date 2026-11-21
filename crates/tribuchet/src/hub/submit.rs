@@ -214,6 +214,9 @@ impl attach_hub_server::AttachHub for AttachSvc {
         if producer::is_request(&req) && req.attach_id.is_empty() {
             return Err(Status::failed_precondition(producer::NO_ATTACH_ID));
         }
+        if req.relay_started && !producer::is_request(&req) {
+            return Err(Status::invalid_argument(producer::NOT_RELAYED));
+        }
         // Queued, a build with network that no worker serves would wait
         // forever; declined, it would run on this host's own network.
         if req.fixed_output && unserved(&req.required_features) {
@@ -247,7 +250,11 @@ impl attach_hub_server::AttachHub for AttachSvc {
 
         let paths = producer::claims(&req);
         let owner: Option<Arc<str>> = req.client.as_deref().map(Arc::from);
-        let asks = |sys| (self.state.shadow.submit(&key, sys, can_local)).owned(owner.as_ref());
+        let once_relayed = producer::can_local(&req, true);
+        let asks = |sys| {
+            let client = self.state.shadow.submit(&key, sys, can_local);
+            client.owned(owner.as_ref()).relayed(once_relayed)
+        };
         let relayed = req.relay_started;
         let rx = loop {
             // Registered before the checks so a release in between

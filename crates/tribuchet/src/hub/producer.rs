@@ -48,6 +48,12 @@ pub(super) const RELAYED_LOST: &str = "the producer's run was lost after it reac
 pub(super) const NO_ATTACH_ID: &str = "a dynamic-derivation producer (builder-rpc-v0) needs an \
     attach that relays its run: this request carries no attach_id";
 
+/// What a request saying its run reached the client is told when it is no
+/// producer's: only a producer's run is relayed (DD8a), and attach says so
+/// for no other.
+pub(super) const NOT_RELAYED: &str = "relay_started on a build that is not a \
+    dynamic-derivation producer's (builder-rpc-v0): only a producer's run reaches its client";
+
 /// Whether `job` is a producer.
 pub(super) fn is(job: &Job) -> bool {
     is_request(&job.req)
@@ -93,10 +99,15 @@ impl Replay {
     /// A RelayStarted naming `token`: recorded if that is a token of the
     /// run current now. Whether it was.
     fn relay_started_by(&self, token: &[u8]) -> bool {
-        let mut relay = self.relay.lock().unwrap();
-        let current = relay.tokens.iter().any(|t| t == token);
-        relay.started |= current;
-        current
+        // Decided under the clients' lock, taken before the relay's as a
+        // join does: no loss reads a client's answer between the run
+        // recorded reached and the answer switched (Replay::reached_when).
+        self.reached_when(|| {
+            let mut relay = self.relay.lock().unwrap();
+            let current = relay.tokens.iter().any(|t| t == token);
+            relay.started |= current;
+            current
+        })
     }
 
     /// The run current now was lost (or its build requeued): whether it
@@ -178,8 +189,9 @@ pub(super) fn can_local(req: &BuildRequest, relayed: bool) -> bool {
 
 /// The loss of a producer's run, at `why`. Relayed, it is settled with no
 /// fresh run behind the same attach (DD8a), declining only a client whose
-/// Nix said it builds it (OQ1's fallback (a)), never a fixed-output one
-/// (DD1b); else it is current no more (`run_lost`), for the loss policy.
+/// Nix builds it, as reached (OQ1's fallback (a), Replay::reached_when), never a
+/// fixed-output one (DD1b); else it is current no more (`run_lost`), for
+/// the loss policy.
 pub(super) async fn lost_relayed(state: &HubState, job: Job, why: &str) -> Option<Job> {
     if !job.replay.run_lost() {
         return Some(job);
@@ -189,9 +201,7 @@ pub(super) async fn lost_relayed(state: &HubState, job: Job, why: &str) -> Optio
         why,
         "a relayed producer's run is lost; no fresh run"
     );
-    // One attach is a producer's every client (DD9): its request says.
-    let local = can_local(&job.req, true);
-    losses::cannot(state, job, (RELAYED, local), RELAYED_LOST.to_owned()).await;
+    losses::cannot(state, job, (RELAYED, true), RELAYED_LOST.to_owned()).await;
     None
 }
 

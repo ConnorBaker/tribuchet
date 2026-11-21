@@ -17,6 +17,8 @@ use super::*;
 enum Act {
     Submit(Key, Client, bool),
     Leave(Key, Client),
+    /// A run of the key reached the client, whose Nix did not say it can.
+    Bound(Key, Client),
     /// Worker 2 loses `key`'s runs with no known cause; the key is resubmitted
     /// and placed again, every client leaves, and the run ends (L10's corner).
     Unread(Key, bool),
@@ -287,6 +289,12 @@ impl World {
                 self.send(Event::Leave { key, client });
                 assert_eq!(live(&self.hub), before, "L9: a leave keeps the live run");
             }
+            Act::Bound(key, client) => {
+                if let Some(o) = self.open.get_mut(&(key, client)) {
+                    o.0 = false;
+                }
+                self.send(Event::Bound { key, client });
+            }
             Act::Unread(key, ok) => {
                 let run = |w: &mut World| {
                     w.act(Act::Submit(key, 3, false));
@@ -539,36 +547,10 @@ impl World {
     }
 }
 
-fn act() -> impl Strategy<Value = Act> {
-    let w = 0..3usize;
-    prop_oneof![
-        3 => (0..4u32, 0..3u32, any::<bool>()).prop_map(|(k, c, l)| Act::Submit(k, c, l)),
-        1 => (0..4u32, 0..3u32).prop_map(|(k, c)| Act::Leave(k, c)),
-        1 => (0..4u32, any::<bool>()).prop_map(|(k, ok)| Act::Unread(k, ok)),
-        2 => w.clone().prop_map(Act::Connect),
-        1 => w.clone().prop_map(Act::Down),
-        2 => w.clone().prop_map(Act::Crash),
-        6 => w.clone().prop_map(Act::Deliver),
-        5 => (w.clone(), 0..4usize).prop_map(|(w, i)| Act::Start(w, i)),
-        4 => (w.clone(), 0..4usize, any::<bool>()).prop_map(|(w, i, ok)| Act::Finish(w, i, ok)),
-        2 => (w.clone(), 0..4usize).prop_map(|(w, i)| Act::Reap(w, i)),
-        3 => (0..64usize).prop_map(Act::Replay),
-        2 => w.clone().prop_map(Act::Fetched),
-        1 => (w.clone(), 0..4usize).prop_map(|(w, i)| Act::BogusFetched(w, i)),
-        1 => (0..64usize).prop_map(Act::Contradict),
-        1 => Just(Act::HubRestart),
-        5 => (0..4u32, w.clone()).prop_map(|(k, w)| Act::Place(k, w)),
-        2 => (0..8usize, 0..8u32).prop_map(|(i, k)| Act::Adopt(i, k)),
-        2 => (0..8usize).prop_map(Act::Abort),
-        1 => (0..4u32, 0..3u32).prop_map(|(k, c)| Act::Defer(k, c)),
-        1 => (0..4u32).prop_map(Act::Refuse),
-        1 => (0..4u32).prop_map(Act::Cannot),
-        1 => w.clone().prop_map(Act::Suspect),
-        1 => w.prop_map(Act::Decommission),
-    ]
-}
-
+mod acts;
 mod lost_mark;
+
+use acts::act;
 
 /// Every law after every step of any history under any policy; progress (a
 /// fair end answers every client still waiting); and the histories reach

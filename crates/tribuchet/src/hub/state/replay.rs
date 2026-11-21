@@ -488,7 +488,11 @@ impl Replay {
                 return None;
             }
             let client = client();
-            let (listener, declined) = Listener::new(&tx, &client);
+            let (mut listener, declined) = Listener::new(&tx, &client);
+            // Joining a build whose run reached its client (DD8a).
+            if self.relay.lock().unwrap().started {
+                listener.reached();
+            }
             clients.push(listener);
             self.held.store(false, Ordering::Relaxed);
             self.joins.fetch_add(1, Ordering::Relaxed);

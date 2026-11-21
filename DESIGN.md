@@ -621,9 +621,15 @@ DT for its tests, apart from SEMANTICS-7's D and U.
   resume, the same run, goes on. The hub answers as `hub_cannot` does: a
   client whose build.json says `canBuildLocally` is declined (222), and
   its Nix rebuilds the producer in a fresh builder; every other client
-  fails, told why. The acknowledgement and every loss take one lock: an
-  acknowledgement first, and the loss settles the build so; a loss first
-  (or a requeue), and the lost run's tokens are acknowledged no more. The
+  fails, told why. The acknowledgement and every loss take one lock (the
+  relay's): an acknowledgement first, and the loss settles the build so;
+  a loss first (or a requeue), and the lost run's tokens are acknowledged
+  no more. Whether a client is declined or held to the relayed outcome is
+  decided under one lock too, the clients': the acknowledgement records
+  the run reached and switches each client's answer under it (relay's
+  inside, as a join takes them), and every close or decline reads the
+  answers under it, so none reads the run reached with an answer not yet
+  switched. The
   loss is decided at three points: a loss of a started run its worker
   says is gone, a fresh take of the build, and a worker staging afresh a
   build handed it by key. A loss before the first byte follows the loss
@@ -693,13 +699,18 @@ DT for its tests, apart from SEMANTICS-7's D and U.
   refuses, before submitting anything, a producer whose build.json says
   `canBuildLocally: false`. (a) for a client whose Nix does not say, once
   the run reached it: the hub takes it for one that cannot
-  (`producer::can_local`), so a relayed loss fails the build, told why,
-  as does a relayed build no known worker serves, and a relayed
-  resubmission no connected worker serves waits instead of being
-  declined. Before the first byte (a fresh admission, a loss before it)
-  unsaid is taken as can, as for any build without network. The
-  semantic core took that client as canLocal when it joined and has no
-  relayed state, so failing it is a shadow divergence (§2).
+  (`producer::can_local`). Each client's answer is stored as it joins
+  and is changed where the run reaches it: as the hub acknowledges
+  RelayStarted, each client then waiting, and each that joins after, is
+  taken as its Nix builds the key once reached (`Replay::reached_when`), and
+  the semantic core is told (`Bound`, the client's canLocal now false).
+  Every answer the hub then decides reads that: a relayed loss, the loss
+  caps, a decline while the build waits (an input missing, the hub's
+  daemon failing), the hub's own verdict, and no known worker serving
+  it, each fails such a client, told why; and a relayed resubmission no
+  connected worker serves waits instead of being declined. Before the
+  first byte (a fresh admission, a loss before it) unsaid is taken as
+  can, as for any build without network.
 
 Their tests are labelled in their doc comments: DT1 and DT2 (DD4), DT3
 (DD7), DT4 (DD8), DT7 (DD9, DD6), DT8 (DD11), DT9 (DD10's record), DT10 (DD6), DT11
