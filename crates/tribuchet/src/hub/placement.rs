@@ -13,7 +13,7 @@ use rusqlite::types::Value;
 
 use super::Admission;
 use super::naming::drv_name;
-use super::record::{Recorder, Rest, Row, int, now_ms, profile_row, result_row, val};
+use super::record::{Recorder, Rest, Row, int, now_ms, profile_row, result_row, source_row, val};
 use super::state::{HubState, Job, Replay};
 use crate::proto::{BuildUsage, Register};
 
@@ -49,6 +49,7 @@ pub(super) fn build_of(job: &Job) -> Build<'_> {
         system: &job.req.system,
         name: drv_name(&job.req),
         declared: declares(&job.features),
+        sources: job.sources.as_deref(),
     }
 }
 
@@ -255,8 +256,9 @@ impl Placement {
             (self.downstream).learn(&key, secs, outputs, &job.req.input_paths);
         }
         let profile = (u.profile.as_ref()).map(|p| profile_row(rest.at_ms, &rest.id, p));
+        let source = (build.sources).map(|s| source_row(rest.at_ms, &rest.id, s));
         self.append(result_row(&build, exit_code, u, rest));
-        if let Some(row) = profile {
+        for row in profile.into_iter().chain(source) {
             self.append(row);
         }
     }

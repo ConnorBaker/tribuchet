@@ -538,6 +538,7 @@ mod tests {
             deferred: None,
             expected: Expected::prior(false),
             expected_at: None,
+            sources: None,
         }
     }
 

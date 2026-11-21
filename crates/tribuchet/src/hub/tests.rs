@@ -183,6 +183,7 @@ pub(super) fn job(n: usize, replay: Arc<Replay>) -> Job {
         deferred: None,
         expected: placement::Expected::prior(false),
         expected_at: None,
+        sources: None,
     }
 }
 

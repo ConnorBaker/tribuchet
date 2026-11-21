@@ -59,6 +59,12 @@ const PROFILE: &str = "CREATE TABLE IF NOT EXISTS profile (at_ms INTEGER NOT NUL
 /// drvPath, where Nix writes it): added to a record of either age.
 const DRV_PATH: &str = "CREATE TABLE IF NOT EXISTS drv_path (at_ms INTEGER NOT NULL, \
     id TEXT NOT NULL, key TEXT, drv_path TEXT NOT NULL);";
+/// The table of builds' sources (hub/sources.rs), which a record of
+/// user_version 1 gains as profile does: a row per result row of a
+/// build whose sources the hub's daemon gave, by the result's at_ms and
+/// id, with their digest.
+const SOURCE: &str = "CREATE TABLE IF NOT EXISTS source (at_ms INTEGER NOT NULL, \
+  id TEXT NOT NULL, sources TEXT NOT NULL);";
 
 /// A row for table `table`: its values, in the schema's column order.
 pub(in crate::hub) struct Row {
@@ -98,6 +104,20 @@ pub(in crate::hub) fn profile_row(at_ms: i64, id: &str, p: &BuildProfile) -> Row
     ];
     Row {
         table: "profile",
+        values,
+    }
+}
+
+/// The `source` row of the result row at `at_ms` of build `id`, whose
+/// sources' digest is `sources`.
+pub(in crate::hub) fn source_row(at_ms: i64, id: &str, sources: &str) -> Row {
+    let values = vec![
+        Value::Integer(at_ms),
+        id.to_owned().into(),
+        sources.to_owned().into(),
+    ];
+    Row {
+        table: "source",
         values,
     }
 }
@@ -316,6 +336,7 @@ fn take(path: &Path) -> Result<Option<(Connection, File, (History, u64))>> {
     conn.execute_batch(PROFILE)?;
     // Only into a record ours (fold read it as one).
     conn.execute_batch(DRV_PATH)?;
+    conn.execute_batch(SOURCE)?;
     let mode: String = conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
     if !mode.eq_ignore_ascii_case("wal") {
         return Err(err_msg(format!("journal_mode {mode}, not WAL")));
@@ -338,16 +359,31 @@ fn read(path: &Path) -> Result<(History, u64)> {
     Ok(fold(&conn)?)
 }
 
-/// The history the `result` rows teach, in rowid order, and how many
-/// rows it read. A row with no system (its build queued before the
-/// journal it was imported from begins) teaches nothing: history keys
-/// every run by its system.
+/// The history the `result` rows teach, in rowid order, each with the
+/// sources its `source` row gives (none in a record without the table),
+/// and how many rows it read. A row with no system (its build queued
+/// before the journal it was imported from begins) teaches nothing:
+/// history keys every run by its system.
 pub(in crate::hub) fn fold(conn: &Connection) -> rusqlite::Result<(History, u64)> {
     let (mut history, mut read) = (History::default(), 0);
-    let mut stmt = conn.prepare(
-        "SELECT system, drv, declared, exit_code, wall_ms, cpu_usec, peak_memory_bytes, \
-         oom_killed, frozen_ms FROM result ORDER BY rowid",
+    let with_table: bool = conn.query_row(
+        "SELECT count(*) > 0 FROM sqlite_schema WHERE type = 'table' AND name = 'source'",
+        [],
+        |r| r.get(0),
     )?;
+    let (sources, joined) = if with_table {
+        (
+            "s.sources",
+            "LEFT JOIN source s ON s.at_ms = r.at_ms AND s.id = r.id",
+        )
+    } else {
+        ("NULL", "")
+    };
+    let mut stmt = conn.prepare(&format!(
+        "SELECT r.system, r.drv, r.declared, r.exit_code, r.wall_ms, r.cpu_usec, \
+         r.peak_memory_bytes, r.oom_killed, r.frozen_ms, {sources} FROM result r {joined} \
+         ORDER BY r.rowid"
+    ))?;
     let mut rows = stmt.query([])?;
     while let Some(r) = rows.next()? {
         read += 1;
@@ -362,10 +398,12 @@ pub(in crate::hub) fn fold(conn: &Connection) -> rusqlite::Result<(History, u64)
             frozen_ms: n(8)?,
             profile: None,
         };
+        let sources: Option<String> = r.get(9)?;
         let build = Build {
             system: &system,
             name: drv.as_deref(),
             declared: r.get(2)?,
+            sources: sources.as_deref(),
         };
         history.record(&build, r.get(3)?, &usage);
     }

@@ -54,6 +54,7 @@ mod runs;
 mod semantics;
 mod serve;
 mod shadow;
+mod sources;
 mod state;
 mod submit;
 pub use serve::run;

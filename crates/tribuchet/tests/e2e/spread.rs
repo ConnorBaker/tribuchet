@@ -1,7 +1,7 @@
 //! The `spread` phase (nix/tests/phase-spread.nix): a heavy big-parallel
-//! build submitted while another of its pname runs goes to the other
+//! build submitted while another of its stem runs goes to the other
 //! worker, idle and less full with it, by what the earlier rounds taught.
-//! Round 0's two are unseen pnames (one would hold `b` for its key), at a
+//! Round 0's two are unseen stems (one would hold `b` for its key), at a
 //! prior larger than either worker: `b` waits for the largest to empty
 //! and is taken with what `a` taught their prefix, on either worker. Two
 //! workers, the worker VM's and the hub VM's, each with two agents.
@@ -55,7 +55,8 @@ fn a_second_heavy_goes_to_the_other_worker() {
     for round in 0..ROUNDS {
         let [a, b] = ["a", "b"].map(|n| match round {
             0 => format!("spread-{n}-0"),
-            _ => format!("spread-a-{round}-{n}"),
+            // One stem, `spread-a`: a version-like part is not in it.
+            _ => format!("spread-a-{round}{n}"),
         });
         launch(&a);
         let dispatched = format!(

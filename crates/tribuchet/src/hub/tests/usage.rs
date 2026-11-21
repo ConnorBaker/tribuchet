@@ -71,19 +71,19 @@ async fn a_builder_exiting_with_the_decline_code_is_not_a_decline() {
 }
 
 /// What a build's run used is learned, here an OOM-killed run's peak: the
-/// next build of its pname, submitted as the attach program does, is
+/// next build of its stem, submitted as the attach program does, is
 /// dispatched expecting it, where the first had only the prior. A failed
 /// run that was not OOM-killed teaches its key too, as a lower bound: the
-/// next build of its pname expects its peak from its key, not its
+/// next build of its stem expects its peak from its key, not its
 /// prefix's guess (`tt`).
 #[tokio::test]
-async fn a_run_teaches_the_next_dispatch_of_its_pname() {
+async fn a_run_teaches_the_next_dispatch_of_its_stem() {
     let log = Captured;
     let _guard = log.install();
     let state = Arc::new(HubState::for_test(Duration::from_secs(30)));
     let mut w = connect(&state, "w1", 1, &[]);
     for n in 0..4u64 {
-        let (pname, oom_killed) = if n < 2 {
+        let (stem, oom_killed) = if n < 2 {
             ("learn", true)
         } else {
             ("fail", false)
@@ -91,7 +91,7 @@ async fn a_run_teaches_the_next_dispatch_of_its_pname() {
         let req = BuildRequest {
             system: "x86_64-linux".into(),
             builder: format!("/nix/store/{H}-bash/bin/bash"),
-            outputs: [("out".to_owned(), format!("/nix/store/{H}-tt-{pname}-{n}.0"))].into(),
+            outputs: [("out".to_owned(), format!("/nix/store/{H}-tt-{stem}-{n}.0"))].into(),
             tmp_dir_in_sandbox: "/build".into(),
             store_dir: "/nix/store".into(),
             ..Default::default()
@@ -180,19 +180,20 @@ fn learning_survives_a_restart() {
     let path = dir.path().join("state/tribuchet/record.sqlite");
     let state = HubState::for_test(Duration::from_secs(30));
     let writer = open_record(&state, &path);
-    let (j, usage) = learned_build();
+    let (mut j, usage) = learned_build();
+    j.sources = Some("s".to_owned());
     learn(&state, &j, 0, &usage);
     record::close(&state, writer);
     let restarted = HubState::for_test(Duration::from_secs(30));
     let _writer = open_record(&restarted, &path);
     let after = expected(&restarted, &j);
-    assert_eq!(after, ("key", 5 << 30), "after a restart");
+    assert_eq!(after, ("source", 5 << 30), "after a restart");
 }
 
 /// The history a hub learned is the fold of the record it wrote, in the
 /// order learned, over runs that teach (successes, an OOM kill), one
-/// that does not (a failure), pnames sharing a prefix, and more runs of
-/// a key than its window.
+/// that does not (a failure), stems sharing a prefix, more runs of a key
+/// than its window, and runs of two sources and of none.
 #[test]
 fn the_history_is_the_fold_of_the_record() {
     let dir = tempfile::tempdir().unwrap();
@@ -201,7 +202,8 @@ fn the_history_is_the_fold_of_the_record() {
     let writer = open_record(&state, &path);
     for n in 0..30u64 {
         let name = ["tt-a", "tt-b-c", "tt-b-d"][usize::try_from(n % 3).unwrap()];
-        let (j, mut usage) = run_of(&format!("{name}-{n}.0"), n + 1);
+        let (mut j, mut usage) = run_of(&format!("{name}-{n}.0"), n + 1);
+        j.sources = (n % 4 != 0).then(|| format!("s{}", n % 2));
         usage.oom_killed = n == 4;
         // Received in an order its times do not follow: the fold's is
         // the rows' (rowid), the order learned.

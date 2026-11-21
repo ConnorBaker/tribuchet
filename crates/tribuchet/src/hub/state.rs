@@ -93,6 +93,10 @@ pub(super) struct Job {
     /// learned a run since, a scan reads `expected` instead of asking the
     /// history again. None: never read.
     pub(super) expected_at: Option<Read>,
+    /// The digest of the content-addressed inputs it consumes, as the
+    /// hub's daemon said when it was submitted (sources.rs): history keys
+    /// its runs by them.
+    pub(super) sources: Option<String>,
 }
 
 impl Job {

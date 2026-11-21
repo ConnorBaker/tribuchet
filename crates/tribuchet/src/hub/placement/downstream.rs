@@ -8,7 +8,7 @@
 //! A run that succeeds lists its inputs, the closure its builder sees
 //! (build.json's inputPaths). An input that is an output of one of the
 //! last WINDOW runs of a key here was made by that key (its own system
-//! and pname); each such key is then followed by this build's expected
+//! and stem); each such key is then followed by this build's expected
 //! seconds and the chain that follows this build's key:
 //!
 //!   below(k) = max over builds d, finished since k's own last run, with an
@@ -18,7 +18,7 @@
 //! and, where none has finished since that run, what the runs before it
 //! left: what followed k's latest run, not the longest any run of k ever
 //! started (a key that runs often, as `source` does, keeps its latest).
-//! Keys are pnames, and a closure lists transitive inputs, so keys can
+//! Keys are stems, and a closure lists transitive inputs, so keys can
 //! name each other: a chain that would come back to k counts d alone.
 //! Every `below` is thus the learned seconds of a chain of distinct keys,
 //! and a cycle of keys cannot add to it. A closure's transitive inputs
@@ -186,8 +186,8 @@ mod tests {
         assert_eq!(d.below("a"), 5.0);
     }
 
-    /// Two keys each among the other's inputs (pnames of two builds of a
-    /// bootstrap, or a closure naming its consumer's pname), built in
+    /// Two keys each among the other's inputs (stems of two builds of a
+    /// bootstrap, or a closure naming its consumer's stem), built in
     /// turn: below stays the seconds of a chain of distinct keys.
     #[test]
     fn a_cycle_of_keys_stays_bounded() {
