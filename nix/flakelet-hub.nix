@@ -121,6 +121,8 @@
           ];
           WatchdogSec = "30";
           Restart = "on-failure";
+          # A descriptor per attach client; see nix/nixos-module.nix.
+          LimitNOFILE = 1048576;
         };
       };
 

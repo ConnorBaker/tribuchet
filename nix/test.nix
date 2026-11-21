@@ -423,6 +423,11 @@ in
     with subtest("worker registers at hub over mTLS"):
         hub.succeed("systemctl start tribuchet-hub.socket")
         hub.succeed("systemctl start tribuchet-hub")
+        # the hub process itself runs with the agents' descriptor limit,
+        # soft and hard, not the systemd default soft limit of 1024
+        hub.succeed(
+            "grep -E '^Max open files +1048576 +1048576 ' /proc/$(systemctl show -P MainPID tribuchet-hub)/limits"
+        )
         worker.succeed("systemctl start tribuchet-worker")
         # agents = "auto": the generator made one agent socket per core and
         # a spare, and the hub has the worker's max-jobs, one per core

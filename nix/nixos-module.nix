@@ -323,6 +323,12 @@ in
           ];
           WatchdogSec = "30";
           Restart = "on-failure";
+          # Each attach client holds a connection for as long as its build
+          # is queued or running, so the hub's descriptors grow with the
+          # farm's queue. Under the systemd default soft limit of 1024 the
+          # hub could not open the files of the inputs it serves ("Too many
+          # open files"). Match the agents' and nix-daemon's limit.
+          LimitNOFILE = 1048576;
         };
       };
     })

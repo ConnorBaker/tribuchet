@@ -35,7 +35,8 @@ let
   # chown the socket, so this directory carries the nixbld restriction.
   attachDir = lib.escapeShellArg (dirOf (toString hub.socketPath));
   agentUser = i: "_tribuchetbld${toString i}";
-  # launchd's default soft limit of 256 is inherited by builders.
+  # launchd's default soft limit of 256 is inherited by builders; the
+  # hub holds a descriptor per attach client.
   fileLimits.SoftResourceLimits.NumberOfFiles = 10240;
   # Not under /var/run: it is wiped at boot, nothing recreates the
   # directory, and launchd does not create parents of a socket path, so
@@ -185,6 +186,7 @@ in
     (lib.mkIf hub.enable {
       environment.etc."tribuchet/hub.toml".source = hubToml;
       launchd.daemons.tribuchet-hub.serviceConfig = {
+        inherit (fileLimits) SoftResourceLimits;
         ProgramArguments = [
           (lib.getExe' hub.package "tribuchet")
           "hub"
