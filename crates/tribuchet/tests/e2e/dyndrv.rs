@@ -94,10 +94,34 @@ fn load(name: &str, secs: u32) {
             120,
         );
     }
-    // All run at once: none has ended by the time the last is dispatched
-    // (submit's unit writes its status as it ends).
-    for n in 0..slots {
-        succeed(Node::Hub, &format!("test ! -e /tmp/{name}-n{n}.rc"));
+    // All run at once: none has ended by the time the last is dispatched,
+    // read from the order of the hub's journal (the last of their dispatch
+    // lines before the first of their usage lines, logged as each ends),
+    // not from whether one has ended by now: a pause of the VMs between
+    // the dispatches and this check, as long as a build sleeps, would end
+    // them and leave that order as it was.
+    let order = format!(
+        "{} | awk -v p='drv=\"{name}-n' \
+           'index($0, p) && /dispatching build/ {{ d++; last = NR }} \
+            index($0, p) && /build usage/ && !first {{ first = NR }} \
+            END {{ exit !(d >= {slots} && (!first || last < first)) }}'",
+        journal(HUB)
+    );
+    succeed(Node::Hub, &order);
+}
+
+/// Each of load `name`'s builds, all ended, has its usage line: what
+/// load() read their order by is a line the hub logs, so no usage line
+/// there meant none had ended, not a pattern that matches nothing. By
+/// `grep -c`, which reads the whole journal: `grep -q` would close the
+/// pipe early, and under pipefail fail on a line that is there.
+fn usage_logged(name: &str) {
+    for n in 0..capacity() {
+        let line = format!(
+            "[ $({} | grep 'build usage' | grep -cF 'drv=\"{name}-n{n}\"') -gt 0 ]",
+            journal(HUB)
+        );
+        wait_until_succeeds(Node::Hub, &line, 60);
     }
 }
 
@@ -229,6 +253,7 @@ fn step8() {
     for n in 0..capacity() {
         assert_eq!(ended(&format!("load-a-n{n}"), 300), "0", "load-a-n{n}");
     }
+    usage_logged("load-a");
     // The hub's agents busy while both producers of b are first
     // dispatched: they go to the worker VM's, and reach no attach.
     succeed(Node::Worker, "systemctl stop tribuchet-worker");
@@ -238,6 +263,7 @@ fn step8() {
     for n in 0..capacity() {
         assert_eq!(ended(&format!("load-b-n{n}"), 900), "0", "load-b-n{n}");
     }
+    usage_logged("load-b");
 }
 
 fn step1() {
