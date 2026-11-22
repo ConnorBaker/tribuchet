@@ -748,7 +748,32 @@ turns it off: where parallel builds each fill every CPU, it finishes
 the leader, and the builds on average, earlier, on less CPU. While the
 oldest parallel build (by its start, persisted with it, so the same
 after a worker restart; ties by key) keeps every CPU busy, the other
-parallel builds are frozen. A frozen build is thawed at the first
+parallel builds are frozen.
+When a follower is frozen is the arbiter's rule, not a bound
+(`Policy::step` in `worker/arbiter/policy.rs`). A build is parallel
+once the mean of its runnable threads over its last `WINDOW` samples,
+one second, reaches `PARALLEL_AT`, serial once it falls to `SERIAL_AT`,
+and keeps its phase in between; the leader keeps every CPU busy at a
+sample at which it is not frozen and its runnable threads are at least
+the worker's CPUs. Nothing is frozen until the same leader has kept
+every CPU busy at every sample for `SATURATED_FOR`, nor within
+`REFREEZE_AFTER` of a thaw, nor at a sample that thaws a build. Then
+each other build that may be frozen is, if its mean has stayed at
+least `PARALLEL_AT` at every sample at which it ran for
+`SATURATED_FOR`: one burst freezes nothing, and a follower whose mean
+dips below `PARALLEL_AT` starts that count again. So a follower is
+frozen no sooner than `SATURATED_FOR` after both the leader's
+saturation and its own sustained parallel demand began, and the rule
+sets no time by which it must be: how late depends on when the two
+began, on the samples (`SAMPLE_EVERY` apart) and on the host's load.
+The worker can still refuse a freeze the rule asks for
+(`worker/arbiter.rs`): when what the frozen builds would pin together
+does not fit the memory rule below, or when its cgroup.freeze cannot be
+written or the freeze is not reached within `FREEZE_TIMEOUT`, after
+either of which that build is never frozen again; a build without a
+cgroup or a freeze handle is never frozen at all. How long it then
+stays frozen follows from the thaws below.
+A frozen build is thawed at the first
 200 ms sample at which the leader leaves a CPU spare or has ended, when
 the memory rule below needs the room, when its lease ends, or when the
 freeze is not reached within 5 s; nothing bounds how long it may stay
