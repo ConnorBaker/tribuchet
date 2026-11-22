@@ -16,6 +16,7 @@ use super::state::HubState;
 use crate::errors::{Result, err_ctx};
 use crate::proto::BuildUsage;
 
+mod dependants;
 mod histogram;
 mod workers;
 use histogram::{BYTES, SECONDS, Series, bytes_f64, observe, render_histogram};
@@ -230,6 +231,7 @@ pub(super) async fn render(state: &HubState) -> String {
             value.load(Ordering::Relaxed),
         );
     }
+    dependants::render(&mut out, state);
 
     for (name, help, counts) in [
         (

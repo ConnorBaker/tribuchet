@@ -91,7 +91,8 @@ impl HubState {
             .is_some_and(|h| h.beats > after && !h.keys.contains(key))
     }
 
-    /// The first queued job `caps`'s worker can take, as worker session
+    /// The first queued job, in the queue's order (placement/objective.rs),
+    /// `caps`'s worker can take, as worker session
     /// `asker`, if any: a build it passes over to a less full worker
     /// (placement::Rooms) stays queued, the session it is left to woken.
     pub(in crate::hub) async fn take_job(

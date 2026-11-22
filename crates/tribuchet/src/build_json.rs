@@ -57,6 +57,11 @@ pub struct BuildJson {
     /// by the rule it then applies; absent from a Nix that does not say.
     #[serde(default)]
     pub can_build_locally: Option<bool>,
+    /// Who asked for the build (BuildRequest's client), where the Nix
+    /// that wrote this knows; absent, attach names the nix-daemon
+    /// connection running it.
+    #[serde(default)]
+    pub client: Option<String>,
 }
 
 impl BuildJson {

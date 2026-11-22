@@ -31,6 +31,10 @@ use crate::proto::{
 use crate::rt;
 use crate::tmpdir;
 
+#[path = "attach/client.rs"]
+mod client;
+use client::daemon_connection;
+
 pub fn run(build_json: &Path, socket: &Path) -> Result<()> {
     let build = BuildJson::load(build_json)?;
     let rt = rt::runtime("trib-attach").map_err(err_ctx("creating the tokio runtime"))?;
@@ -130,6 +134,7 @@ fn request(build: BuildJson) -> (BuildRequest, Option<bool>) {
         timeout_secs: build.timeout,
         max_silent_secs: build.max_silent_time,
         can_local,
+        client: build.client.or_else(daemon_connection),
     };
     (req, told)
 }
@@ -387,6 +392,18 @@ mod tests {
     use crate::build_json::tests::{HASH, INPUT_ADDRESSED, SRI, doc};
     use crate::proto::AttachEvent;
     use crate::proto::attach_hub_server::{AttachHub, AttachHubServer};
+
+    /// A request names the client build.json names, else the nix-daemon
+    /// connection running attach.
+    #[test]
+    fn a_request_names_its_client() {
+        let mut build = doc(&serde_json::json!({}));
+        build.client = Some("asked".into());
+        let (req, _) = request(build);
+        assert_eq!(req.client.as_deref(), Some("asked"), "build.json's client");
+        let (req, _) = request(doc(&serde_json::json!({})));
+        assert_eq!(req.client, daemon_connection(), "the daemon connection");
+    }
 
     /// zstd-compressed NAR of a single regular file, as the hub streams it.
     fn zstd_nar_of_file(dir: &Path, body: &[u8]) -> Vec<u8> {

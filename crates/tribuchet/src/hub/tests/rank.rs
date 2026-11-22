@@ -62,6 +62,7 @@ fn expecting(cores: f64, gib: f64) -> Expected {
         secs: None,
         level: Level::Key,
         oom: 0,
+        below: 0.0,
     }
 }
 
@@ -277,7 +278,11 @@ fn seated(
         cores: load.0,
         memory: load.1 * GIB,
     };
-    session.committed.insert("in-flight".into(), in_flight);
+    let held = placement::Placed {
+        demand: in_flight,
+        owners: Vec::new(),
+    };
+    session.committed.insert("in-flight".into(), held);
     drop(placement);
     (guard, caps)
 }

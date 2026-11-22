@@ -330,12 +330,15 @@ teaches nothing. A key with no run takes the longest dash-prefix of its
 pname that has one, then its class (its system and whether it declares
 `big-parallel`), then a fixed prior. A `big-parallel` declaration picks
 the class (its runs, and the cores a key without a succeeded run takes)
-and the prior; nothing else. Placement ranks by memory and cores only:
-the running time, the OOM kills and where an expectation came from are
-learned and logged at dispatch, for a replay of the journal to weigh,
-and unused. A run with no running time (a worker can report none)
-teaches no timing. Keys are never dropped. A build's expectation is
-taken once, as it is first queued; a requeued build keeps it.
+and the prior; nothing else. Placement ranks workers by memory and cores
+only. The running time goes into the path of the builds a key's builds
+are learned to follow (Order, below), not into the key's own. The count
+of a
+key's OOM kills and where an expectation came from are logged at
+dispatch; nothing ranks by them.
+A run with no running time (a worker can report none) teaches no timing.
+Keys are never dropped. A build's expectation is taken once, as it is
+first queued; a requeued build keeps it.
 
 The history is the fold of the hub's build record (`hub/record.rs`), a
 SQLite database at [placement] `record`, by default
@@ -387,7 +390,8 @@ into the record once instead, by a command removed since, before the
 first hub that keeps a record started. Its rows are the record's first;
 those of builds queued before that journal began have no system.
 
-The worker that asks takes the first queued build it can, unless
+The worker that asks takes the first queued build it can, in the
+queue's order (Order, below), unless
 another connected worker that serves it has an idle agent (a free slot,
 not the one build a worker stages ahead while every slot is busy) and
 would be less full with it, or the asker has only that lookahead. That
@@ -404,6 +408,134 @@ memory was replayed on an earlier model of this code and left out: no
 build in the copy of the hub's journal the figures come from
 (`hub/placement/history.rs`) was OOM-killed, and the holds delayed the
 builds they held.
+
+### Order
+
+The queue is kept in an order, stated in `hub/placement/objective.rs`,
+and a worker takes the first build in it it can (above). A waiting build
+b's urgency is `wait(b) + path(b)`:
+
+- `path(b)`: `below(key(b))`, the longest chain of expected running
+  seconds learned to depend on its key: the upward rank of HEFT
+  (Topcuoglu, Hariri and Wu, IEEE TPDS 13(3), 2002) and HLFET's static
+  level, with expected running seconds as costs, less b's own seconds.
+  It is taken with the expectation, as b is first queued.
+- `wait(b)`: seconds since it last entered the queue; a requeued build
+  enters it again and its wait starts over.
+
+The most urgent goes first; equal ones in the order they came. As
+`wait(b) = now - queued(b)`, `urgency(b) = now - due(b)` with
+`due(b) = queued(b) - path(b)`: the order is by due, earliest first, and
+the same at every instant. So nothing is ordered at a take: a build is
+put into the queue at its place by due as it is queued or requeued
+(`objective::enqueue`, a binary search), and the take scans from the
+front, as before. With every path equal the order is the one builds came
+in, FIFO. Each dispatch logs the build's `path` and `waited` beside
+`expect_below`.
+
+*Why not its own seconds.* With b's own seconds in its path, builds
+nothing follows go longest first, and in a class few workers serve the
+shorter wait out the longer that came after them. Replayed on the hub's
+trace of 2026-11-16..19 with the hub's own estimates (8 KVM agents a
+host, summed batch makespan against FIFO's 1,097.5 h, 95% interval by
+bootstrap over batches), own seconds plus `below` was +0.17% (+0.10% to
++0.24%), about 88% of it in KVM batches (1.6 h of the 1.82 h, +0.30%
+there): the KVM builds' summed wait
+grew from 23.6 h to 30.5 h, each waiting behind KVM builds of longer own
+seconds that came after it. `below` alone was -0.02% (-0.05% to +0.01%;
+-0.09%, -0.19% to +0.00%, with memory admission), no measured gain or
+loss on that trace, and no batch more than 10% + 60 s slower; on
+synthetic graphs where chains compete with other work it kept the gain
+of the whole rank (in the commit message). It still makes KVM builds
+wait longer in sum, if not finish their batches later: 24.61 h against
+FIFO's 23.62 h, and 41.11 h against 36.50 h with memory admission
+(where the other builds wait 41.98 h against 44.03 h).
+
+*Starvation bound.* A build c queued after b goes before it only if it
+came less than `path(c) - path(b)` seconds after b
+(`a_later_build_passes_only_within_its_path_difference`). No stream of
+later builds keeps b waiting: one that arrives more than the longest
+path the hub has learned after b goes behind it. The bound is as long as
+the longest `below` learned, which pname keys joining chains
+overestimate; the hub exports by system the `below` of each key
+something was learned to follow, a minute to a day
+(`tribuchet_hub_below_seconds`), so that it can be watched. A build no asking
+worker admits is outside this: admission skips a build, it does not
+order it, and under memory admission a large build can be skipped while
+smaller ones behind it fill a worker; that wait is admission's.
+
+*Share, logged, not in the order.* Each dispatch logs, beside `path`,
+`waited` and `expect_below`, the build's `share`: the least, over the
+clients still waiting for it, of the client's dominant share (Dominant
+Resource Fairness, Ghodsi et al., NSDI 2011), the larger of the expected
+cores and the expected memory that the builds placed and not settled
+hold for the client, over the connected workers' cores and memory (a
+worker that reports none counts none). A placed build holds for the
+clients waiting for it as it is placed, each once, until it settles or
+its worker's session closes (kept as builds are placed and settle,
+`objective::Charges`, not recomputed). The clients no request names are
+one client, unknown to the hub, charged as one. Share is not in the
+order because nix-grpc-store, whose builder opens a nix-daemon
+connection per build, makes each build its own client, holding nothing
+while it waits: a client the hub names by its connection to the hub's
+daemon, holding a running build, would wait behind every one of them
+without bound. Share enters the order once nix-grpc-store forwards each
+build's originating client. nix-grpc-store also decides fairness itself
+(its scheduler places the next build for the client with the fewest
+placed, 37094d0); with the hub the one admission and placement owner,
+that layer's fairness should then pass builds through.
+
+*What the hub learns of dependants* (`hub/placement/downstream.rs`). Nix
+hands the hub a build only once its inputs exist, so a waiting build's
+dependants are never queued beside it. A run that succeeds lists its
+inputs (build.json's `inputPaths`, its closure). An input that is an
+output of one of a key's last 8 runs here was made by that key, of its
+own system; each such key is then followed by this build's expected
+seconds and the chain that follows this build's key: `below(k) = max
+over builds d, finished since k last ran, with an input made by k, of
+secs(d) + below(key(d))`, where the chain through d is one of keys none
+of which is k; one that would come back to k counts d alone. While none
+has finished since k's last run, what the runs before left stands:
+`below` follows a key's latest run, not the longest any of its runs
+started (a key that runs often, as `source` does, keeps its latest).
+Keys are pnames and inputs are closures, so keys can name each other;
+every `below` is the learned seconds of a chain of distinct keys, and a
+cycle cannot add to it. A chain of n builds is learned over at most n -
+1 runs of it. Below a key no run has followed, `below` is 0, and so is
+the path of its builds. Pname keys also
+join chains no one build is on: if one build of b follows a and another
+build of b is followed by c, `below(a)` counts b then c, longer than any
+chain one run went down. Never learned, and counted only as a run
+without a producer here (`tribuchet_hub_dependants_unmatched_total`,
+against `_matched_total`): a producer whose output path is not the one
+its dependants list (floating content-addressed, whose scratch path is
+not its final one), a producer this hub did not run (substituted, or
+built elsewhere), and one older than its key's last 8 runs. It is not in
+the record: a restarted hub learns it anew. It keeps the output paths of
+each key's last 8 runs and a chain of keys for each.
+
+*Who the client is.* A request carries `client`: build.json's, where the
+Nix writing it says, else the nix-daemon connection that runs attach (Nix
+starts an external builder from the process serving the connection that
+asked for the build), named by boot, pid and start time. A client of the
+hub's daemon is then a client here; the hub logs it as `owner` on the
+build's queueing line. No Nix writes build.json's field yet. It is not
+part of the build: a second client joins the first's build, and a
+worker's assignment does not carry it (it is built field by field from
+the request, this left out). The clients not named are one client,
+charged as one: an attach older than the field, during a mixed rollout,
+and an attach on a hub without /proc (darwin), or whose /proc hides its
+parent's (hidepid). An attach whose parent exited before it read it is
+named, by its new parent (init, or a subreaper): it is charged as that
+client, shared with every other such attach.
+
+*Keys are pnames.* `below` is kept per history key, as the history keeps
+seconds, so builds of one pname share it: every fetchFromGitHub source is
+named `source`. A build is known as its key's producer by its outputs,
+of every output name, not by the input's name.
+
+The replays and synthetic runs behind this order, by models kept outside
+this repository, are recorded in the message of the commit that added it.
 
 ## CPU arbitration
 
