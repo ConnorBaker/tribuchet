@@ -6,7 +6,7 @@
 //! and is taken with what `a` taught their prefix, on either worker. Two
 //! workers, the worker VM's and the hub VM's, each with two agents.
 
-use crate::harness::{Node, ended, journal, submit, succeed, wait_until_succeeds};
+use crate::harness::{Node, ended, journal, submit, succeed, wait_journal, wait_until_succeeds};
 
 /// Rounds of: submit `a`; once it is dispatched, submit `b`.
 const ROUNDS: usize = 3;
@@ -64,11 +64,12 @@ fn a_second_heavy_goes_to_the_other_worker() {
             _ => format!("spread-a-{round}{n}"),
         });
         launch(&a);
-        let dispatched = format!(
-            "{} | grep 'dispatching build' | grep -qF 'drv=\"{a}\"'",
-            journal("tribuchet-hub")
+        wait_journal(
+            Node::Hub,
+            "tribuchet-hub",
+            &format!("dispatching build.*drv=\"{a}\""),
+            60,
         );
-        wait_until_succeeds(Node::Hub, &dispatched, 60);
         let first = dispatch_line(&a);
         assert!(
             first.contains(r#"features="big-parallel""#) && first.contains("idle_elsewhere=1"),

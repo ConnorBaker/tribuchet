@@ -151,8 +151,10 @@ in
 
     hub.succeed("systemctl start tribuchet-hub.socket tribuchet-hub")
     worker.succeed("systemctl start tribuchet-worker")
+    # `grep -c`, not `grep -q`: an early exit would SIGPIPE journalctl
+    # and, under the driver's pipefail, fail on a line that is there.
     hub.wait_until_succeeds(
-        "journalctl -u tribuchet-hub | grep -q 'worker registered worker=\"tt-worker\"'",
+        "[ $(journalctl -u tribuchet-hub | grep -c 'worker registered worker=\"tt-worker\"') -gt 0 ]",
         timeout=60,
     )
 
@@ -174,8 +176,8 @@ in
         )
         out = hub.succeed("nix-build /root/test.nix --no-out-link").strip()
         hub.succeed(f"grep -q 'tailscale-auth-payload ok' {out}")
-        hub.succeed("journalctl -u tribuchet-hub | grep -q 'dispatching build'")
-        worker.succeed("journalctl -u tribuchet-worker | grep -q 'builder finished'")
+        hub.succeed("[ $(journalctl -u tribuchet-hub | grep -c 'dispatching build') -gt 0 ]")
+        worker.succeed("[ $(journalctl -u tribuchet-worker | grep -c 'builder finished') -gt 0 ]")
 
     with subtest("a non-tailnet peer is rejected"):
         # Dial the hub over the plain VM network: whois has no entry
@@ -185,7 +187,7 @@ in
         )
         worker.succeed("systemctl restart tribuchet-worker")
         hub.wait_until_succeeds(
-            "journalctl -u tribuchet-hub | grep -q 'tailscale whois failed'",
+            "[ $(journalctl -u tribuchet-hub | grep -c 'tailscale whois failed') -gt 0 ]",
             timeout=30,
         )
   '';
