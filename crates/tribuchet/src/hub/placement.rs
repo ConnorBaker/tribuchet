@@ -273,7 +273,9 @@ impl Placement {
         let on = (rest.worker.as_deref()).map(|worker| On { worker, taught });
         self.history.record(&build, exit_code, u, on);
         if let Some(key) = key_of(job).filter(|_| exit_code == 0 && !u.oom_killed) {
-            let secs = self.history.expect(&build).secs.unwrap_or(0.0);
+            // A path's seconds are the build's, on a worker of factor 1,
+            // not those of the workers its runs happened to take.
+            let secs = self.history.unit_secs(&build).unwrap_or(0.0);
             let outputs = job.req.outputs.values().cloned();
             (self.downstream).learn(&key, secs, outputs, &job.req.input_paths);
         }

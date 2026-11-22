@@ -695,7 +695,20 @@ b's urgency is `wait(b) + path(b)`:
   seconds learned to depend on its key: the upward rank of HEFT
   (Topcuoglu, Hariri and Wu, IEEE TPDS 13(3), 2002) and HLFET's static
   level, with expected running seconds as costs, less b's own seconds.
-  It is taken with the expectation, as b is first queued.
+  The seconds are a worker of speed factor 1's (`History::unit_secs`,
+  Worker speed): a path is a property of the builds on it, not of the
+  workers their runs happened to take, which would make a chain longer
+  for having run on slow workers. The median as the runs ran stays the
+  dispatch line's `expect_secs`. A test runs a dependant 50 s on a 2x
+  worker or 100 s on a 1x one and learns the same path. A link's seconds
+  are those of the factors when it was learned: a later refit does not
+  revise a path, which is learned again at the next run of each
+  dependant on it. A link is off a fresh read by as much as its
+  workers' factors moved since it was learned, and no bound on that is
+  claimed: the compared workers' factors end the replay below within
+  0.90 to 1.18 of the typical worker's, an end state, not how far they
+  move over time. It is taken with the expectation, as b is first
+  queued.
 - `wait(b)`: seconds since it last entered the queue; a requeued build
   enters it again and its wait starts over.
 
