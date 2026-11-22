@@ -102,22 +102,26 @@ fn a_learned_hot_one_goes_where_the_naps_are() {
     assert_eq!([ended("hot-0", 120), ended("nap-0", 120)], ["0", "0"]);
     restart();
     // Each run's profile, as its worker's arbiter sampled it, is in the
-    // record by its result: the hot build ran 2 threads, the nap none;
-    // the hot build's points' CPU times sum to its result's, and their
-    // running times to about its own.
+    // record by its result. Over its running time the hot build ran 2
+    // threads, the nap none: a 10 s run's point is one 200 ms sample, and
+    // a nap's shell is runnable at instants as it starts and ends. The hot
+    // build's points' CPU times sum to its result's, and their running
+    // times to about its own.
     let of = |drv: &str, value: &str, list: &str| {
         let sql = format!(
             "SELECT {value} FROM profile p JOIN result r USING (id), \
-             json_each(p.{list}) j WHERE r.drv = '{drv}'"
+             json_each(p.{list}) j, json_each(p.running_usec) t \
+             WHERE j.key = t.key AND r.drv = '{drv}'"
         );
         let out = succeed(Node::Hub, &format!("sqlite3 -readonly {RECORD} \"{sql}\""));
         out.trim()
             .parse::<i64>()
             .unwrap_or_else(|_| panic!("{drv} {value}: {out:?}"))
     };
+    let threads = "sum(j.value * t.value) / sum(t.value)";
     let (hot, nap) = (
-        of("hot-0", "max(j.value)", "runnable"),
-        of("nap-0", "max(j.value)", "runnable"),
+        of("hot-0", threads, "runnable"),
+        of("nap-0", threads, "runnable"),
     );
     assert!(hot >= 1500 && nap <= 500, "profiles: hot {hot}, nap {nap}");
     let unsummed = of("hot-0", "max(r.cpu_usec) - sum(j.value)", "cpu_usec");
