@@ -555,3 +555,35 @@ fn a_censored_run_teaches_no_speed() {
     let r = ratio(&h, "a", "b");
     assert!(r > 1.2, "succeeded, b read {r}x slower");
 }
+
+/// Runs are compared under history's key (history::key, system and
+/// stem): `tool-1.0` on a and `tool-2.0` on b, one stem, are compared,
+/// and read b 2x a; `foo-1` on a and `bar-1` on b, two stems, are not,
+/// and leave both at factor 1, though bar-1 takes half foo-1's time: a
+/// coarser key (the system alone) would compare them and read b 2x.
+#[test]
+fn runs_are_compared_under_historys_key() {
+    let mut h = History::default();
+    for _ in 0..500 {
+        for (worker, name, secs) in [("a", "tool-1.0", 100.0), ("b", "tool-2.0", 50.0)] {
+            let on = Some(On {
+                worker,
+                taught: true,
+            });
+            h.record(&build(name), 0, &usage(secs), on);
+        }
+    }
+    let r = ratio(&h, "b", "a");
+    assert!((r / 2.0 - 1.0).abs() < 0.02, "one stem: b read {r}x a");
+    let mut h = History::default();
+    for _ in 0..500 {
+        for (worker, name, secs) in [("a", "foo-1", 100.0), ("b", "bar-1", 50.0)] {
+            let on = Some(On {
+                worker,
+                taught: true,
+            });
+            h.record(&build(name), 0, &usage(secs), on);
+        }
+    }
+    assert_eq!((h.speed("a"), h.speed("b")), (1.0, 1.0), "two stems");
+}

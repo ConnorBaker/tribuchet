@@ -855,13 +855,33 @@ per other worker, with its latest run before and its next after. On
 the record 5 of the 13 workers it names are compared; the others keep
 factor 1: 7 ran only before dispatch rows recorded load, so none of
 their runs is quiet, and one aarch64 worker shares no key with the
-rest. The factors fit the comparisons by least squares,
-with two departures, each chosen by a replay of the record (below):
+rest. A run's key is history's (`history::key`: its system and stem),
+so the runs a factor compares are those history counts as one build's,
+whose seconds an expectation multiplies by the factor; a test pins it
+(two versions of one stem compared, two stems not). The replays below
+keyed by Nix's pname, before history keyed by stem, on the snapshot
+without its `source` table, and are quoted as run then. Run again at
+this commit under the stem, on the same snapshot and its 2026-11-17 to
+19 window passed over, the cut per run is 3.91 % (1,328,795 runs,
+against 1,328,851 by pname), and 11.43 % with the worker that halves.
+On the snapshot with the `source` table (1,345,937 results with
+sources, as the hub's daemon names them), whose expectations take the
+sources level, speed cuts 7.22 % per run, and 9.65 % for blob-deps'
+`program-observation.json` builds (1,009,757 runs), hour-weighted
+-0.90 % and -1.20 %; with the worker that halves, 18.56 % and 22.51 %.
+Comparing runs under their sources where they have them, the stem
+else, instead: 7.33 % and 9.76 %, hour-weighted -0.86 % and -1.06 %,
+from 13 % more comparisons (1,424,520 against 1,262,031; each pair of
+the five compared workers changes by -1 % to +24 %); with the worker
+that halves, 18.27 % and 22.07 %. The two keys trade places by 0.44
+points or less on the figures quoted, so speed keeps history's. The
+factors fit the comparisons by least squares, with two departures,
+each chosen by a replay of the record (below):
 
 - A comparison is clamped to within 0.5 in ln of the fit when it is made
   (`BOUND`). One comparison's deviation from the fit has a standard
   deviation of 2.0 but a median of 0.17: runs timed at a millisecond,
-  and pnames that pool unlike inputs. The clamp is not a Huber
+  and keys that pool unlike inputs. The clamp is not a Huber
   M-estimate: a comparison is not revisited as the fit moves, so the
   factors depend on the order runs arrive in, which the fold keeps.
 - Each pair of workers' comparisons decay with a window of 1,000

@@ -10,7 +10,8 @@
 //! earliest-finish-time rule (HEFT, Topcuoglu et al. 2002) takes.
 //!
 //! In logs, ln t = ln p_b - x_w + noise, with x_w = ln s_w. Two runs of
-//! the same key on workers a and b compare them, p_b cancelling:
+//! the same key (history's: system and stem) on workers a and b compare
+//! them, p_b cancelling:
 //! ln t_a - ln t_b = x_b - x_a. Each run that teaches speed (below) is
 //! compared with each other worker's latest such run of its key that
 //! came since this worker's previous one, so each pair of runs is
@@ -27,7 +28,7 @@
 //! Two departures from plain least squares, each chosen by a replay of
 //! the record (DESIGN.md, Worker speed). A comparison is clamped to
 //! within BOUND of the fit when it is made, so that a run timed at 1 ms
-//! or a pname pooling unlike inputs moves the fit by a bounded step (the
+//! or a key pooling unlike inputs moves the fit by a bounded step (the
 //! deviations' tails are heavy: a standard deviation of 2.0 in ln, a
 //! median of 0.17). Unlike a Huber M-estimate, a comparison is not
 //! revisited as the fit moves: the result depends on the runs' order,
