@@ -28,6 +28,8 @@ use crate::proto::{AttachEvent, BuildRequest, attach_event};
 
 #[path = "state/clientless.rs"]
 mod clientless;
+#[path = "state/farm.rs"]
+mod farm;
 #[path = "state/hold.rs"]
 mod hold;
 #[path = "state/inflight.rs"]
@@ -173,6 +175,9 @@ pub(super) struct HubState {
     /// When set, the known workers' systems and the connected workers'
     /// capacity are mirrored to this nix.conf fragment, through its one writer.
     pub(super) nix_config: Option<(NixConfig, watch::Sender<String>)>,
+    /// When set, the known workers are mirrored to a farm file
+    /// (render_farm) at this oversubscribe percent, through its one writer.
+    pub(super) farm: Option<(u32, watch::Sender<String>)>,
     pub(super) chunks: Arc<ChunkCache>,
     /// Each worker session's admission (placement.rs).
     pub(super) placement: StdMutex<Placement>,
@@ -269,6 +274,7 @@ impl HubState {
             caps_changed: Notify::default(),
             metrics: Metrics::default(),
             nix_config: nix_config.map(Self::nix_config_writer),
+            farm: None,
             chunks,
             placement: StdMutex::default(),
             runs: Runs::default(),
@@ -279,9 +285,11 @@ impl HubState {
     }
 
     /// Mirror the known workers' systems and the connected workers'
-    /// capacity to the nix.conf fragment. Called as the hub starts, and
-    /// after a register, deregister, decommission or capacity change.
+    /// capacity to the nix.conf fragment, and the known workers to the farm
+    /// (regen_farm). Called as the hub starts, and after a register,
+    /// deregister, decommission or capacity change.
     pub(super) fn regen_nix_config(&self) {
+        self.regen_farm();
         let Some((cfg, tx)) = &self.nix_config else {
             return;
         };
@@ -473,6 +481,7 @@ mod tests {
             attach_program: "/nix/store/attach".into(),
             oversubscribe_percent: 200,
             max_jobs_cap: 256,
+            farm_path: None,
         };
         let mut workers = HashMap::new();
         workers.insert(1, {
@@ -506,6 +515,7 @@ mod tests {
             attach_program: r"/nix/store/at\tach".into(),
             oversubscribe_percent: 100,
             max_jobs_cap: 1,
+            farm_path: None,
         };
         let mut workers = HashMap::new();
         workers.insert(1, caps("x86_64-linux\u{2028}\"", &[]));
@@ -528,6 +538,7 @@ mod tests {
             attach_program: "/nix/store/attach".into(),
             oversubscribe_percent: 200,
             max_jobs_cap: 256,
+            farm_path: None,
         };
         let out = render_nix_config(&BTreeSet::new(), &HashMap::new(), &cfg);
         assert!(out.contains(r#""systems":[]"#), "{out}");

@@ -111,6 +111,19 @@ in
         defaultText = lib.literalExpression "[ pkgs.stdenv.hostPlatform.system ]";
         description = "Systems handed to tribuchet instead of being built locally (static mode; ignored when `dynamic` is set).";
       };
+      farmPath = lib.mkOption {
+        type = lib.types.nullOr lib.types.path;
+        default = null;
+        example = "/run/tribuchet/farm.json";
+        description = ''
+          Where the hub also writes its known workers as a farm (dynamic
+          mode), for a nix-grpc-daemon that hands it builds (its
+          `farmFile`): per worker, the features it honors for each system
+          and its max-jobs scaled by `oversubscribePercent` (at least 1), 0 while it is
+          away. The daemon admits a build only while the workers that could
+          build it have room, so the bound follows both.
+        '';
+      };
       nixConfigPath = lib.mkOption {
         type = lib.types.path;
         default = "/run/tribuchet/nix.conf";
@@ -283,6 +296,9 @@ in
         attach-program = toString attachWrapper;
         oversubscribe-percent = hub.externalBuilders.oversubscribePercent;
         max-jobs-cap = hub.externalBuilders.maxJobsCap;
+      }
+      // lib.optionalAttrs (hub.externalBuilders.farmPath != null) {
+        farm-path = toString hub.externalBuilders.farmPath;
       };
       # Apply a regenerated fragment: restart swaps only the daemon's
       # accept loop, in-flight build children keep running.

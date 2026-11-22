@@ -155,6 +155,9 @@ fn run_extending(cfg: HubConfig, period: Duration) -> Result<()> {
 fn open_state(cfg: &HubConfig, chunks: Arc<ChunkCache>, record: &Path) -> HubState {
     let grace = Duration::from_secs(cfg.worker_grace_secs);
     let mut state = HubState::new(grace, cfg.nix_config.clone(), chunks);
+    state.farm = (cfg.nix_config.as_ref())
+        .and_then(|n| Some((n.farm_path.clone()?, n.oversubscribe_percent)))
+        .map(|(path, percent)| HubState::farm_writer(path, percent));
     state.runs = Runs::open(&record.with_file_name("run-epoch"));
     state.known = Known::open(&record.with_file_name("known-workers"));
     state.lost = Lost::open(&record.with_file_name("lost-keys"));
@@ -523,5 +526,31 @@ mod tests {
         let three = |seen: &[String]| seen.len() >= 3;
         let s = notifications(endless, three, &Quiet::Cpu(Duration::from_secs(2)));
         assert_eq!(s.seen, [EXTEND; 3]);
+    }
+
+    /// With farm-path set, the starting hub writes its known workers as the
+    /// farm, each at 0 until it connects, at the fragment's oversubscribe
+    /// percent.
+    #[tokio::test]
+    async fn a_starting_hub_writes_its_known_workers_as_the_farm() {
+        let dir = tempfile::tempdir().unwrap();
+        let (record, path) = (dir.path().join("record"), dir.path().join("nix.conf"));
+        let farm = dir.path().join("farm.json");
+        Known::open(&record.with_file_name("known-workers")).learn(&caps("w"));
+        let set = format!(
+            "[nix-config]\npath = {path:?}\nattach-program = '/a'\noversubscribe-percent = 300\nfarm-path = {farm:?}"
+        );
+        let cfg: HubConfig = toml::from_str(&set).unwrap();
+        let chunks = Arc::new(ChunkCache::open(dir.path().join("chunks"), 1 << 20).unwrap());
+        let state = open_state(&cfg, chunks, &record);
+        let Some((percent, rendered)) = state.farm.as_ref() else {
+            panic!("the hub keeps no farm for farm-path");
+        };
+        assert_eq!(*percent, 300);
+        let listed = rendered.borrow().clone();
+        assert_eq!(
+            listed,
+            "{\"machines\":[{\"jobs\":0,\"systems\":{\"x86_64-linux\":[]}}]}\n"
+        );
     }
 }
