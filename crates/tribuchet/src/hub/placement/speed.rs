@@ -42,7 +42,7 @@
 //! as many taught runs as there are workers, so its cost per run grows
 //! with the square of the workers, not their cube.
 //!
-//! A run teaches speed only if its dispatch was quiet (`Placed`): it
+//! A run teaches speed only if its dispatch was quiet (`Teaching`): it
 //! succeeded with running time, and its dispatch was quiet and not
 //! resumed, by the hub or by the worker's answer. The hub records the
 //! decision beside the result (record::TAUGHT). Quiet is tested once, when the build is dispatched, on what
@@ -97,7 +97,7 @@ pub(in crate::hub) fn quiet(load: f64, expect: f64, cores: f64) -> bool {
 /// answer (a resumed dispatch may hand over a run that ended before it,
 /// under a load it did not see). The result's record row keeps it.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(in crate::hub) struct Placed {
+pub(in crate::hub) struct Teaching {
     pub(in crate::hub) quiet: bool,
 }
 

@@ -9,7 +9,8 @@
 
 use crate::errors::{Result, err_ctx, err_msg};
 use crate::fsutil::{io_ctx, stat_field};
-use crate::worker::arbiter::{cgroup_path, frozen_usec, subgroups};
+use crate::worker::arbiter::{frozen_usec, subgroups};
+use crate::worker::caps::own_cgroup;
 use std::fs;
 use std::io;
 use std::io::Write;
@@ -25,7 +26,7 @@ use std::time::{Duration, Instant};
 /// the leaf. None when the unit is not delegated (development runs):
 /// builds then run without a cgroup of their own.
 pub(super) fn init() -> Option<PathBuf> {
-    let base = cgroup_path(&fs::read_to_string("/proc/self/cgroup").ok()?)?;
+    let base = own_cgroup()?;
     let controllers = fs::read_to_string(base.join("cgroup.controllers")).ok()?;
     let leaf = base.join("agent");
     if fs::create_dir_all(&leaf).is_err() || fs::write(leaf.join("cgroup.procs"), "0").is_err() {

@@ -1,6 +1,7 @@
 //! Which worker a queued build is left to: the least full with an idle
-//! agent, by what its builds are expected to use (history.rs) against its
-//! size. Fullness is the larger of committed cores over the worker's
+//! agent that admits it for its memory (Room::admits), by what its builds
+//! are expected to use (history.rs) against its size. Fullness is the
+//! larger of committed cores over the worker's
 //! cores and committed memory over the memory its builds may use, each
 //! with the build added. On the copy of the hub's journal of history.rs,
 //! replayed by a model with 32 cores and a slot per core on every worker,
@@ -40,9 +41,52 @@ pub(in crate::hub) struct Room {
     pub(in crate::hub) idle: u32,
     pub(in crate::hub) size: Size,
     pub(in crate::hub) load: Demand,
+    /// Of `load`, what its builds the clientless rule may give up hold.
+    pub(in crate::hub) clientless: Demand,
+    /// It holds no build.
+    pub(in crate::hub) empty: bool,
+    /// It holds builds, each one the clientless rule may give up.
+    pub(in crate::hub) only_clientless: bool,
+}
+
+/// The most memory any of `rooms` reported for its builds; None where none
+/// reported any.
+pub(in crate::hub) fn largest(rooms: &[Room]) -> Option<f64> {
+    rooms.iter().filter_map(|r| r.size.memory).reduce(f64::max)
 }
 
 impl Room {
+    /// Whether the worker admits a build expected to use `d`, for its
+    /// memory: what it holds and the build fit its builds' memory; or it
+    /// holds nothing and is the largest serving the build (`largest`), so
+    /// a build larger than every worker waits for that, and is not failed
+    /// for its size. No memory reported admits any. Cores are not tested:
+    /// the CPU arbiter shares them, and a test of them starved builds of
+    /// many cores in an offline replay of the hub's recorded placements.
+    pub(in crate::hub) fn admits(&self, d: Demand, largest: Option<f64>) -> bool {
+        let Some(m) = self.size.memory else {
+            return true;
+        };
+        self.load.memory + d.memory <= m || (self.empty && largest.is_none_or(|l| m >= l))
+    }
+
+    /// The room with its clientless builds given up: empty if they are
+    /// all it holds.
+    pub(in crate::hub) fn freed(&self) -> Self {
+        let (l, c) = (self.load, self.clientless);
+        let load = Demand {
+            cores: l.cores - c.cores,
+            memory: l.memory - c.memory,
+        };
+        let empty = self.empty || self.only_clientless;
+        Self {
+            load,
+            empty,
+            only_clientless: false,
+            ..*self
+        }
+    }
+
     /// How full the worker would be with `d` added: its committed cores
     /// over its cores, or, with `memory`, its committed memory over its
     /// memory if fuller.
@@ -60,9 +104,20 @@ impl Room {
 pub(in crate::hub) struct Rooms {
     pub(in crate::hub) asker: u64,
     pub(in crate::hub) rooms: Vec<Room>,
+    /// A room per build passes ranked that lost it only for the load of
+    /// its clientless builds (passes): they are wanted.
+    pub(in crate::hub) wants: Vec<u64>,
 }
 
 impl Rooms {
+    pub(in crate::hub) fn new(asker: u64, rooms: Vec<Room>) -> Self {
+        Self {
+            asker,
+            rooms,
+            wants: Vec::new(),
+        }
+    }
+
     /// The session that `serves` a build expected to use `d` with an
     /// idle agent and ranks better for it than the asker (an idle agent,
     /// then less full; memory only where every room compared has a
@@ -80,27 +135,51 @@ impl Rooms {
             return None;
         }
         let mine = self.rooms.iter().find(|r| r.id == self.asker)?;
+        let serving: Vec<Room> = (self.rooms.iter())
+            .filter(|r| r.id == self.asker || serves(r.id))
+            .cloned()
+            .collect();
+        let largest = largest(&serving);
         let others: Vec<usize> = (0..self.rooms.len())
             .filter(|&i| {
                 let r = &self.rooms[i];
-                r.id != self.asker && r.idle > 0 && serves(r.id)
+                r.id != self.asker && r.idle > 0 && serves(r.id) && r.admits(d, largest)
             })
             .collect();
         let memory = mine.size.memory.is_some()
             && others.iter().all(|&i| self.rooms[i].size.memory.is_some());
         let rank = |r: &Room| (r.idle == 0, r.fullness(d, memory));
         let order = |a: (bool, f64), b: (bool, f64)| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1));
-        let mine = rank(mine);
-        let best = others.into_iter().min_by(|&i, &j| {
+        let (asker, mine) = (mine.id, rank(mine));
+        let best = others.iter().copied().min_by(|&i, &j| {
             let (a, b) = (&self.rooms[i], &self.rooms[j]);
             order(rank(a), rank(b)).then(a.id.cmp(&b.id))
         })?;
-        if order(rank(&self.rooms[best]), mine) != Ordering::Less {
+        let passed = order(rank(&self.rooms[best]), mine) == Ordering::Less;
+        // A room with an idle agent that would win the build were its
+        // clientless builds given up, and does not, wants them given up.
+        let (won, win) = if passed {
+            (self.rooms[best].id, rank(&self.rooms[best]))
+        } else {
+            (asker, mine)
+        };
+        let lost_only_to_them = |r: &Room| {
+            r.id != won
+                && r.idle > 0
+                && order(rank(&r.freed()), win) == Ordering::Less
+                && order(rank(r), win) != Ordering::Less
+        };
+        let asker = self.rooms.iter().position(|r| r.id == asker);
+        let wants = (others.into_iter().chain(asker)).map(|i| &self.rooms[i]);
+        self.wants
+            .extend(wants.filter(|r| lost_only_to_them(r)).map(|r| r.id));
+        if !passed {
             return None;
         }
         let room = &mut self.rooms[best];
         room.idle -= 1;
         room.load = room.load.plus(d);
+        (room.empty, room.only_clientless) = (false, false);
         since.get_or_insert(now);
         Some(room.id)
     }

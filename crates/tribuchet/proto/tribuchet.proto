@@ -5,8 +5,14 @@ package tribuchet.v1;
 // Worker-facing service. Workers dial the hub and keep a long-lived
 // bidirectional stream open (NAT-friendly; the hub never dials workers).
 service WorkerHub {
-  // Single bidi stream multiplexing registration, heartbeats, build
-  // assignment, path negotiation, chunk transfer, logs and results.
+  // A worker's control: registration, heartbeats, assignments, cancels,
+  // Needs, Started, logs, results and acks. Opened first, on a
+  // connection of its own, so that no chunk is ever queued ahead of it.
+  rpc Control(stream WorkerMessage) returns (stream HubMessage);
+  // The same worker's bulk, on a second connection: chunks, manifests and
+  // tmp dirs. Its first message is a Register carrying only the session
+  // of the worker's open Control. A Register without one (a worker
+  // predating Control) is refused.
   rpc Session(stream WorkerMessage) returns (stream HubMessage);
 }
 
@@ -31,11 +37,49 @@ message WorkerMessage {
     // store lacks. The first Need answers the assignment and lists
     // every missing input path. May repeat any number of times.
     Need need = 8;
+    // The build is staged and its run starts: sent before its builder is
+    // spawned, so before anything else of the run. A Resumed stands for
+    // it on a resume.
+    Started started = 9;
+    // Answer to a Need for output chunks of a result the worker no longer
+    // has, or cannot read: it has dropped the result.
+    ResultGone result_gone = 10;
   }
+}
+
+// A run: one assignment of a build to a worker, numbered by the hub
+// after every run an earlier hub process numbered (epoch). Unset from
+// peers predating it.
+message RunId {
+  uint64 epoch = 1;
+  uint64 seq = 2;
+}
+
+// A run a worker holds and was not told to drop: staging, started, or
+// finished with its exit code.
+message HeldRun {
+  RunId run = 1;
+  string dedupe_key = 2;
+  bool started = 3;
+  optional int32 exit_code = 4;
+}
+
+message ResultGone {
+  string build_id = 1;
+  RunId run = 2;
 }
 
 message Resumed {
   string build_id = 1;
+  // The run has finished: what follows is its result.
+  bool finished = 2;
+  // The run the worker holds, which the assignment's run stands for.
+  RunId run = 3;
+}
+
+message Started {
+  string build_id = 1;
+  RunId run = 2;
 }
 
 message RequestJob {
@@ -137,6 +181,12 @@ message Register {
   // where the worker cannot tell, and by workers predating the fields.
   optional uint32 cores = 5;
   optional uint64 build_memory = 6;
+  // Random, chosen by the worker per session: names its Control to its
+  // Session.
+  bytes session = 7;
+  // Every run it holds, and those it found gone as it started.
+  repeated HeldRun held = 8;
+  repeated RunId lost = 9;
 }
 
 message Heartbeat {
@@ -147,6 +197,14 @@ message Heartbeat {
   // Current Register.max_jobs: reachable build agents change. Unset by
   // workers predating the field.
   optional uint32 max_jobs = 4;
+  // The dedupe keys of the builds the worker's CPU arbiter holds frozen,
+  // and of the build it lets run meanwhile, its leader; none, and unset,
+  // with none frozen, and from workers predating the fields.
+  repeated string frozen_keys = 5;
+  optional string leader_key = 6;
+  // Current Register.held and Register.lost.
+  repeated HeldRun held = 7;
+  repeated RunId lost = 8;
 }
 
 message BuildAssignment {
@@ -174,6 +232,12 @@ message BuildAssignment {
   // own; 0 (none, or from hubs predating the fields) leaves its own.
   uint64 timeout_secs = 15;
   uint64 max_silent_secs = 16;
+  RunId run = 17;
+  // A producer's (builder-rpc-v0) run: 16 random bytes per dispatch, which
+  // the hub also sends that build's attach (RelayReady) and nobody else.
+  // The worker hands the run's listener only to a holder of it. Never
+  // logged. Empty for every other build.
+  bytes handoff_token = 18;
 }
 
 message TmpDirArchive {
@@ -215,6 +279,11 @@ message BuildResult {
   reserved 5;
   // What the build used on the worker; all 0 when unknown.
   BuildUsage usage = 6;
+  RunId run = 7;
+  // A producer's run killed because no attach fetched its listener in
+  // time, or because a restarted worker found it never handed off: the
+  // run reached no client, so the hub settles it as a loss, not a result.
+  bool handoff_expired = 8;
 }
 
 message BuildUsage {
@@ -232,6 +301,36 @@ message BuildUsage {
   // Of wall_ms, the time the build was frozen (by the worker's CPU
   // arbiter, or anyone); 0 when unknown.
   uint64 frozen_ms = 5;
+  // How its parallelism and memory changed over its run; unset where the
+  // worker's CPU arbiter did not sample it (off, no cgroup, an older
+  // worker).
+  BuildProfile profile = 6;
+}
+
+// A build's run as the worker's CPU arbiter sampled it, about every
+// 200 ms, from when that worker began tracking it (a build adopted after
+// a worker restart has only its later part): at most 64 points, oldest
+// first, each of the same number of consecutive samples, the last
+// possibly fewer. The four lists are parallel, one entry per point.
+message BuildProfile {
+  // Running time the point covers, measured: the clock's advance less
+  // the build cgroup's own frozen time (cgroup.stat.local frozen_usec)
+  // over it. A point's share of the run, however late its samples came.
+  repeated uint64 running_usec = 1;
+  // CPU time the build's cgroup used over the point (cpu.stat
+  // usage_usec): cores used, its running time times its cores. The
+  // first point also holds what the cgroup used before tracking began,
+  // so the points sum to the cgroup's count, BuildUsage.cpu_usec.
+  repeated uint64 cpu_usec = 2;
+  // Mean runnable threads (running or waiting for a CPU: demand) over
+  // the point's samples taken while the build was not frozen, in
+  // thousandths; 0 where every one was frozen. Against cpu_usec over
+  // running_usec, what the build wanted against what it got.
+  repeated uint32 runnable_milli = 3;
+  // Largest memory.current of the build's cgroup as sampled over the
+  // point: a lower bound on its peak there. The run's own peak is
+  // BuildUsage.peak_memory_bytes (memory.peak).
+  repeated uint64 memory_bytes = 4;
 }
 
 // Local service between `tribuchet attach` and the hub, served on a unix
@@ -243,13 +342,47 @@ service AttachHub {
   rpc Build(stream BuildMessage) returns (stream AttachEvent);
 }
 
+// The operator's commands, on the same local socket.
+service HubAdmin {
+  // Retire a worker that is not connected: the hub no longer knows it
+  // (SEMANTICS-7 U4). Fails for a connected or an unknown worker.
+  rpc Decommission(DecommissionRequest) returns (DecommissionReply);
+}
+
+message DecommissionRequest {
+  string worker_name = 1;
+}
+
+message DecommissionReply {}
+
 // Client-streamed submission: the BuildRequest, then TmpDirFile
 // chunks terminated by an eof chunk.
 message BuildMessage {
   oneof msg {
     BuildRequest request = 1;
     TmpDirChunk tmp_dir = 2;
+    // A producer's attach, before it writes the first byte of the run to
+    // its client's socket; the hub acknowledges it (relay_started_ack).
+    RelayStarted relay_started = 3;
   }
+}
+
+// Names the run whose bytes are about to reach the client: a token the
+// hub gave that run (RelayReady). The hub records and acknowledges only
+// one of the run current now, so a stale splice never marks another run.
+message RelayStarted {
+  bytes handoff_token = 1;
+}
+
+// Where a producer's attach fetches the run's listener: the worker's
+// handoff socket, with this token. `fresh`: the run was staged afresh
+// (not resumed), so a listener attach holds is of a run now gone, unless
+// the token is one of its own. A client joining after it (an attach
+// reconnecting to the same hub) is replayed the latest fresh one and each
+// resume's after it, as published.
+message RelayReady {
+  bytes handoff_token = 1;
+  bool fresh = 2;
 }
 
 message TmpDirChunk {
@@ -278,6 +411,24 @@ message BuildRequest {
   // time it waits for a worker or an agent, nor the time it is frozen.
   uint64 timeout_secs = 12;
   uint64 max_silent_secs = 13;
+  // Whether the client's own Nix builds it when declined (canLocal), as
+  // its build.json says, false with network; unset when Nix does not say.
+  // Not part of the build.
+  optional bool can_local = 14;
+  // Who asked for the build: the client a fair share is kept for
+  // (hub/placement/objective.rs). Its build.json's, else the nix-daemon
+  // connection running attach. Not part of the build.
+  optional string client = 15;
+  // A producer's (builder-rpc-v0): 16 random bytes per attach process,
+  // kept across its reconnects. Part of the build: another client's goal
+  // never joins this one's run.
+  bytes attach_id = 16;
+  // The hub acknowledged this attach's RelayStarted: the run reached the
+  // client. Not part of the build.
+  bool relay_started = 17;
+  // build.json's drvPath, where Nix writes it: logged and recorded only,
+  // never in the key or admission. Not part of the build.
+  optional string drv_path = 18;
 }
 
 message AttachEvent {
@@ -295,6 +446,9 @@ message AttachEvent {
     // Name of the worker the build was dispatched to, for the client
     // to report where the build runs.
     string dispatched = 7;
+    RelayReady relay_ready = 8;
+    // The hub recorded the attach's RelayStarted: its handoff_token.
+    bytes relay_started_ack = 9;
   }
 }
 

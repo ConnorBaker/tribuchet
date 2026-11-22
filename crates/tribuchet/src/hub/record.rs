@@ -22,11 +22,18 @@ use rusqlite::types::Value;
 use rusqlite::{Connection, OpenFlags, TransactionBehavior, params_from_iter};
 
 use super::naming::named_output;
-use super::placement::{Build, History, On, Placed, QUIET};
+#[cfg(test)]
+use super::placement::On;
+use super::placement::{Build, History, QUIET, Teaching};
 use super::state::{HubState, Job};
 use crate::errors::{Result, err_msg};
-use crate::proto::BuildUsage;
+use crate::proto::{BuildProfile, BuildUsage};
+#[cfg(test)]
+pub(in crate::hub) use fold::each_run;
+pub(in crate::hub) use fold::fold;
 
+#[path = "record/fold.rs"]
+mod fold;
 #[cfg(test)]
 #[path = "record/replay.rs"]
 mod replay;
@@ -68,7 +75,27 @@ CREATE TABLE dispatch (at_ms INTEGER NOT NULL, id TEXT NOT NULL, key TEXT, worke
 PRAGMA user_version = 1;
 ";
 
-/// Whether each `result` row's run teaches speed (speed::Placed), by
+/// The table of build profiles, which a record of user_version 1 gains
+/// as a hub that writes them opens it: a hub that does not ignores it.
+/// A row per result row whose usage had one, by the result's at_ms and
+/// id; the others are JSON arrays of the profile's points, one column
+/// per list of BuildProfile in tribuchet.proto.
+const PROFILE: &str = "CREATE TABLE IF NOT EXISTS profile (at_ms INTEGER NOT NULL, \
+  id TEXT NOT NULL, running_usec TEXT NOT NULL, cpu_usec TEXT NOT NULL, runnable TEXT NOT NULL, \
+  memory TEXT NOT NULL);";
+
+/// The hub's build id joined to the client's `.drv` (build.json's
+/// drvPath, where Nix writes it): added to a record of either age.
+const DRV_PATH: &str = "CREATE TABLE IF NOT EXISTS drv_path (at_ms INTEGER NOT NULL, \
+    id TEXT NOT NULL, key TEXT, drv_path TEXT NOT NULL);";
+/// The table of builds' sources (hub/sources.rs), which a record of
+/// user_version 1 gains as profile does: a row per result row of a
+/// build whose sources the hub's daemon gave, by the result's at_ms and
+/// id, with their digest.
+const SOURCE: &str = "CREATE TABLE IF NOT EXISTS source (at_ms INTEGER NOT NULL, \
+  id TEXT NOT NULL, sources TEXT NOT NULL);";
+
+/// Whether each `result` row's run teaches speed (speed::Teaching), by
 /// rowid, committed with it; a hub that predates the table ignores it,
 /// and a result it wrote gains its row at the next take (migration).
 /// VACUUM renumbers rowids, `result` having no INTEGER PRIMARY KEY (one
@@ -107,10 +134,42 @@ pub(in crate::hub) fn int(x: u64) -> Value {
     Value::Integer(i64::try_from(x).unwrap_or(i64::MAX))
 }
 
+/// The `profile` row of the result row at `at_ms` of build `id`.
+pub(in crate::hub) fn profile_row(at_ms: i64, id: &str, p: &BuildProfile) -> Row {
+    let json = |xs: Vec<String>| Value::from(format!("[{}]", xs.join(",")));
+    let list = |xs: &[u64]| json(xs.iter().map(u64::to_string).collect());
+    let values = vec![
+        Value::Integer(at_ms),
+        id.to_owned().into(),
+        list(&p.running_usec),
+        list(&p.cpu_usec),
+        json(p.runnable_milli.iter().map(u32::to_string).collect()),
+        list(&p.memory_bytes),
+    ];
+    Row {
+        table: "profile",
+        values,
+    }
+}
+
+/// The `source` row of the result row at `at_ms` of build `id`, whose
+/// sources' digest is `sources`.
+pub(in crate::hub) fn source_row(at_ms: i64, id: &str, sources: &str) -> Row {
+    let values = vec![
+        Value::Integer(at_ms),
+        id.to_owned().into(),
+        sources.to_owned().into(),
+    ];
+    Row {
+        table: "source",
+        values,
+    }
+}
+
 /// What a `result` row holds beyond what history learns from, and
 /// whether its run teaches speed (a `taught` row).
 pub(in crate::hub) struct Rest {
-    pub(in crate::hub) placed: Placed,
+    pub(in crate::hub) placed: Teaching,
     pub(in crate::hub) at_ms: i64,
     pub(in crate::hub) id: String,
     pub(in crate::hub) key: Option<String>,
@@ -363,6 +422,10 @@ fn take(path: &Path) -> Result<Option<(Connection, File, (History, u64))>> {
         ),
     }
     let folded = fold(&conn)?;
+    conn.execute_batch(PROFILE)?;
+    // Only into a record ours (fold read it as one).
+    conn.execute_batch(DRV_PATH)?;
+    conn.execute_batch(SOURCE)?;
     let mode: String = conn.pragma_update_and_check(None, "journal_mode", "WAL", |r| r.get(0))?;
     if !mode.eq_ignore_ascii_case("wal") {
         return Err(err_msg(format!("journal_mode {mode}, not WAL")));
@@ -401,82 +464,6 @@ fn read(path: &Path) -> Result<(History, u64)> {
         return Err(err_msg("an empty database"));
     }
     Ok(fold(&conn)?)
-}
-
-/// The history the `result` rows teach, in rowid order, and how many
-/// rows it read (each_run).
-pub(in crate::hub) fn fold(conn: &Connection) -> rusqlite::Result<(History, u64)> {
-    let mut history = History::default();
-    let read = each_run(conn, |run| {
-        history.record(&run.build, run.exit_code, &run.usage, run.on);
-    })?;
-    Ok((history, read))
-}
-
-/// A `result` row's run, as the fold learns it.
-pub(in crate::hub) struct Folded<'a> {
-    /// When the result was recorded, for the replay tool's windows.
-    #[cfg(test)]
-    pub(in crate::hub) at_ms: i64,
-    pub(in crate::hub) build: Build<'a>,
-    pub(in crate::hub) exit_code: i32,
-    pub(in crate::hub) usage: BuildUsage,
-    pub(in crate::hub) on: Option<On<'a>>,
-}
-
-/// Whether `conn`'s record has the `taught` table.
-fn has_taught(conn: &Connection) -> rusqlite::Result<bool> {
-    let sql = "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'taught'";
-    conn.query_row(sql, [], |r| r.get::<_, i64>(0).map(|n| n > 0))
-}
-
-/// Each `result` row's run, in rowid order, to `f`; the rows read (one
-/// with no system passed over). A run is on the worker its row names,
-/// and teaches speed as its `taught` row says: none does that has no
-/// row, as in a record only a hub before that table took (migration).
-pub(in crate::hub) fn each_run(
-    conn: &Connection,
-    mut f: impl FnMut(Folded<'_>),
-) -> rusqlite::Result<u64> {
-    let taught = if has_taught(conn)? {
-        "coalesce(t.quiet, 0) FROM result r LEFT JOIN taught t ON t.result = r.rowid"
-    } else {
-        "0 FROM result r"
-    };
-    let mut stmt = conn.prepare(&format!(
-        "SELECT r.system, r.drv, r.declared, r.exit_code, r.wall_ms, r.cpu_usec, \
-         r.peak_memory_bytes, r.oom_killed, r.frozen_ms, r.worker, r.at_ms, {taught} ORDER BY r.rowid"
-    ))?;
-    let mut rows = stmt.query([])?;
-    let mut read = 0;
-    while let Some(r) = rows.next()? {
-        read += 1;
-        let (system, drv): (Option<String>, Option<String>) = (r.get(0)?, r.get(1)?);
-        let Some(system) = system else { continue };
-        let n = |i| r.get::<_, i64>(i).map(|v| u64::try_from(v).unwrap_or(0));
-        let usage = BuildUsage {
-            wall_ms: n(4)?,
-            cpu_usec: n(5)?,
-            peak_memory_bytes: n(6)?,
-            oom_killed: r.get(7)?,
-            frozen_ms: n(8)?,
-        };
-        let worker = r.get_ref(9)?.as_str_or_null()?;
-        let taught: bool = r.get(11)?;
-        f(Folded {
-            #[cfg(test)]
-            at_ms: r.get(10)?,
-            build: Build {
-                system: &system,
-                name: drv.as_deref(),
-                declared: r.get(2)?,
-            },
-            exit_code: r.get(3)?,
-            usage,
-            on: worker.map(|worker| On { worker, taught }),
-        });
-    }
-    Ok(read)
 }
 
 /// Commit the rows `rx` brings, all those waiting in one transaction,

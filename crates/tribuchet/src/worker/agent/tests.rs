@@ -1,4 +1,4 @@
-use std::os::unix::fs::{PermissionsExt, symlink};
+use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 
 use super::*;
 use crate::tmpdir::pack_zstd_dir;
@@ -95,5 +95,69 @@ fn status_and_adopt_are_answered_while_a_finish_works() -> Result<()> {
         ),
         "(Status, Adopt, Finish) with a Finish at work"
     );
+    cleanup(&socket, ID)
+}
+
+/// DT13, DT14 (DD3, DD10) on a real agent: a producer's socket is in its build
+/// dir, mode 0600, and its listener reaches the worker only. Neither its
+/// builder nor the agent holds a copy: the builder's fds and this process's
+/// (the agent's and the worker's) name the listener's inode once, the
+/// worker's.
+#[cfg(target_os = "linux")]
+#[test]
+fn a_producers_listener_reaches_the_worker_only() -> Result<()> {
+    const ID: &str = "0123456789abcdef0123456789abcdeb";
+    let dir = tempfile::tempdir()?;
+    let socket = dir.path().join("agent.sock");
+    let listener = sockpath::bind(&socket)?;
+    let state_dir = dir.path().join("state");
+    fs::create_dir(&state_dir)?;
+    let opts = Options {
+        socket: None,
+        listen_fd: None,
+        state_dir: state_dir.canonicalize()?,
+        worker_uid: None,
+        uid_base: None,
+        dedicated_uid: false,
+    };
+    let agent = Arc::new(Agent {
+        state_dir: opts.state_dir.clone(),
+        worker_uid: getuid().as_raw(),
+        confinement: platform::Confinement::init(&opts)?,
+        current: Mutex::new(None),
+        work: Mutex::new(()),
+        dedicated_uid: false,
+    });
+    thread::spawn(move || {
+        let _ = serve(&agent, &listener, false);
+    });
+    let top = dir.path().join("top");
+    fs::create_dir(&top)?;
+    let pack = dir.path().join("top.zst");
+    fs::write(&pack, pack_zstd_dir(&top)?)?;
+    let log = fs::File::create(dir.path().join("build.log"))?;
+    let script = "for f in /proc/self/fd/*; do readlink $f; done > fds; true".to_owned();
+    let mut req = start_request(ID, script, vec![]);
+    req.rpc_socket = Some(".nix-socket".into());
+    let mut build = AgentBuild::start(&socket, &req, &fs::File::open(&pack)?, &log)?;
+    let held = build
+        .listener
+        .take()
+        .expect("no listener in the StartReply");
+    assert_eq!(build.wait_exit()?.exit_code, 0);
+    let path = build.scratch_dir.join(".nix-socket");
+    let mode = fs::metadata(&path)?.mode() & 0o777;
+    assert_eq!(mode, 0o600, "the producer's socket's mode");
+    let inode = fs::metadata(format!("/proc/self/fd/{}", held.as_raw_fd()))?.ino();
+    let name = format!("socket:[{inode}]");
+    let builders = fs::read_to_string(build.scratch_dir.join("fds"))?;
+    assert!(
+        !builders.contains(&name),
+        "the builder holds the listener:\n{builders}"
+    );
+    let ours = (fs::read_dir("/proc/self/fd")?.flatten())
+        .filter(|f| fs::read_link(f.path()).is_ok_and(|l| l.to_string_lossy() == name))
+        .count();
+    assert_eq!(ours, 1, "the agent kept a copy of the listener");
     cleanup(&socket, ID)
 }

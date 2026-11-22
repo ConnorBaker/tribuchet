@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::env;
 
-use super::super::placement::{BOUND, pname};
+use super::super::placement::{BOUND, key};
 use super::*;
 
 /// Per worker, its latest quiet run's ln seconds and which of the
@@ -174,8 +174,7 @@ fn replay() {
                 }
             }
             if on.taught {
-                let key = format!("{}/{}", run.build.system, pname(name));
-                let (count, l) = latest.entry(key).or_default();
+                let (count, l) = latest.entry(key(run.build.system, name)).or_default();
                 let since = l.get(on.worker).map(|e| e.1);
                 for (v, (tv, _)) in l.iter().filter(|(_, e)| since.is_none_or(|s| e.1 > s)) {
                     diffs.push((

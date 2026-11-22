@@ -16,6 +16,7 @@ use super::state::HubState;
 use crate::errors::{Result, err_ctx};
 use crate::proto::BuildUsage;
 
+mod dependants;
 mod histogram;
 mod workers;
 use histogram::{BYTES, SECONDS, Series, bytes_f64, observe, render_histogram};
@@ -197,7 +198,7 @@ pub(super) async fn render(state: &HubState) -> String {
         ),
         (
             "tribuchet_builds_declined_total",
-            "Builds declined because no capable worker registered in time.",
+            "Builds declined: no capable worker registered in time, or lost in transport too often.",
             &m.declined,
         ),
         (
@@ -230,6 +231,7 @@ pub(super) async fn render(state: &HubState) -> String {
             value.load(Ordering::Relaxed),
         );
     }
+    dependants::render(&mut out, state);
 
     for (name, help, counts) in [
         (
@@ -502,11 +504,13 @@ mod tests {
             replay: Arc::new(Replay::default()),
             listing: Arc::default(),
             attempts: 0,
-            resumed_losses: 0,
+            transport_losses: 0,
             queued_at: Instant::now(),
             loss: None,
             deferred: None,
             expected: Expected::prior(false),
+            expected_at: None,
+            sources: None,
             placed: Default::default(),
         };
         state.queue.lock().await.push_back(job("x86_64-linux"));

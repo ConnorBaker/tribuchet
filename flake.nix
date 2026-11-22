@@ -7,6 +7,11 @@
     url = "github:numtide/treefmt-nix";
     inputs.nixpkgs.follows = "nixpkgs";
   };
+  # Only the dyndrv VM phase's Nix: the farm's (602cd88e21), which carries
+  # builder-rpc-v0 for external builders, the 222 decline and
+  # canBuildLocally; nix/patches do not apply to nixVersions.git.
+  inputs.nix-dyndrv.url = "github:ConnorBaker/nix/602cd88e213913f64ce1183db959f55630db971d";
+  inputs.nix-dyndrv.inputs.nixpkgs.follows = "nixpkgs";
   # only used to evaluate the darwin module in checks
   inputs.nix-darwin = {
     url = "github:nix-darwin/nix-darwin";
@@ -20,6 +25,7 @@
       crane,
       nix-darwin,
       treefmt-nix,
+      ...
     }:
     let
       systems = [
@@ -136,6 +142,13 @@
           )
         )
         // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          # nix/test.nix's dyndrv phase, on the farm's Nix (nix-dyndrv)
+          nixos-test-dyndrv = vmTest ./nix/test.nix {
+            phase = "dyndrv";
+            nixDyndrv = inputs.nix-dyndrv.packages.x86_64-linux.nix;
+          };
+        }
+        // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
           # Inductive proofs of the Quint models. Linux only: Apalache
           # binds a fixed port, which unsandboxed darwin builds share.
           spec-staging = specCheck "staging";
@@ -196,6 +209,7 @@
             protobuf
             (treefmtFor pkgs).config.build.wrapper
           ];
+          buildInputs = pkgs.lib.optional pkgs.stdenv.hostPlatform.isLinux pkgs.libseccomp;
           PROTOC = "${pkgs.protobuf}/bin/protoc";
           RUSTFLAGS = "--cfg tokio_unstable";
         };

@@ -128,33 +128,24 @@
         hub.succeed("nix-build /etc/tt/singleuid.nix --no-out-link")
 
     # podman gives the container no /dev/net/tun: the worker would refuse
-    # a build with network, so it advertises no `tribuchet-network` and
-    # the hub holds one for a worker that does, its client told why it
-    # waits, never failed.
+    # a build with network, so it advertises no `tribuchet-network`. No
+    # worker the hub knows serves one, so the hub refuses it once none is
+    # expected (L11), its client told why; it would hold it while a known
+    # worker that serves it is away.
     with subtest("a build with network is not sent to a worker without network"):
         worker.succeed(
             "journalctl -u podman-worker | grep 'resolved sandbox defaults' | grep -q 'fod_isolation=false'"
         )
         hub.succeed(
-            "systemd-run --unit=fodheld -p StandardOutput=append:/root/fodheld.log"
-            " -p StandardError=append:/root/fodheld.log nix-build /etc/tt/fod.nix --no-out-link"
+            "systemd-run --unit=fod -p StandardOutput=append:/root/fod.log"
+            " -p StandardError=append:/root/fod.log nix-build /etc/tt/fod.nix --no-out-link"
         )
-        hub.wait_until_succeeds(
-            "journalctl -u tribuchet-hub | grep -q 'holding queued build'"
-            " || ! systemctl is-active --quiet fodheld",
-            timeout=120,
-        )
+        hub.wait_until_succeeds("! systemctl is-active --quiet fod", timeout=120)
         worker.fail("journalctl -u podman-worker | grep -q 'refusing a build with network'")
         hub.succeed(
-            "journalctl -u tribuchet-hub | grep 'holding queued build'"
-            " | grep -qF 'features=\"tribuchet-network\"'"
+            "grep -qF 'no worker this hub knows builds x86_64-linux [tribuchet-network]'"
+            " /root/fod.log"
         )
-        hub.wait_until_succeeds(
-            "grep -qF 'no connected worker builds x86_64-linux [tribuchet-network]; waiting for one'"
-            " /root/fodheld.log",
-            timeout=60,
-        )
-        hub.succeed("systemctl is-active --quiet fodheld")
-        hub.succeed("systemctl stop fodheld")
+        hub.succeed("systemctl is-failed --quiet fod")
   '';
 }

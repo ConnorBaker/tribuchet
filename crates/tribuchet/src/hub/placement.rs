@@ -5,34 +5,52 @@
 //! dispatch's log line and record row. A queued build goes to the worker that asks for it unless
 //! another with an idle agent would be less full with it (rank.rs).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use rusqlite::types::Value;
 
 use super::Admission;
 use super::naming::drv_name;
-use super::record::{Recorder, Rest, Row, int, now_ms, result_row, taught_row, val};
-use super::state::{HubState, Job};
+use super::record::{
+    Recorder, Rest, Row, int, now_ms, profile_row, result_row, source_row, taught_row, val,
+};
+use super::state::{HubState, Job, Replay};
 use crate::proto::{BuildUsage, Register};
 
+#[path = "placement/downstream.rs"]
+mod downstream;
 #[path = "placement/history.rs"]
 mod history;
+#[path = "placement/objective.rs"]
+pub(super) mod objective;
 #[path = "placement/rank.rs"]
 mod rank;
+#[path = "placement/reserve.rs"]
+mod reserve;
 #[path = "placement/speed.rs"]
 mod speed;
+pub(super) use downstream::Downstream;
 #[cfg(test)]
 pub(super) use history::Level;
-pub(super) use history::{Build, Demand, Expected, History, On};
+pub(super) use history::{Build, Demand, Expected, History, On, Read};
 #[cfg(test)]
-pub(super) use history::{Entry, pname};
+pub(super) use history::{Entry, key};
+use objective::{Charges, Priority};
 #[cfg(test)]
 pub(super) use rank::GRACE;
 pub(super) use rank::{Room, Rooms, Size};
 #[cfg(test)]
+pub(super) use reserve::AGE;
+#[cfg(test)]
 pub(super) use speed::BOUND;
-pub(super) use speed::{Placed, QUIET, quiet};
+pub(super) use speed::{QUIET, Teaching, quiet};
+
+/// The history key of `job`, if its name could be read.
+fn key_of(job: &Job) -> Option<String> {
+    drv_name(&job.req).map(|n| history::key(&job.req.system, n))
+}
 
 /// What history knows `job` by.
 pub(super) fn build_of(job: &Job) -> Build<'_> {
@@ -40,6 +58,7 @@ pub(super) fn build_of(job: &Job) -> Build<'_> {
         system: &job.req.system,
         name: drv_name(&job.req),
         declared: declares(&job.features),
+        sources: job.sources.as_deref(),
     }
 }
 
@@ -65,18 +84,40 @@ pub(super) fn size_of(register: &Register) -> Size {
     }
 }
 
+/// A build handed to a session and not yet settled: what it is expected
+/// to use, the clients it holds a share for, those waiting for it as it
+/// was placed (objective.rs), and its history key, which holds the key's
+/// other builds while the key has no run of its own
+/// (Placement::held_for_key).
+#[derive(Clone, Debug)]
+pub(super) struct Placed {
+    pub(super) demand: Demand,
+    pub(super) owners: Vec<Option<Arc<str>>>,
+    pub(super) key: Option<String>,
+    /// When it is expected to end: its dispatch and its expected seconds.
+    pub(super) ends: Option<Instant>,
+}
+
 /// A worker session as placement sees it.
 pub(super) struct Session {
     pub(super) admission: Arc<Mutex<Admission>>,
     pub(super) size: Size,
-    /// What the builds handed to it and not yet settled are expected to
-    /// use, by build id.
-    pub(super) committed: HashMap<String, Demand>,
+    /// The builds handed to it and not yet settled, by build id.
+    pub(super) committed: HashMap<String, Placed>,
+    /// The builds, by id, that placement left elsewhere or to the asker
+    /// only for the load of this session's clientless builds (Rooms's
+    /// wants) since the clientless decider last read them.
+    pub(super) wants: HashMap<String, Arc<Replay>>,
+    /// Its CPU arbiter's leader and the builds it keeps frozen, by key,
+    /// as its latest heartbeat said (hub/state/clientless.rs).
+    pub(super) frozen_by: Option<(String, Vec<String>)>,
+    /// The build of a lost key it runs, alone (D4, state/take.rs).
+    pub(super) alone: Option<String>,
 }
 
 impl Session {
     pub(super) fn load(&self) -> Demand {
-        (self.committed.values()).fold(Demand::default(), |sum, d| sum.plus(*d))
+        (self.committed.values()).fold(Demand::default(), |sum, c| sum.plus(c.demand))
     }
 }
 
@@ -86,27 +127,130 @@ pub(super) struct Placement {
     pub(super) sessions: HashMap<u64, Session>,
     /// What builds used, by key: the record's fold.
     pub(super) history: History,
+    /// What follows builds of each key, learned from their dependants.
+    pub(super) downstream: Downstream,
     /// Where the record's rows go; None where the hub holds no record.
     pub(super) record: Option<Recorder>,
+    /// The session taking no new build until it is empty, for a lost key
+    /// waiting to run alone (D4, state/take.rs).
+    pub(super) drain: Option<u64>,
+    /// What the placed builds hold for each client.
+    pub(super) charges: Charges,
+}
+
+/// What a build placed on `s` holds of the farm: a worker that reports no
+/// memory counts none, in the total or a share.
+fn counted(s: &Session, d: Demand) -> Demand {
+    Demand {
+        memory: s.size.memory.map_or(0.0, |_| d.memory),
+        ..d
+    }
 }
 
 impl Placement {
     pub(super) fn open(&mut self, id: u64, admission: Arc<Mutex<Admission>>, size: Size) {
-        let committed = HashMap::new();
+        let (committed, wants) = (HashMap::new(), HashMap::new());
         let session = Session {
             admission,
             size,
             committed,
+            wants,
+            frozen_by: None,
+            alone: None,
         };
         self.sessions.insert(id, session);
     }
 
     pub(super) fn close(&mut self, id: u64) {
-        self.sessions.remove(&id);
+        if let Some(s) = self.sessions.remove(&id) {
+            for p in s.committed.values() {
+                self.charges.release(&p.owners, counted(&s, p.demand));
+            }
+        }
+        if self.drain == Some(id) {
+            self.drain = None;
+        }
     }
 
     pub(super) fn expect(&self, job: &Job) -> Expected {
-        self.history.expect(&build_of(job))
+        self.with_below(job, self.history.expect(&build_of(job)))
+    }
+
+    /// `e`, the history's expectation of `job`, with the running seconds
+    /// learned to follow `job` (downstream.rs), which the queue's order
+    /// reads (objective.rs).
+    fn with_below(&self, job: &Job, e: Expected) -> Expected {
+        let below = key_of(job).map_or(0.0, |k| self.downstream.below(&k));
+        Expected { below, ..e }
+    }
+
+    /// The least dominant share of the farm among the clients waiting for
+    /// `job` (objective.rs), as they held it while `job` waited: the charge
+    /// `job` holds from its take (state/take.rs) is not in it, as a build
+    /// resumed by key (take_job_by_key) holds none before its dispatch.
+    pub(super) fn share(&self, job: &Job) -> f64 {
+        let total = (self.sessions.values()).fold(Demand::default(), |t, s| {
+            t.plus(Demand {
+                cores: s.size.cores,
+                memory: s.size.memory.unwrap_or(0.0),
+            })
+        });
+        let own = (self.sessions.values()).find_map(|s| {
+            let p = s.committed.get(&job.id)?;
+            Some((p.owners.as_slice(), counted(s, p.demand)))
+        });
+        self.charges.least(job, total, own)
+    }
+
+    /// Whether `job` waits for its key: no run of the key has succeeded
+    /// with its usage measured, so `job`'s expectation is a guess (prefix,
+    /// class, prior, or no lower than a failed run's peak), and another
+    /// build of the key is taken and not settled. The end of that run ends
+    /// the wait, and a measured success ends the hold (History::ran). On
+    /// 2026-11-18 a batch guessed at 2-9 GiB used 29-44 GiB each, together.
+    pub(super) fn held_for_key(&self, job: &Job) -> bool {
+        let build = build_of(job);
+        let key = History::key_of(&build).filter(|_| !self.history.ran(&build));
+        let of_key = |c: &Placed| c.key.is_some() && c.key == key;
+        key.is_some() && (self.sessions.values()).any(|s| s.committed.values().any(of_key))
+    }
+
+    /// What `job` is expected to use: as a scan last read it, before it
+    /// asks (Placement::refresh), or afresh if it was never read.
+    pub(super) fn expected(&self, job: &Job) -> Expected {
+        match &job.expected_at {
+            Some(_) => job.expected,
+            None => self.expect(job),
+        }
+    }
+
+    /// Mark `job`'s expectation as read from the history now, as a
+    /// submit does, keeping it.
+    #[cfg(test)]
+    pub(super) fn stamp(&self, job: &mut Job) {
+        job.expected_at = Some(self.history.read(&build_of(job)).1);
+    }
+
+    /// Read `job`'s expectation afresh where what it read learned since.
+    /// Its path (`below`) is the one it was first read with, as it was
+    /// queued: the queue is kept in order by it (objective.rs, enqueue),
+    /// and a build is not moved in it.
+    pub(super) fn refresh(&self, job: &mut Job) {
+        if !job
+            .expected_at
+            .as_ref()
+            .is_some_and(|r| self.history.fresh(r))
+        {
+            let (e, r) = self.history.read(&build_of(job));
+            let e = match job.expected_at {
+                Some(_) => Expected {
+                    below: job.expected.below,
+                    ..e
+                },
+                None => self.with_below(job, e),
+            };
+            (job.expected, job.expected_at) = (e, Some(r));
+        }
     }
 
     /// `job`'s expected running seconds on worker `worker` (by name):
@@ -119,18 +263,24 @@ impl Placement {
 
     /// Learn from a finished run of `job`, and append it to the record,
     /// in one step: the history stays the record's fold. The send never
-    /// waits. The run teaches speed as its dispatch decided (Placed),
-    /// which the record keeps beside its row, committed with it
-    /// (record::taught_row).
+    /// waits. The run teaches speed as its dispatch decided (Teaching),
+    /// which the record keeps beside its row; its result, taught and
+    /// profile rows are committed together (record::taught_row).
     pub(super) fn learn(&mut self, job: &Job, exit_code: i32, u: &BuildUsage, rest: Rest) {
         let build = build_of(job);
         let taught = rest.placed.quiet;
         let on = (rest.worker.as_deref()).map(|worker| On { worker, taught });
         self.history.record(&build, exit_code, u, on);
-        self.append(vec![
-            result_row(&build, exit_code, u, rest),
-            taught_row(taught),
-        ]);
+        if let Some(key) = key_of(job).filter(|_| exit_code == 0 && !u.oom_killed) {
+            let secs = self.history.expect(&build).secs.unwrap_or(0.0);
+            let outputs = job.req.outputs.values().cloned();
+            (self.downstream).learn(&key, secs, outputs, &job.req.input_paths);
+        }
+        let profile = (u.profile.as_ref()).map(|p| profile_row(rest.at_ms, &rest.id, p));
+        let source = (build.sources).map(|s| source_row(rest.at_ms, &rest.id, s));
+        let mut rows = vec![result_row(&build, exit_code, u, rest), taught_row(taught)];
+        rows.extend(profile.into_iter().chain(source));
+        self.append(rows);
     }
 
     /// Hand `rows` to the record's writer as one, if there is one.
@@ -140,31 +290,83 @@ impl Placement {
         }
     }
 
-    /// `job` went to `session`: its expected demand counts there until
-    /// it settles. The session's room with it.
-    pub(super) fn dispatched(&mut self, session: u64, job: &Job) -> Option<Room> {
+    /// `job` went to `session`, `alone` if its key is lost: its expected
+    /// demand counts there until it settles. The session's room with it.
+    pub(super) fn dispatched(&mut self, session: u64, job: &Job, alone: bool) -> Option<Room> {
+        let key = History::key_of(&build_of(job));
         let s = self.sessions.get_mut(&session)?;
-        s.committed.insert(job.id.clone(), job.expected.demand);
+        // A take commits a build to its session (state/take.rs) and its
+        // dispatch (dispatch, below) again: the second replaces the first,
+        // whose charge goes, so a build holds one charge until it settles.
+        if let Some(old) = s.committed.remove(&job.id) {
+            self.charges.release(&old.owners, counted(s, old.demand));
+        }
+        let (demand, owners) = (job.expected.demand, objective::owners(job));
+        self.charges.charge(&owners, counted(s, demand));
+        let ends = (job.expected.secs).map(|s| Instant::now() + Duration::from_secs_f64(s));
+        let placed = Placed {
+            demand,
+            owners,
+            key,
+            ends,
+        };
+        s.committed.insert(job.id.clone(), placed);
+        if alone {
+            s.alone = Some(job.id.clone());
+        }
         Some(room(session, s))
     }
 
     /// The build left its worker: finished, failed, requeued or given up.
     pub(super) fn settled(&mut self, session: u64, build_id: &str) {
         if let Some(s) = self.sessions.get_mut(&session) {
-            s.committed.remove(build_id);
+            if let Some(p) = s.committed.remove(build_id) {
+                self.charges.release(&p.owners, counted(s, p.demand));
+            }
+            if s.alone.as_deref() == Some(build_id) {
+                s.alone = None;
+            }
         }
+    }
+
+    /// Session `id` asked for work: a lost key it serves waits for room
+    /// (`wants`), or none does. With no session draining, it drains: it
+    /// takes no new build until it is empty, and then the lost key's. It
+    /// drains no longer once no lost key it serves waits.
+    pub(super) fn drain_for(&mut self, id: u64, wants: bool) {
+        match self.drain {
+            None if wants => self.drain = Some(id),
+            Some(d) if d == id && !wants => self.drain = None,
+            _ => {}
+        }
+    }
+
+    /// Of session `id`: whether it holds a build, and one alone (D4).
+    pub(super) fn residence(&self, id: u64) -> (bool, bool) {
+        let s = self.sessions.get(&id);
+        let busy = s.is_some_and(|s| !s.committed.is_empty());
+        (busy, s.is_some_and(|s| s.alone.is_some()))
     }
 
     pub(super) fn rooms(&self) -> Vec<Room> {
         (self.sessions.iter()).map(|(id, s)| room(*id, s)).collect()
     }
 
-    /// Every session's room as session `asker` asks for work.
-    pub(super) fn rooms_for(&self, asker: u64) -> Rooms {
-        Rooms {
-            asker,
-            rooms: self.rooms(),
-        }
+    /// Every session's room as session `asker` asks for work, with what
+    /// its builds of `clientless`, those the clientless rule may give
+    /// up, hold of its load.
+    pub(super) fn rooms_for(&self, asker: u64, clientless: &HashSet<String>) -> Rooms {
+        let rooms = self.sessions.iter().map(|(id, s)| {
+            let theirs = s.committed.iter().filter(|(b, _)| clientless.contains(*b));
+            let only_clientless =
+                !s.committed.is_empty() && theirs.clone().count() == s.committed.len();
+            Room {
+                clientless: theirs.fold(Demand::default(), |sum, (_, c)| sum.plus(c.demand)),
+                only_clientless,
+                ..room(*id, s)
+            }
+        });
+        Rooms::new(asker, rooms.collect())
     }
 }
 
@@ -174,32 +376,36 @@ fn room(id: u64, s: &Session) -> Room {
         idle: s.admission.lock().unwrap().idle(),
         size: s.size,
         load: s.load(),
+        clientless: Demand::default(),
+        empty: s.committed.is_empty(),
+        only_clientless: false,
     }
 }
 
 /// Count `job`'s expected demand against worker session `to` (id and
-/// name); log it and append its record row: the declaration that
-/// admitted it, its features, the other serving workers with an idle
-/// agent, what it is expected to use, and the worker's size and load
-/// with it (the line adds the worker's speed and the build's seconds
-/// there, which nothing reads yet). Over-memory is only logged
-/// (DESIGN.md, Placement). Whether its run teaches speed (Placed).
+/// name); log the dispatch and append its record row: the declaration,
+/// features, other serving workers with an idle agent, expected use, and
+/// the worker's size and load with it (the line adds the worker's speed
+/// and the build's seconds there). Over-memory is logged: a build larger
+/// than every worker serving it goes to the largest once it is empty
+/// (Room::admits). Returns whether its run teaches speed (Teaching).
 pub(super) fn dispatch(
     state: &HubState,
     to: (u64, &str),
     job: &Job,
     resumed: bool,
     admission: &Mutex<Admission>,
-) -> Placed {
+) -> Teaching {
     let (capacity, assignments, free, sent) = {
         let a = admission.lock().unwrap();
         (a.capacity, a.assignments, a.free, a.sent)
     };
     let e = job.expected;
-    let (idle_elsewhere, room, record, secs_on, speed) = {
+    let (idle_elsewhere, room, record, p, secs_on, speed) = {
         let workers = state.worker_caps.lock().unwrap();
         let mut placement = state.placement.lock().unwrap();
-        let room = placement.dispatched(to.0, job);
+        let p = Priority::of(job, placement.share(job), Instant::now());
+        let room = placement.dispatched(to.0, job, state.lost.has(&job.key));
         let serves = |r: &&Room| {
             (workers.get(&r.id)).is_some_and(|c| c.serves(&job.req.system, &job.features))
         };
@@ -207,11 +413,11 @@ pub(super) fn dispatch(
         let idle = rooms.iter().filter(|r| r.id != to.0 && r.idle > 0);
         let idle = idle.filter(serves).count();
         let (secs_on, speed) = (placement.secs_on(job, to.1), placement.history.speed(to.1));
-        (idle, room, placement.record.clone(), secs_on, speed)
+        (idle, room, placement.record.clone(), p, secs_on, speed)
     };
     let load = room.as_ref().map(|r| r.load);
     let memory = room.as_ref().and_then(|r| r.size.memory);
-    let placed = Placed {
+    let placed = Teaching {
         quiet: !resumed
             && (room.as_ref()).is_some_and(|r| quiet(r.load.cores, e.demand.cores, r.size.cores)),
     };
@@ -259,6 +465,10 @@ pub(super) fn dispatch(
         expect_mem = bytes(e.demand.memory),
         expect_cores = round3(e.demand.cores),
         expect_secs = e.secs.map(round3),
+        expect_below = round3(e.below),
+        share = round3(p.share),
+        path = round3(p.path),
+        waited = round3(p.wait),
         speed = round3(speed),
         expect_secs_on = secs_on.map(round3),
         oom_runs = e.oom,

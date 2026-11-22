@@ -44,8 +44,8 @@ and owns transfer, scheduling and execution itself.
   every CPU busy, younger parallel builds are frozen until it no longer
   does, and only while what they pin together fits their memory
   caps and the host's available memory; frozen time counts toward
-  neither `build-timeout-secs` and `max-silent-time-secs` nor a
-  client's `timeout` and `max-silent-time`. There is no setting to
+  neither `build-timeout-secs` and `max-silent-time-secs` (both off by
+  default) nor a client's `timeout` and `max-silent-time`. There is no setting to
   turn it off;
   DESIGN.md (CPU arbitration) says why.
 - NixOS and nix-darwin modules for both services, and an OCI worker
@@ -184,7 +184,10 @@ deploys. Upgrade workers before or with the hub: a hub sends a
 fixed-output build only to a worker advertising `tribuchet-network`,
 which older workers never do, even with `/dev/net/tun`, so until an
 upgraded worker with `/dev/net/tun` registers every fixed-output build
-waits.
+waits. The build agents and their builds run in
+`system-tribuchet\x2dagent.slice`, and no agent is ever an OOM victim:
+cap the slice (`systemd.slices."system-tribuchet\\x2dagent"`) to keep
+memory for the rest of the host.
 
 ### macOS (nix-darwin)
 

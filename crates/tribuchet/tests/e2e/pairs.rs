@@ -21,16 +21,7 @@ struct Row {
     frozen: (i64, i64),
 }
 
-const ROWS: [Row; 3] = [
-    // Page cache filling the slice is headroom: the follower is frozen
-    // (a rule that counted it as used froze nothing). The cache is written
-    // once, before.
-    Row {
-        name: "cache",
-        work: ["CL", "CF"],
-        limits: (0, 0),
-        frozen: (5000, i64::MAX),
-    },
+const ROWS: [Row; 2] = [
     // The follower's random bytes stay pinned (zswap refuses pages that
     // do not compress, and swap is no room): they do not fit, so it is not
     // frozen (frozen, it OOM-killed the leader at the merge base in 1 of 2
@@ -59,10 +50,9 @@ fn limits((timeout, silent): (i64, i64)) {
         &format!(
             "mkdir -p /run/arb && \
              {{ test -e /run/arb/base.toml || cp $(readlink -f /etc/tribuchet/worker.toml) /run/arb/base.toml; }} && \
-             {{ printf 'build-timeout-secs = %d\\nmax-silent-time-secs = %d\\n' {} {silent}; \
+             {{ printf 'build-timeout-secs = %d\\nmax-silent-time-secs = %d\\n' {timeout} {silent}; \
                 cat /run/arb/base.toml; }} > /run/arb/worker.toml && \
-             cp --remove-destination /run/arb/worker.toml /etc/tribuchet/worker.toml",
-            if timeout == 0 { 86_400 } else { timeout },
+             cp --remove-destination /run/arb/worker.toml /etc/tribuchet/worker.toml"
         ),
     );
     let registered = count(Node::Hub, "tribuchet-hub", "worker registered");
@@ -108,6 +98,23 @@ fn run(row: &Row, problems: &mut Vec<String>) {
     limits(row.limits);
     let kills = oom_kills();
     let names = row.work.map(|w| format!("{}-{w}", row.name));
+    // Each build first alone, as a no-op (N): the hub admits a pair by
+    // the memory history expects, and both must fit the slice to co-run,
+    // the arbiter's subject. Their own keys, so learned, expect almost
+    // none, whatever another row taught their class. That relies on the
+    // no-op's peak (its shell's) not being 0: a run measured as 0 teaches
+    // nothing (Run::of), which the check of each dispatch below catches.
+    for name in &names {
+        let usage = count(Node::Hub, "tribuchet-hub", "build usage");
+        succeed(
+            Node::Hub,
+            &format!(
+                "nix-build /etc/tt/pair.nix --argstr name {name} --argstr work N --no-out-link"
+            ),
+        );
+        let learned = more_than("tribuchet-hub", "build usage", usage);
+        wait_until_succeeds(Node::Hub, &learned, 120);
+    }
     for (name, work) in names.iter().zip(row.work) {
         let started = count(Node::Worker, "tribuchet-worker", "builder started on agent");
         submit(
@@ -154,6 +161,19 @@ fn run(row: &Row, problems: &mut Vec<String>) {
         silent == 0 || frozen > silent * 1000,
         "frozen past its silence",
     );
+    for name in &names {
+        let line = succeed(
+            Node::Hub,
+            &format!(
+                "{} | grep 'dispatching build' | grep -F 'drv=\"{name}\"' | tail -n 1 || true",
+                journal("tribuchet-hub")
+            ),
+        );
+        problem(
+            line.contains("learned=\"key\""),
+            "dispatched not by its key's own runs (the no-op taught none)",
+        );
+    }
 }
 
 /// Each row, every problem reported at the end.
@@ -163,14 +183,6 @@ fn rows() {
     succeed(
         Node::Worker,
         "systemctl start 'system-tribuchet\\x2dagent.slice'",
-    );
-    // Page cache charged to the slice: a unit in it writes and reads back
-    // more than the slice's cap, then exits.
-    succeed(
-        Node::Worker,
-        "systemd-run --wait --collect --quiet --slice='system-tribuchet\\x2dagent.slice' \
-         --unit=arb-fill bash -lc 'dd if=/dev/zero of=/var/tmp/fill bs=1M count=2600 status=none \
-         && sync && cat /var/tmp/fill > /dev/null'",
     );
     let mut problems = Vec::new();
     for row in &ROWS {

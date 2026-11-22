@@ -25,6 +25,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 #[cfg(target_os = "linux")]
+use rustix::fs::{Mode, OFlags, open};
+#[cfg(target_os = "linux")]
+use rustix::io::{Errno, write};
 #[cfg(target_os = "linux")]
 use rustix::pipe::{PipeFlags, pipe_with};
 
@@ -82,9 +85,9 @@ pub struct SandboxSpec {
     /// Uids mapped in that namespace at in-ns 0 (1 or 65536).
     #[serde(default)]
     pub leased_uid_count: Option<u32>,
-    /// Its network is a namespace of its own; set with `network`
-    /// (prepare). A spec with network but without it, as older workers sent
-    /// on a host without /dev/net/tun, is unconfined.
+    /// Set with `network` (prepare) for an agent still running an older
+    /// Tribuchet, which reads it: without it, such an agent runs a build
+    /// with network in the host's network, or refuses it.
     #[serde(default)]
     pub net_isolation: bool,
     /// Flow policy applied to that network.
@@ -112,21 +115,13 @@ pub struct SandboxSpec {
 }
 
 impl SandboxSpec {
-    /// Why a build with this spec may not run, if it may not: with
-    /// network but in the host's network, or with the host's nix-daemon
-    /// socket bound in (recursive Nix, which workers no longer serve). No
-    /// spec this worker sends is either, but one an older
-    /// worker persisted can still describe a running build: agents
-    /// outlive an upgrade.
+    /// Why a build with this spec may not run, if it may not: with the
+    /// host's nix-daemon socket bound in (recursive Nix, which workers no
+    /// longer serve). No spec this worker sends has it.
     pub fn unconfined(&self) -> Option<&'static str> {
-        if self.network && !self.net_isolation {
-            Some("with network in the host's network")
-        } else if (self.binds_ro.iter()).any(|(_, to)| to.starts_with("/nix/var/nix/daemon-socket"))
-        {
-            Some("with the host's nix-daemon socket")
-        } else {
-            None
-        }
+        (self.binds_ro.iter())
+            .any(|(_, to)| to.starts_with("/nix/var/nix/daemon-socket"))
+            .then_some("with the host's nix-daemon socket")
     }
 }
 
@@ -162,7 +157,7 @@ pub struct PrepareOpts<'a> {
 pub fn network(a: &BuildAssignment, build_dir: &Path) -> bool {
     let env = |name: &str| a.env.get(name).map(String::as_str);
     let attrs = build_json::read_attrs(build_dir, a.env.contains_key("NIX_ATTRS_JSON_FILE"));
-    build_json::fixed_output(&a.store_dir, &a.outputs, env, attrs.as_ref())
+    build_json::fixed_output(&a.store_dir, &a.outputs, env, attrs.as_ref()) == Some(true)
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -258,6 +253,7 @@ fn build_command(spec: &SandboxSpec) -> Result<(Command, Option<OwnedFd>), Error
     // Own process group, so orphaned builder children can be killed
     // after the builder exits.
     CommandExt::process_group(&mut cmd, 0);
+    unprotect_from_oom(&mut cmd);
     // The derivation env must not reach the pre-sandbox setup stage
     // (worker binary, worker host credentials): LD_PRELOAD would run
     // client code outside the sandbox. With the spec on stdin the env
@@ -275,6 +271,29 @@ fn build_command(spec: &SandboxSpec) -> Result<(Command, Option<OwnedFd>), Error
     }
     cmd.stdin(Stdio::null());
     Ok((cmd, None))
+}
+
+/// Start a build at oom_score_adj 0: the agent runs at -1000, which
+/// its children inherit along with that floor. Written while the child
+/// still holds the agent's CAP_SYS_RESOURCE, 0 resets the floor as well,
+/// so the build cannot lower its score again. EACCES means the floor is
+/// already above 0: nothing to undo.
+#[cfg(target_os = "linux")]
+pub fn unprotect_from_oom(cmd: &mut Command) {
+    // SAFETY: open, write and close are async-signal-safe.
+    unsafe {
+        cmd.pre_exec(|| {
+            let fd = open(
+                c"/proc/self/oom_score_adj",
+                OFlags::WRONLY | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?;
+            match write(&fd, b"0") {
+                Ok(_) | Err(Errno::ACCESS) => Ok(()),
+                Err(e) => Err(e.into()),
+            }
+        });
+    }
 }
 
 /// Spawn the sandboxed build with stdout/stderr on `log`. The build
@@ -327,40 +346,22 @@ mod tests {
         }
     }
 
-    /// What a spec may not run with, whoever wrote it.
-    #[test]
-    fn network_in_the_hosts_network_or_its_daemon_is_unconfined() {
-        let dir = tempfile::tempdir().unwrap();
-        let spec = |network, net_isolation, bind: &str| SandboxSpec {
-            network,
-            net_isolation,
-            binds_ro: vec![(PathBuf::from("/x"), PathBuf::from(bind))],
-            ..test_spec(dir.path())
-        };
-        let socket = "/nix/var/nix/daemon-socket/socket";
-        assert_eq!(spec(false, false, "/nix/store/x").unconfined(), None);
-        assert_eq!(spec(true, true, "/nix/store/x").unconfined(), None);
-        let host = Some("with network in the host's network");
-        assert_eq!(spec(true, false, "/nix/store/x").unconfined(), host);
-        let daemon = Some("with the host's nix-daemon socket");
-        assert_eq!(spec(false, false, socket).unconfined(), daemon);
-        assert_eq!(spec(true, true, socket).unconfined(), daemon);
-    }
-
-    /// The setup stage refuses an unconfined spec before it enters any
-    /// namespace: the build never runs in the host's network.
+    /// The setup stage refuses a spec with the host's nix-daemon socket
+    /// before it enters any namespace; a store path is no such bind.
     #[test]
     fn the_setup_stage_refuses_an_unconfined_spec() {
         let dir = tempfile::tempdir().unwrap();
-        let spec = SandboxSpec {
-            network: true,
+        let spec = |bind: &str| SandboxSpec {
+            binds_ro: vec![(PathBuf::from("/x"), PathBuf::from(bind))],
             ..test_spec(dir.path())
         };
+        assert_eq!(spec("/nix/store/x").unconfined(), None);
         let status = fs::File::create(dir.path().join("status")).unwrap();
-        let err = platform::stage::enter_and_exec(&spec, &status).unwrap_err();
+        let socket = spec("/nix/var/nix/daemon-socket/socket");
+        let err = platform::stage::enter_and_exec(&socket, &status).unwrap_err();
         assert_eq!(
             err.to_string(),
-            "refusing a build with network in the host's network"
+            "refusing a build with the host's nix-daemon socket"
         );
     }
 

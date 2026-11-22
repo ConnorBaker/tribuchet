@@ -218,6 +218,7 @@ mod tests {
                     reply::Reply::Start(StartReply {
                         pid: 7,
                         scratch_dir: "/scratch/next".into(),
+                        rpc_listener: false,
                     }),
                     &[],
                 )
@@ -246,6 +247,7 @@ mod tests {
             reply::Reply::Start(StartReply {
                 pid: 42,
                 scratch_dir: "/scratch/b1".into(),
+                rpc_listener: false,
             }),
             &[],
         )

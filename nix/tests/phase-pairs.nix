@@ -13,15 +13,14 @@ let
     wait
   '';
   work = {
+    # nothing: each build's first run, alone (pairs.rs)
+    N = "true";
     # deadline: 18 s of wall clock; 15 s of running time
     K = "${spinners} 18";
     D = "${python} ${./pair-spin.py} 15";
     # A: 1400 MiB more at 10 CPU-s; 4 x 300 MiB for the first 6 CPU-s
     AL = "${python} ${./pair-hog.py} '4:64:20:1400@10'";
     AF = "${python} ${./pair-hog.py} '4:300:6;1:64:10'";
-    # cache: 40 s of wall clock; 4 x 128 MiB
-    CL = "${spinners} 40";
-    CF = "${python} ${./pair-hog.py} '4:128:10'";
   };
   deps = [
     pkgs.bash
@@ -58,8 +57,6 @@ in
       memoryPercent = 400;
     };
     virtualisation.cores = lib.mkForce 4;
-    # room for the page cache the cache row writes
-    virtualisation.diskSize = lib.mkForce 6144;
     virtualisation.additionalPaths = deps;
     # The agents' slice as a host's agent-memory policy left it on this
     # VM with a 1536 MiB reserve: A and S (MemTotal 4,010,648 kB, from

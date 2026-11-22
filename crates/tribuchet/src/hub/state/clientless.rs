@@ -1,23 +1,35 @@
-//! Builds with no attach client. Holding one costs something
-//! only when its slot is wanted, so it is kept for as long as no waiting
-//! build wants it, and a client that comes back however late finds it.
-//! Once work waits for a slot (queued at the hub, or staged on a worker
-//! beyond its slots), a build whose clients have all been gone FLOOR is
-//! given up, the one with the least work sunk (its run time) first, and
-//! no more than the waiting builds their slots would serve, counted
-//! hub-wide. One task decides, every CHECK (decide); a build given up
+//! Builds with no attach client. A build holds what placement charges
+//! it: an agent (its slot) and what it is expected to use (its load).
+//! Holding one costs something only when releasing that would change
+//! where a build with a client runs, so it is kept for as long as no
+//! such build wants it, and a client that comes back however late finds
+//! it. A build whose clients have all been gone FLOOR is given up, the
+//! one with the least work sunk (its run time) first, when
+//! - work waits for a slot (queued at the hub, or staged on a worker
+//!   beyond its slots): no more than the waiting builds their slots
+//!   would serve, counted hub-wide; or
+//! - placement ranked a build with a client away from a worker with an
+//!   idle agent, or kept it from one, only for the load of that
+//!   worker's builds with no client (placement::Rooms's wants): one of
+//!   them per such build; or
+//! - as its worker's CPU arbiter's leader, it keeps a build with a
+//!   client frozen (the worker's heartbeat says which): it, whatever
+//!   its run time.
+//! One task decides, every CHECK (decide); a build given up
 //! has its dispatch's token cancelled, which its supervision follows.
 //! A build a worker holds from before the hub's restart that no dispatch
 //! claims is never given up: it runs to completion, an exception to
 //! this rule.
 
 use std::collections::HashSet;
+use std::mem;
 use std::sync::atomic::Ordering;
 
 use tokio::time::{Instant, MissedTickBehavior, interval};
 use tokio_util::sync::CancellationToken;
 
 use super::*;
+use crate::proto::Heartbeat;
 
 /// How often the decider checks the dispatched builds for clients.
 const CHECK: Duration = Duration::from_secs(2);
@@ -29,7 +41,7 @@ pub(in crate::hub) const FLOOR: Duration = Duration::from_secs(14);
 /// A build dispatched to a worker session, as giving it up weighs it.
 pub(in crate::hub) struct Dispatched {
     session: u64,
-    key: String,
+    pub(super) key: String,
     replay: Arc<Replay>,
     /// The job's dedupe listing: given up, a later client starts it anew.
     listing: Arc<StdMutex<Option<Listing>>>,
@@ -40,6 +52,16 @@ pub(in crate::hub) struct Dispatched {
     /// Given up, then a later dispatch on the same worker took its key:
     /// the worker delivers to that one.
     superseded: bool,
+}
+
+impl Dispatched {
+    /// If it may be given up at `now`: how long it has been without a
+    /// client, and how long it has run.
+    fn open(&self, now: Instant) -> Option<(Duration, Duration)> {
+        let away = now.duration_since(self.replay.clientless()?);
+        let open = !self.given_up.is_cancelled() && !self.superseded && away >= FLOOR;
+        open.then(|| (away, now.duration_since(self.started)))
+    }
 }
 
 /// Lists a dispatched build until its supervision ends.
@@ -98,6 +120,34 @@ impl HubState {
             .is_some_and(|d| d.superseded)
     }
 
+    /// The run of dispatched build `id` has its outcome: it holds no slot
+    /// and has no work left to give up, so it is weighed no more and stays
+    /// listed for a later client (SEMANTICS-7 L9). False if given up first.
+    pub(in crate::hub) fn outcome_in(&self, id: &str) -> bool {
+        let mut map = self.dispatched.lock().unwrap();
+        if map.get(id).is_some_and(|d| d.given_up.is_cancelled()) {
+            return false;
+        }
+        map.remove(id);
+        true
+    }
+
+    /// The dispatched builds that may be given up now.
+    pub(in crate::hub) fn open_clientless(&self) -> HashSet<String> {
+        let (now, map) = (Instant::now(), self.dispatched.lock().unwrap());
+        let open = map.iter().filter(|(_, d)| d.open(now).is_some());
+        open.map(|(id, _)| id.clone()).collect()
+    }
+
+    /// Record which builds worker session `session`'s CPU arbiter keeps
+    /// frozen, and for which leader, as its heartbeat `h` says.
+    pub(in crate::hub) fn record_frozen(&self, session: u64, h: &Heartbeat) {
+        let mut placement = self.placement.lock().unwrap();
+        if let Some(s) = placement.sessions.get_mut(&session) {
+            s.frozen_by = h.leader_key.clone().map(|l| (l, h.frozen_keys.clone()));
+        }
+    }
+
     /// The token cancelled when build `id` is given up; one never
     /// cancelled if it is not dispatched.
     pub(in crate::hub) fn given_up(&self, id: &str) -> CancellationToken {
@@ -126,24 +176,49 @@ impl HubState {
             replay.checked(has_client, now);
         }
         let queued = self.waiting_queued().await;
+        // The builds with a client that each session's clientless load
+        // kept from it: one build given up there for each.
+        let wants: Vec<(u64, Arc<Replay>)> = (self.placement.lock().unwrap().sessions)
+            .iter_mut()
+            .flat_map(|(s, p)| p.wants.drain().map(|(_, r)| (*s, r)))
+            .collect();
+        let mut load_wanted: HashMap<u64, usize> = HashMap::new();
+        for (s, replay) in wants {
+            if replay.has_subscribers().await {
+                *load_wanted.entry(s).or_default() += 1;
+            }
+        }
+        let frozen_by: Vec<(u64, (String, Vec<String>))> = (self.placement.lock().unwrap())
+            .sessions
+            .iter()
+            .filter_map(|(s, p)| Some((*s, p.frozen_by.clone()?)))
+            .collect();
         let workers = self.worker_caps.lock().unwrap().clone();
         let map = self.dispatched.lock().unwrap();
-        // A build that may be given up: how long it has been without a
-        // client, and how long it has run.
-        let open = |d: &Dispatched| {
-            let away = now.duration_since(d.replay.clientless()?);
-            let open = !d.given_up.is_cancelled() && !d.superseded && away >= FLOOR;
-            open.then(|| (away, now.duration_since(d.started)))
-        };
-        let next = || {
+        for (s, (leader, frozen)) in &frozen_by {
+            let on = |d: &&Dispatched| d.session == *s && !d.superseded;
+            let mut held = map.values().filter(on).filter(|d| frozen.contains(&d.key));
+            let wanted = held.any(|d| d.replay.clientless().is_none());
+            let lead = map.iter().find(|(_, d)| on(d) && d.key == *leader);
+            if let Some((id, d)) = lead.filter(|(_, d)| wanted && d.open(now).is_some()) {
+                d.given_up.cancel();
+                drop(d.listing.lock().unwrap().take());
+                tracing::info!(id, "a build with no client keeps one with a client frozen");
+            }
+        }
+        let next = |load_wanted: &HashMap<u64, usize>| {
             let weighed: HashMap<&String, (Duration, Duration)> = map
                 .iter()
-                .filter_map(|(id, d)| open(d).map(|w| (id, w)))
+                .filter_map(|(id, d)| d.open(now).map(|w| (id, w)))
                 .collect();
             let sessions: HashSet<u64> = weighed.keys().map(|id| map[*id].session).collect();
             let wanted: HashMap<u64, usize> = sessions
                 .into_iter()
-                .filter_map(|s| one_more_runs(&map, &workers, &queued, s).map(|n| (s, n)))
+                .filter_map(|s| {
+                    let by_load = load_wanted.get(&s).is_some_and(|n| *n > 0);
+                    let slots = one_more_runs(&map, &workers, &queued, s);
+                    slots.or(by_load.then_some(0)).map(|n| (s, n))
+                })
                 .collect();
             weighed
                 .into_iter()
@@ -152,53 +227,73 @@ impl HubState {
                     ran_a.cmp(ran_b).then(away_b.cmp(away_a)).then(a.cmp(b))
                 })
         };
-        while let Some((id, (away, ran), slots_wanted)) = next() {
+        while let Some((id, (away, ran), slots_wanted)) = next(&load_wanted) {
             map[id].given_up.cancel();
             drop(map[id].listing.lock().unwrap().take());
+            let load = load_wanted.get_mut(&map[id].session);
+            let loads_wanted = load.map(|n| mem::replace(n, n.saturating_sub(1)));
             tracing::info!(
                 id,
                 clientless_s = away.as_secs(),
                 ran_s = ran.as_secs(),
                 slots_wanted,
-                "queued builds want the slot of a build with no client"
+                loads_wanted,
+                "builds with a client want the slot or load of a build with no client"
             );
         }
     }
 
-    /// For each queued build waiting for a slot, the worker sessions
-    /// that serve it: those with a client, that no session with a free
-    /// slot serves (one would take them), nor a worker's key holds, nor a
-    /// loss keeps for a worker still awaited. The queue is not held while
-    /// it asks for clients: a stalled one holds its replay's lock for
-    /// SUB_STALL, and take_job needs the queue.
-    async fn waiting_queued(&self) -> Vec<Vec<u64>> {
+    /// For each queued build with a client waiting for a slot, the
+    /// sessions that would take it but for one (Placement::waits), none
+    /// with a free slot, nor a key or loss keeping it for another. One that
+    /// would take none wants clientless builds given up at one worker, the
+    /// first by id, where that lets it in (wants_memory). The replays are
+    /// asked for clients off the queue's lock.
+    pub(in crate::hub) async fn waiting_queued(&self) -> Vec<Vec<u64>> {
+        let open = self.open_clientless();
+        let mut wanted = Vec::new();
         let candidates: Vec<(Arc<Replay>, Vec<u64>)> = {
-            let queue = self.queue.lock().await;
+            let mut queue = self.queue.lock().await;
             let holding = self.holding.lock().unwrap();
             let workers = self.worker_caps.lock().unwrap();
             let placement = self.placement.lock().unwrap();
-            let free: Vec<&WorkerCaps> = placement
-                .sessions
-                .iter()
+            let rooms = placement.rooms_for(0, &open).rooms;
+            let mut scan = placement.scan();
+            let free: HashSet<u64> = (placement.sessions.iter())
                 .filter(|(_, s)| s.admission.lock().unwrap().free > 0)
-                .filter_map(|(id, _)| workers.get(id))
+                .map(|(id, _)| *id)
                 .collect();
-            queue
-                .iter()
-                .filter(|j| {
-                    !j.kept(&workers, &holding)
-                        && !free.iter().any(|c| c.serves(&j.req.system, &j.features))
-                })
-                .map(|j| {
-                    let serving = workers
-                        .iter()
-                        .filter(|(_, c)| c.serves(&j.req.system, &j.features))
-                        .map(|(id, _)| *id)
+            (queue.iter_mut().filter(|j| !j.kept(&workers, &holding)))
+                .filter_map(|j| {
+                    placement.refresh(j);
+                    let j = &*j;
+                    let serves = |id| {
+                        (workers.get(&id)).is_some_and(|c| c.serves(&j.req.system, &j.features))
+                    };
+                    let mut ids: Vec<u64> =
+                        workers.keys().copied().filter(|id| serves(*id)).collect();
+                    ids.sort_unstable();
+                    let takes: Vec<u64> = (ids.iter().copied())
+                        .filter(|id| !placement.waits(j, Some(*id), serves, &mut scan))
                         .collect();
-                    (j.replay.clone(), serving)
+                    if takes.is_empty() {
+                        let mut short = ids.iter();
+                        let want = short.find(|id| placement.wants_memory(j, **id, serves, &rooms));
+                        wanted.extend(want.map(|id| (*id, j.id.clone(), j.replay.clone())));
+                    }
+                    let waiting = !takes.is_empty() && !takes.iter().any(|id| free.contains(id));
+                    waiting.then(|| (j.replay.clone(), takes))
                 })
                 .collect()
         };
+        {
+            let mut placement = self.placement.lock().unwrap();
+            for (s, id, replay) in wanted {
+                if let Some(s) = placement.sessions.get_mut(&s) {
+                    s.wants.insert(id, replay);
+                }
+            }
+        }
         let mut waiting = Vec::new();
         for (replay, serving) in candidates {
             if replay.has_subscribers().await {

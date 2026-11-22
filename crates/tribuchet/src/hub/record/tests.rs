@@ -1,6 +1,7 @@
 //! The record's open, writer and close.
 
 use std::fs;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
@@ -8,8 +9,11 @@ use std::time::Duration;
 use rusqlite::config::DbConfig;
 
 use super::*;
+
 use crate::hub::metrics;
-use crate::hub::testlog::Captured;
+use crate::hub::producer::drv_path_row;
+use crate::hub::tests::{H, job};
+use crate::testlog::Captured;
 
 /// A reader of the record at `path`, as another process would open it,
 /// that never waits for a lock.
@@ -37,6 +41,7 @@ fn result(id: &str, at_ms: i64) -> Row {
         system: "x86_64-linux",
         name: Some("foo-1"),
         declared: false,
+        sources: None,
     };
     let usage = BuildUsage {
         wall_ms: 1000,
@@ -45,7 +50,7 @@ fn result(id: &str, at_ms: i64) -> Row {
         ..BuildUsage::default()
     };
     let rest = Rest {
-        placed: Placed::default(),
+        placed: Teaching::default(),
         at_ms,
         id: id.into(),
         key: None,
@@ -276,6 +281,75 @@ fn a_record_not_ours_is_never_written() {
         assert!(after == before, "{} written", path.display());
     }
     assert!(fs::read(&wal).unwrap() == wal_before, "the WAL written");
+}
+
+/// A record written before profiles (user_version 1, no profile table)
+/// is opened, folded and written as before, and gains the table: the
+/// deployed record needs no migration, and a hub that predates profiles
+/// still knows the record (known() names only result and dispatch).
+#[test]
+fn a_record_from_before_profiles_gains_their_table() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record.sqlite");
+    Connection::open(&path)
+        .unwrap()
+        .execute_batch(SCHEMA)
+        .unwrap();
+    {
+        let db = Connection::open(&path).unwrap();
+        insert(&db, &result("a", 1)).unwrap();
+    }
+    let opened = open(&path);
+    assert_eq!(opened.history.len().0, 1, "the old rows are folded");
+    let tables: i64 = reader(&path)
+        .query_row(
+            "SELECT count(*) FROM sqlite_schema WHERE type = 'table' AND name = 'profile'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 1, "no profile table once opened");
+    let record = opened.record.clone().expect("written by this hub");
+    let p = BuildProfile {
+        running_usec: vec![200_000],
+        cpu_usec: vec![100_000],
+        runnable_milli: vec![500],
+        memory_bytes: vec![9],
+    };
+    record.send(profile_row(1, "a", &p));
+    committed(&record);
+    drop(record);
+    shut(opened);
+    assert_eq!(rows(&path, "profile"), 1);
+    assert!(known(&reader(&path)).unwrap());
+}
+
+/// R1: a producer's drvPath row is recorded in a new record and in one
+/// made before the drv_path table was (its schema alone).
+#[test]
+fn a_drv_path_row_is_recorded_in_a_record_of_either_age() {
+    for old in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.sqlite");
+        if old {
+            Connection::open(&path)
+                .unwrap()
+                .execute_batch(SCHEMA)
+                .unwrap();
+        }
+        let state = HubState::for_test(Duration::from_secs(30));
+        let writer = open(&path).install(&state);
+        let mut j = job(1, Arc::default());
+        j.req.drv_path = Some(format!("/nix/store/{H}-p.drv"));
+        let row = drv_path_row(&j).expect("no row");
+        let placement = state.placement.lock().unwrap();
+        placement.record.as_ref().expect("not recording").send(row);
+        drop(placement);
+        close(&state, writer);
+        let sql = "SELECT count(*) FROM drv_path";
+        let n = reader(&path).query_row(sql, [], |r| r.get::<_, i64>(0));
+        assert_eq!(n.ok(), Some(1), "old {old}: the drv_path rows");
+    }
 }
 
 /// A record from before the `taught` table is read with no run taught

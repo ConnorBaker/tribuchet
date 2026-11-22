@@ -148,6 +148,11 @@ impl Policy {
             .map(|b| Action::Freeze(b.key.to_owned()))
             .collect()
     }
+
+    /// The leader that last kept every CPU busy, if one did since.
+    pub(super) fn leader(&self) -> Option<&str> {
+        self.saturated.as_ref().map(|(k, _)| k.as_str())
+    }
 }
 
 #[cfg(test)]

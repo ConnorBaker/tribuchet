@@ -5,9 +5,10 @@
 //! At startup the agent creates a user namespace mapping in-ns
 //! 0..65536 to its uid block. Writing another namespace's uid_map
 //! needs CAP_SETUID in the parent namespace, so the agent unit runs
-//! with AmbientCapabilities=CAP_SETUID CAP_SETGID CAP_CHOWN; the
-//! setuid/setgid caps are dropped right after the write, CAP_CHOWN
-//! stays for handing each build cgroup to its mapped root uid.
+//! with AmbientCapabilities=CAP_SETUID CAP_SETGID CAP_CHOWN
+//! CAP_SYS_RESOURCE; the setuid/setgid caps are dropped right after the
+//! write, CAP_CHOWN stays for handing each build cgroup to its mapped
+//! root uid, CAP_SYS_RESOURCE for each build's oom_score_adj floor.
 //! Sandboxed builds join that namespace via the worker's setup
 //! stage, spawned here.
 
@@ -35,12 +36,13 @@ use rustix::thread::{
 };
 use sandbox_proto::agent::StartRequest;
 
-use super::{Build, Options, cgroup, make_readable, msg, spawn_plain, stage_scratch};
+use super::{Build, Options, cgroup, make_readable, msg, rpc, spawn_plain, stage_scratch};
 use crate::errors::{Error, Result, chain, err_ctx};
 use crate::fsutil::{io_ctx, stat_field};
 use crate::worker::sandbox::{self, SandboxSpec};
 use crate::worker::userns::{self, UsernsHolder};
 use crate::{netpolicy, sd};
+use sandbox_proto::framing;
 
 /// Argv[1] marker of the re-exec'd userns filesystem helper.
 pub const FS_HELPER_ARG: &str = "__agent_fs";
@@ -120,6 +122,36 @@ pub(super) fn stage_tmp_dir(
         return Err(msg(format!("userns unpack helper exited with {status}")));
     }
     Ok(())
+}
+
+/// A producer's listener `name` in `build_dir` (rpc.rs). With a user
+/// namespace the userns helper binds it as in-ns root, the uid its builder
+/// runs as, and sends it back over a socketpair.
+pub(super) fn rpc_listener(
+    confinement: &Confinement,
+    build_dir: &Path,
+    name: &str,
+) -> Result<OwnedFd> {
+    let Some(userns) = &confinement.userns else {
+        return rpc::listen(build_dir, name);
+    };
+    let (ours, theirs) = UnixStream::pair()?;
+    let (_ns_fd, ns_path) = userns::inherited_ns(&userns.fd)?;
+    let status = Command::new(env::current_exe()?)
+        .args([
+            FS_HELPER_ARG.as_ref(),
+            ns_path.as_os_str(),
+            "listen".as_ref(),
+        ])
+        .args([build_dir.as_os_str(), name.as_ref()])
+        .stdout(Stdio::from(OwnedFd::from(theirs)))
+        .status()?;
+    if !status.success() {
+        return Err(msg(format!("userns listen helper exited with {status}")));
+    }
+    let (_, mut fds) = framing::recv_reply(&ours)?;
+    fds.pop()
+        .ok_or_else(|| msg("the userns helper sent no listener"))
 }
 
 /// Spawn the build inside the pre-mapped user namespace. Only a
@@ -357,6 +389,19 @@ pub fn fs_helper_stage() -> ! {
             let _ = unsafe { libc::kill(-1, libc::SIGKILL) };
             return Ok(());
         }
+        if op.to_str() == Some("listen") {
+            set_thread_gid(Gid::from_raw(0)).map_err(err_ctx("setgid 0 in the ns"))?;
+            set_thread_uid(Uid::from_raw(0)).map_err(err_ctx("setuid 0 in the ns"))?;
+            let (dir, name) = (args.next(), args.next().and_then(|n| n.into_string().ok()));
+            let (Some(dir), Some(name)) = (dir, name) else {
+                return Err(msg("listen needs a build dir and a name"));
+            };
+            let listener = rpc::listen(Path::new(&dir), &name)?;
+            let out = UnixStream::from(io::stdout().as_fd().try_clone_to_owned()?);
+            let empty = sandbox_proto::agent::reply::Reply::Empty(sandbox_proto::agent::Empty {});
+            framing::send_reply(&out, empty, &[listener.as_raw_fd()])?;
+            return Ok(());
+        }
         if op.to_str() == Some("unpack") {
             // Become in-ns root so the unpacked files belong to the
             // uid block instead of the agent's unmapped uid.
@@ -388,11 +433,13 @@ pub fn fs_helper_stage() -> ! {
 }
 
 /// Confinement hook of the direct-exec path (no sandbox spec):
-/// seatbelt-profile requests have no Linux equivalent there.
-pub(super) fn confine(_cmd: &mut Command, req: &StartRequest, _build_dir: &str) -> Result<()> {
+/// seatbelt-profile requests have no Linux equivalent there; the
+/// builder gives up the agent's OOM protection as a sandboxed one does.
+pub(super) fn confine(cmd: &mut Command, req: &StartRequest, _build_dir: &str) -> Result<()> {
     if !req.profile.is_empty() {
         return Err(msg("seatbelt profiles are only supported on macOS"));
     }
+    sandbox::unprotect_from_oom(cmd);
     Ok(())
 }
 
@@ -423,16 +470,22 @@ impl Userns {
     }
 }
 
-/// Drop the agent's capabilities down to CAP_CHOWN; only handing the
-/// build cgroups to their mapped root uid still needs privilege after
-/// the map write.
+/// Drop the agent's capabilities down to CAP_CHOWN, which hands the
+/// build cgroups to their mapped root uid, and CAP_SYS_RESOURCE if the
+/// unit granted it, which lets a build reset its oom_score_adj floor
+/// (sandbox::unprotect_from_oom).
 fn drop_caps() -> Result<()> {
     rustix::thread::clear_ambient_capability_set().map_err(err_ctx("clearing the ambient set"))?;
+    let granted = rustix::thread::capabilities(None)
+        .map_err(err_ctx("reading the capability sets"))?
+        .permitted;
+    let keep = rustix::thread::CapabilitySet::CHOWN
+        | (granted & rustix::thread::CapabilitySet::SYS_RESOURCE);
     rustix::thread::set_capabilities(
         None,
         rustix::thread::CapabilitySets {
-            effective: rustix::thread::CapabilitySet::CHOWN,
-            permitted: rustix::thread::CapabilitySet::CHOWN,
+            effective: keep,
+            permitted: keep,
             inheritable: rustix::thread::CapabilitySet::empty(),
         },
     )

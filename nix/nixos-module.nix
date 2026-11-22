@@ -39,10 +39,16 @@ let
     {
       agent-sockets-dir = workerUnits.agentSocketsDir;
     }
+    // lib.optionalAttrs (worker.handoffSocket != null) {
+      handoff-socket = toString worker.handoffSocket;
+      handoff-gid = config.users.groups.${hub.socketGroup}.gid or null;
+    }
     // worker.settings
   );
   attachWrapper = pkgs.writeShellScript "tribuchet-attach" ''
-    exec ${lib.getExe' hub.package "tribuchet"} attach "$1" --socket ${hub.socketPath}
+    exec ${lib.getExe' hub.package "tribuchet"} attach "$1" --socket ${hub.socketPath}${
+      lib.optionalString (worker.handoffSocket != null) " --handoff-socket ${worker.handoffSocket}"
+    }
   '';
 in
 {
@@ -92,11 +98,12 @@ in
     externalBuilders = {
       enable = lib.mkEnableOption "routing this machine's nix-daemon builds through the hub (experimental external-builders feature)";
       dynamic = lib.mkEnableOption ''
-        deriving external-builders and max-jobs from the workers
-        currently connected to the hub instead of the static `systems`
-        list. The hub writes a nix.conf fragment on every worker
-        register/deregister; a path unit restarts nix-daemon to apply
-        it (in-flight build children survive the restart)
+        deriving external-builders from the workers the hub knows, and
+        max-jobs from those connected, instead of the static `systems`
+        list. The hub writes a nix.conf fragment as it starts and on every
+        worker register, deregister, capacity change or decommission; a
+        path unit restarts nix-daemon to apply a changed one (in-flight
+        build children survive the restart)
       '';
       systems = lib.mkOption {
         type = lib.types.listOf lib.types.str;
@@ -147,10 +154,12 @@ in
           so a declined build (no worker for the system) falls back to a
           local build instead of failing, and so a build's `timeout` and
           `max-silent-time` reach the worker, which counts only running
-          time toward them. Set false, `nixPackage` must carry all three
-          patches (nix/patches) itself: without the timeouts one, Nix
-          counts a build's timeouts by the wall clock from its start, and
-          so kills builds the CPU arbiter froze for time they did not run.
+          time toward them, and so build.json says whether Nix would
+          build a declined build itself (`canBuildLocally`). Set false,
+          `nixPackage` must carry all four patches (nix/patches) itself:
+          without the timeouts one, Nix counts a build's timeouts by the
+          wall clock from its start, and so kills builds the CPU arbiter
+          froze for time they did not run.
         '';
       };
     };
@@ -177,7 +186,19 @@ in
     agents = lib.mkOption {
       type = lib.types.either lib.types.ints.positive (lib.types.enum [ "auto" ]);
       default = "auto";
-      description = "Build agent count, or \"auto\" for one per CPU, decided at boot.";
+      description = "Build agent count, or \"auto\" for one per CPU and a spare, decided at boot.";
+    };
+    handoffSocket = lib.mkOption {
+      type = lib.types.nullOr lib.types.path;
+      default = null;
+      example = "/run/tribuchet-worker/handoff.sock";
+      description = ''
+        Serve dynamic-derivation producers (builder-rpc-v0) on this
+        worker: it hands each producer run's listener to the hub's attach
+        on this host over this socket, reachable by the hub's socket group,
+        and advertises builder-rpc-v0. Set it only on the hub's host,
+        where attach runs; this host's hub then hands it to attach.
+      '';
     };
     agentUidBase = lib.mkOption {
       type = lib.types.int;
@@ -232,6 +253,7 @@ in
             ./patches/external-builders-uid-range.patch
             ./patches/external-builders-decline-fallback.patch
             ./patches/external-builders-timeouts.patch
+            ./patches/external-builders-can-build-locally.patch
           ];
         in
         if patches == [ ] then
@@ -319,6 +341,12 @@ in
           ];
           WatchdogSec = "30";
           Restart = "on-failure";
+          # Each attach client holds a connection for as long as its build
+          # is queued or running, so the hub's descriptors grow with the
+          # farm's queue. Under the systemd default soft limit of 1024 the
+          # hub could not open the files of the inputs it serves ("Too many
+          # open files"). Match the agents' and nix-daemon's limit.
+          LimitNOFILE = 1048576;
         };
       };
     })
@@ -334,24 +362,32 @@ in
         n: v: lib.nameValuePair "tribuchet-${n}" v
       ) workerUnits.generators;
 
-      systemd.sockets = {
-        "tribuchet-agent@" = removeAttrs workerUnits.agentSocketConfig [ "wantedBy" ];
-      }
-      // lib.listToAttrs (
-        map (
-          i:
-          lib.nameValuePair "tribuchet-agent@${i}" {
-            overrideStrategy = "asDropin";
-            wantedBy = [ "sockets.target" ];
-          }
-        ) workerUnits.agentInstances
-      );
+      systemd.sockets."tribuchet-agent@" = removeAttrs workerUnits.agentSocketConfig [ "wantedBy" ];
 
       systemd.services = {
         "tribuchet-agent@" = workerUnits.agentServiceConfig;
         tribuchet-worker = workerUnits.workerServiceConfig // {
           restartTriggers = [ workerToml ];
         };
+      };
+    })
+
+    (lib.mkIf (worker.enable && worker.handoffSocket != null) {
+      assertions = [
+        {
+          assertion = lib.hasPrefix "/run/" (toString worker.handoffSocket);
+          message = "services.tribuchet-worker.handoffSocket must be under /run/, its RuntimeDirectory.";
+        }
+        {
+          assertion = config.users.groups.${hub.socketGroup}.gid or null != null;
+          message = "the hub's socketGroup ${hub.socketGroup} needs a fixed gid for the handoff socket.";
+        }
+      ];
+      # The handoff socket's directory, and the group it is given to.
+      systemd.services.tribuchet-worker.serviceConfig = {
+        RuntimeDirectory = lib.removePrefix "/run/" (dirOf (toString worker.handoffSocket));
+        RuntimeDirectoryMode = "0755";
+        SupplementaryGroups = [ hub.socketGroup ];
       };
     })
   ];

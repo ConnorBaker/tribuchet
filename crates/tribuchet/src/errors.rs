@@ -33,10 +33,31 @@ pub enum Error {
     /// longer has it (its agent did not). A loss, as of a dead session.
     #[error("the worker no longer holds the build")]
     Unlisted,
+    /// The worker dropped the build's finished result, or could not serve
+    /// it (ResultGone): lost in transport, its session alive.
+    #[error("the worker no longer has the build's result")]
+    ResultGone,
+    /// A producer's run ended without its listener reaching an attach
+    /// (BuildResult.handoff_expired): it reached no client, a loss.
+    #[error("no attach fetched the producer's listener in time")]
+    HandoffExpired,
+    /// The worker stages afresh a producer whose run reached its client:
+    /// a fresh run behind the same attach, which never starts (DD8a).
+    #[error("a relayed producer's run would start afresh")]
+    Relayed,
     /// Given up, then dispatched again by its key to the same worker,
     /// which delivers to that dispatch: nothing more for this one.
     #[error("a later dispatch took the build over")]
     Superseded,
+    /// The worker took nothing sent on a stream of its session for
+    /// SILENCE_TIMEOUT: it may be gone, a lost session.
+    #[error("the worker read nothing for too long")]
+    Silent,
+    /// An input of the build is not valid in the hub's own store: no fact
+    /// about the build, as a client of it may bring it back (SEMANTICS-7
+    /// cut-over 10).
+    #[error("{0} is not a valid path in the local store")]
+    Missing(String),
     #[error(transparent)]
     Io(#[from] io::Error),
     #[error(transparent)]

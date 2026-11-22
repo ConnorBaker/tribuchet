@@ -1,5 +1,5 @@
 //! The `history` phase (nix/tests/phase-history.nix): what builds of a
-//! pname used steers the next one, whatever it declares, from the hub's
+//! stem used steers the next one, whatever it declares, from the hub's
 //! build record across a restart: learned before it,
 //! folded from the record after. Two workers, the worker VM's and one on
 //! the hub VM, three agents on two cores each. Once a `hot` build (both
@@ -101,6 +101,33 @@ fn a_learned_hot_one_goes_where_the_naps_are() {
     launch("nap", "nap-0", 10);
     assert_eq!([ended("hot-0", 120), ended("nap-0", 120)], ["0", "0"]);
     restart();
+    // Each run's profile, as its worker's arbiter sampled it, is in the
+    // record by its result: the hot build ran 2 threads, the nap none;
+    // the hot build's points' CPU times sum to its result's, and their
+    // running times to about its own.
+    let of = |drv: &str, value: &str, list: &str| {
+        let sql = format!(
+            "SELECT {value} FROM profile p JOIN result r USING (id), \
+             json_each(p.{list}) j WHERE r.drv = '{drv}'"
+        );
+        let out = succeed(Node::Hub, &format!("sqlite3 -readonly {RECORD} \"{sql}\""));
+        out.trim()
+            .parse::<i64>()
+            .unwrap_or_else(|_| panic!("{drv} {value}: {out:?}"))
+    };
+    let (hot, nap) = (
+        of("hot-0", "max(j.value)", "runnable"),
+        of("nap-0", "max(j.value)", "runnable"),
+    );
+    assert!(hot >= 1500 && nap <= 500, "profiles: hot {hot}, nap {nap}");
+    let unsummed = of("hot-0", "max(r.cpu_usec) - sum(j.value)", "cpu_usec");
+    assert_eq!(unsummed, 0, "hot-0's CPU points do not sum to its cpu_usec");
+    let ran = of("hot-0", "max(r.wall_ms - r.frozen_ms)", "running_usec");
+    let covered = of("hot-0", "sum(j.value) / 1000", "running_usec");
+    assert!(
+        covered * 10 >= ran * 8 && covered <= ran + 2000,
+        "hot-0's points cover {covered} ms of its {ran} ms"
+    );
     both_declared();
     // 120 s builds: the placements below take seconds, and each counts
     // the builds before it only while they run.
@@ -124,4 +151,45 @@ fn a_learned_hot_one_goes_where_the_naps_are() {
     assert!(first.contains(r#"learned="key""#), "{first}");
     // The size the worker registered: its 2 cores, not its 3 agents.
     assert!(first.contains(" cores=2.0"), "{first}");
+}
+
+/// Submit build `name` of /etc/tt/src.nix, its source holding `input`,
+/// running `secs` seconds.
+fn launch_src(name: &str, input: &str, secs: u32) {
+    submit(
+        name,
+        &format!(
+            "nix-build /etc/tt/src.nix --argstr name {name} --argstr input {input} \
+             --arg secs {secs} --no-out-link"
+        ),
+    );
+}
+
+/// A build expects the runs of the builds of its stem that consumed its
+/// content-addressed inputs, as the hub's daemon names them: `obs-2`
+/// those of `obs-1`, which read the same source, and `obs-3`, of
+/// another source, its stem's; and so does one after a restart, from
+/// the record. Runs after a_learned_hot_one_goes_where_the_naps_are,
+/// whose restarts count the record's rows (tests run in name order); its
+/// name has no `build_`, which the builds phase selects.
+#[test]
+fn the_next_run_of_a_source_expects_its_runs() {
+    both_declared();
+    launch_src("obs-1", "a", 5);
+    assert_eq!(ended("obs-1", 120), "0");
+    for (name, input, learned) in [("obs-2", "a", "source"), ("obs-3", "b", "key")] {
+        launch_src(name, input, 1);
+        let line = dispatch_line(name);
+        println!("[history] {name}: {line}");
+        assert!(line.contains(&format!(r#"learned="{learned}""#)), "{line}");
+        assert_eq!(ended(name, 120), "0", "{name}");
+    }
+    succeed(Node::Hub, "systemctl restart tribuchet-hub.service");
+    folded();
+    both_declared();
+    launch_src("obs-4", "a", 1);
+    let line = dispatch_line("obs-4");
+    println!("[history] obs-4: {line}");
+    assert!(line.contains(r#"learned="source""#), "{line}");
+    assert_eq!(ended("obs-4", 120), "0");
 }

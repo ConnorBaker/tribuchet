@@ -5,10 +5,15 @@ use std::time::Duration;
 use std::time::Instant as Now;
 
 use super::*;
-use crate::hub::placement::Size;
-use crate::hub::tests::job;
-use crate::hub::{Admission, Loss};
+use crate::hub::Admission;
+use crate::hub::losses::{self, Loss};
+use crate::hub::placement::{Demand, Expected, Level, Size, build_of};
+use crate::hub::tests::{H, job};
+use crate::proto::BuildUsage;
 use Queued::{Clientless, Held, Waiting};
+
+#[path = "tests/memory.rs"]
+mod memory;
 
 /// A worker's size, which the decider here does not read.
 const SIZE: Size = Size {
@@ -100,13 +105,45 @@ async fn the_decider_gives_up_what_waiting_work_needs() {
         (&[], &[gone(7, 60, 14)], &[], &[0]),
     ];
     for (n, &(workers, runs, queued, given_up)) in rows.iter().enumerate() {
-        assert_eq!(decided(workers, runs, queued).await, given_up, "row {n}");
+        assert_eq!(
+            decided(workers, runs, queued, None).await,
+            given_up,
+            "row {n}"
+        );
     }
 }
 
-/// The builds of `runs` that the decider gives up, with `workers` and
-/// `queued`.
-async fn decided(workers: &[(u32, bool)], runs: &[Run], queued: &[Queued]) -> Vec<usize> {
+/// Worker 0's heartbeat: its CPU arbiter's leader and the builds it
+/// keeps frozen, of the runs.
+type Frozen = Option<(usize, &'static [usize])>;
+
+/// A build with no client that, as its worker's arbiter's leader, keeps
+/// one with a client frozen is given up once its clients have been gone
+/// FLOOR, whatever its run time, with no work waiting; not when it has
+/// a client, nor when the builds it keeps frozen have none.
+#[tokio::test(start_paused = true)]
+async fn the_decider_gives_up_a_clientless_leader_freezing_a_client() {
+    let rows: &[(&[Run], Frozen, &[usize])] = &[
+        (&[gone(0, HOUR, 14), here(0, 60)], Some((0, &[1])), &[0]),
+        (&[gone(0, HOUR, 13), here(0, 60)], Some((0, &[1])), &[]),
+        (&[here(0, HOUR), here(0, 60)], Some((0, &[1])), &[]),
+        (&[gone(0, HOUR, 14), gone(0, 60, 5)], Some((0, &[1])), &[]),
+        (&[gone(0, HOUR, 14), here(0, 60)], Some((0, &[])), &[]),
+        (&[gone(0, HOUR, 14), here(0, 60)], None, &[]),
+    ];
+    for (n, &(runs, frozen, given_up)) in rows.iter().enumerate() {
+        assert_eq!(decided(TWO, runs, &[], frozen).await, given_up, "row {n}");
+    }
+}
+
+/// The builds of `runs` that the decider gives up, with `workers`,
+/// `queued` and worker 0's heartbeat `frozen`.
+async fn decided(
+    workers: &[(u32, bool)],
+    runs: &[Run],
+    queued: &[Queued],
+    frozen: Frozen,
+) -> Vec<usize> {
     let state = Arc::new(HubState::for_test(Duration::from_secs(30)));
     state.deciding.store(true, Ordering::Relaxed);
     for (id, &(slots, free)) in (0..).zip(workers) {
@@ -134,7 +171,7 @@ async fn decided(workers: &[(u32, bool)], runs: &[Run], queued: &[Queued]) -> Ve
     for (n, q) in queued.iter().enumerate() {
         let j = job(100 + n, Arc::new(Replay::default()));
         if *q == Queued::Held {
-            state.hold(0, [j.key.clone()].into(), false);
+            state.hold(0, &[j.key.clone()], false);
         }
         if *q != Queued::Clientless {
             clients.push(j.replay.subscribe().await);
@@ -168,6 +205,15 @@ async fn decided(workers: &[(u32, bool)], runs: &[Run], queued: &[Queued]) -> Ve
         }
     }
     tokio::time::advance(t0 + Duration::from_secs(end) - Instant::now()).await;
+    if let Some((leader, held)) = frozen {
+        let key = |b: &usize| jobs[*b].key.clone();
+        let h = Heartbeat {
+            leader_key: Some(key(&leader)),
+            frozen_keys: held.iter().map(key).collect(),
+            ..Heartbeat::default()
+        };
+        state.record_frozen(0, &h);
+    }
     state.give_up_clientless().await;
     let given_up = |b: &usize| state.given_up(&jobs[*b].id).is_cancelled();
     (0..jobs.len()).filter(given_up).collect()
@@ -193,6 +239,8 @@ async fn a_resume_keeps_the_run_and_the_absence() {
         worker: "w".into(),
         session: 1,
         until,
+        run: losses::Run::Started,
+        charged: false,
     });
     let _again = state.list_dispatch(&j, 2);
     let resumed = state.dispatched.lock().unwrap()[&j.id].started;
@@ -204,44 +252,100 @@ async fn a_resume_keeps_the_run_and_the_absence() {
     assert_ne!(fresh, started);
 }
 
-/// The decider never holds the hub's queue while it waits on a queued
-/// build's replay: a client that stopped reading holds that replay's lock
-/// for SUB_STALL in publish (as hold_unservable's note to such a build
-/// does), and take_job, requeue and submit all need the queue, which
-/// must not wait the 60 s with it.
+/// A queued build waits for a slot only where one lets it in (waits):
+/// none is given up for a build short of memory or held for its key. One
+/// short only for a clientless run's load wants that run given up
+/// (wants_memory), unless held, as no memory freed lets it run. Each row:
+/// the queued build's GiB (None: an unseen key, its twin running), the
+/// clientless run's and the run with a client's on an 8 GiB worker, a
+/// free slot, given up.
 #[tokio::test(start_paused = true)]
-async fn the_decider_never_holds_the_queue_across_a_replay_wait() {
-    let state = Arc::new(HubState::for_test(Duration::ZERO));
-    let replay = Arc::new(Replay::default());
-    // A client that never reads: its channel is full after SUB_CHANNEL_SLACK.
-    let _client = replay.subscribe().await;
-    for _ in 0..SUB_CHANNEL_SLACK {
-        replay
-            .publish(attach_event::Event::Log(b"x".to_vec()))
-            .await;
+async fn a_build_waits_for_a_slot_only_where_one_lets_it_in() {
+    const GIB: f64 = 1_073_741_824.0;
+    let rows: [(&str, Option<u64>, f64, f64, bool, bool); 5] = [
+        ("fits", Some(1), 1.0, 5.0, false, true),
+        ("short of memory", Some(4), 1.0, 6.0, false, false),
+        ("held for its key", None, 1.0, 1.0, false, false),
+        (
+            "held, short for the clientless load",
+            None,
+            5.0,
+            2.0,
+            true,
+            false,
+        ),
+        (
+            "short for the clientless load",
+            Some(4),
+            4.0,
+            2.0,
+            true,
+            true,
+        ),
+    ];
+    for (row, queued, clientless, with_client, free, given_up) in rows {
+        let state = Arc::new(HubState::for_test(Duration::from_secs(30)));
+        state.deciding.store(true, Ordering::Relaxed);
+        let caps = WorkerCaps {
+            name: "w0".into(),
+            connected_at: Now::now(),
+            systems: [("x86_64-linux".to_owned(), HashSet::new())].into(),
+            max_jobs: 2,
+        };
+        state.worker_caps.lock().unwrap().insert(0, caps);
+        let admission = Admission {
+            free: u32::from(free),
+            ..Default::default()
+        };
+        let size = Size {
+            cores: 4.0,
+            memory: Some(8.0 * GIB),
+        };
+        let admission = Arc::new(StdMutex::new(admission));
+        state.placement.lock().unwrap().open(0, admission, size);
+        let named = |n: usize, name: &str, gib: f64| {
+            let mut j = job(n, Arc::new(Replay::default()));
+            j.req.outputs = [("out".to_owned(), format!("/nix/store/{H}-{name}"))].into();
+            j.expected = Expected {
+                demand: Demand {
+                    cores: 1.0,
+                    memory: gib * GIB,
+                },
+                secs: None,
+                unit_secs: None,
+                level: Level::Key,
+                oom: 0,
+                below: 0.0,
+            };
+            j
+        };
+        let q = named(100, "q-1", queued.unwrap_or(1) as f64);
+        if let Some(gib) = queued {
+            let u = BuildUsage {
+                wall_ms: 1000,
+                cpu_usec: 1_000_000,
+                peak_memory_bytes: gib << 30,
+                ..Default::default()
+            };
+            (state.placement.lock().unwrap().history).record(&build_of(&q), 0, &u, None);
+        } else {
+            let twin = named(101, "q-1", 1.0);
+            state.placement.lock().unwrap().dispatched(0, &twin, false);
+        }
+        let _client = q.replay.subscribe().await;
+        state.queue.lock().await.push_back(q);
+        let (gone, here) = (named(0, "c-1", clientless), named(1, "f-1", with_client));
+        let gone_client = gone.replay.subscribe().await;
+        let _here_client = here.replay.subscribe().await;
+        let mut listed = Vec::new();
+        for j in [&gone, &here] {
+            listed.push(state.list_dispatch(j, 0));
+            state.placement.lock().unwrap().dispatched(0, j, false);
+        }
+        drop(gone_client);
+        gone.replay.checked(false, Instant::now());
+        tokio::time::advance(FLOOR + Duration::from_secs(1)).await;
+        state.give_up_clientless().await;
+        assert_eq!(state.given_up(&gone.id).is_cancelled(), given_up, "{row}");
     }
-    state.queue.lock().await.push_back(job(0, replay.clone()));
-    // The next event waits SUB_STALL for it, holding the replay's lock.
-    let publisher = replay.clone();
-    let note = attach_event::Event::Log(b"note".to_vec());
-    let publishing = tokio::spawn(async move { publisher.publish(note).await });
-    for _ in 0..3 {
-        tokio::task::yield_now().await;
-    }
-    let busy = tokio::time::timeout(Duration::ZERO, replay.has_subscribers()).await;
-    assert!(busy.is_err(), "publish holds the replay's lock");
-    let decider = state.clone();
-    let deciding = tokio::spawn(async move { decider.waiting_queued().await.len() });
-    for _ in 0..3 {
-        tokio::task::yield_now().await;
-    }
-    let t0 = Instant::now();
-    drop(state.queue.lock().await);
-    let waited = t0.elapsed();
-    publishing.await.unwrap();
-    assert_eq!(deciding.await.unwrap(), 1, "the build waits for a slot");
-    assert!(
-        waited < Duration::from_secs(1),
-        "take_job waited {waited:?} for the queue behind one stalled client"
-    );
 }

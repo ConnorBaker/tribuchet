@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use tokio::sync::mpsc;
 
+use super::validate::rpc_socket;
 use super::{ActiveBuild, pack_outputs, unix_now};
 use crate::errors::{Result, chain, err_ctx, err_msg};
 use crate::fsutil::io_ctx;
@@ -23,9 +24,10 @@ use crate::tmpdir::pack_zstd_dir;
 use crate::worker::caps::requires_uid_range;
 #[cfg(target_os = "macos")]
 use crate::worker::caps::requires_uid_range;
+use crate::worker::lease::Lease;
 use crate::worker::logtail::tail_log;
 use crate::worker::resume::{FinishedBuild, ResumeState, Usage, persist_finished};
-use crate::worker::{WorkerCtx, agents, sandbox};
+use crate::worker::{WorkerCtx, agents, handoff, sandbox};
 
 impl ActiveBuild {
     /// Lease a per-uid agent and run the build there. The agent
@@ -35,6 +37,7 @@ impl ActiveBuild {
     /// them readable.
     pub(in crate::worker) fn execute(
         &self,
+        lease: &mut Lease,
         out_tx: &mpsc::Sender<WorkerMessage>,
         timeout: Duration,
     ) -> Result<FinishedBuild> {
@@ -56,7 +59,7 @@ impl ActiveBuild {
         if self.reuse_outputs {
             return Ok(self.finish_reused());
         }
-        self.execute_on_agent(out_tx, timeout)
+        self.execute_on_agent(lease, out_tx, timeout)
     }
 
     /// Pack existing outputs without running a builder. Agent cleanup
@@ -67,7 +70,7 @@ impl ActiveBuild {
             store_inputs: self.input_list(),
             ..sandbox::SandboxSpec::default()
         };
-        let deadline = Instant::now() + Duration::from_mins(10);
+        let deadline = Some(Instant::now() + Duration::from_mins(10));
         let (exit_code, error, outputs) = match pack_outputs(&self.dir, &spec, deadline) {
             Ok(o) => (0, String::new(), o),
             Err(e) => (1, chain(&e), vec![]),
@@ -79,16 +82,38 @@ impl ActiveBuild {
             outputs,
             dir: self.dir.clone(),
             finished_at: Instant::now(),
+            handoff_expired: false,
         }
     }
 
     fn execute_on_agent(
         &self,
+        lease: &mut Lease,
         out_tx: &mpsc::Sender<WorkerMessage>,
         timeout: Duration,
     ) -> Result<FinishedBuild> {
         let a = &self.assignment;
-        let outputs: Vec<String> = a.outputs.values().cloned().collect();
+        // A producer gets a socket to its client's store (DD3), served
+        // only where a handoff socket hands its listener on (DD12), and
+        // packs no outputs: it submits them to the client itself (DD6).
+        let rpc_socket = rpc_socket(a)?;
+        let handoffs = self.ctx.handoffs.as_ref().filter(|_| rpc_socket.is_some());
+        if rpc_socket.is_some() && handoffs.is_none() {
+            // No attach can fetch its listener here: a loss, as an expiry.
+            return Ok(FinishedBuild {
+                exit_code: 1,
+                usage: Usage::default(),
+                error: handoff::NO_SUCH_RUN.into(),
+                outputs: vec![],
+                dir: self.dir.clone(),
+                finished_at: Instant::now(),
+                handoff_expired: true,
+            });
+        }
+        let outputs: Vec<String> = match rpc_socket {
+            Some(_) => Vec::new(),
+            None => a.outputs.values().cloned().collect(),
+        };
         // The agent-side confinement of the builder: a seatbelt
         // profile on macOS, the namespace sandbox spec on Linux. The
         // spec doubles as the packing/resume state, so the Linux one
@@ -109,7 +134,8 @@ impl ActiveBuild {
         );
         #[cfg(target_os = "linux")]
         let (profile, sandbox_json, mut spec) = {
-            let spec = self.build_spec()?;
+            let mut spec = self.build_spec()?;
+            spec.outputs.clone_from(&outputs);
             (String::new(), Some(serde_json::to_string(&spec)?), spec)
         };
         // Re-pack the staged tmp dir: the agent unpacks it into its own
@@ -128,13 +154,14 @@ impl ActiveBuild {
             sandbox_json,
             outputs: outputs.clone(),
             memory_max_bytes: self.ctx.build_memory_max_bytes,
+            rpc_socket: rpc_socket.clone(),
         };
         // The builder writes dir/build.log directly through this fd.
         let log_w = fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(self.dir.join("build.log"))?;
-        let started = self.ctx.agents.start(
+        let started = lease.start(
             &req,
             &fs::File::open(self.dir.join("top.tmpdir.zst"))
                 .map_err(io_ctx("opening", &self.dir.join("top.tmpdir.zst")))?,
@@ -143,8 +170,13 @@ impl ActiveBuild {
             || self.tell_waiting(),
         );
         self.ctx.wait_for_agent(&a.dedupe_key, false);
-        let (socket, build) = started?;
+        let (socket, mut build) = started?;
         drop(log_w);
+        if let Some(handoffs) = handoffs {
+            let listener = (build.listener.take())
+                .ok_or_else(|| err_msg("the agent sent no listener for the producer's socket"))?;
+            handoffs.ready(&a.dedupe_key, &a.handoff_token, listener, &self.dir);
+        }
         tracing::info!(
             id = a.build_id,
             pid = build.pid,
@@ -179,12 +211,14 @@ impl ActiveBuild {
         let resume = ResumeState {
             dedupe_key: a.dedupe_key.clone(),
             build_id: a.build_id.clone(),
+            run: a.run,
             pid: build.pid,
             spec,
             started_unix,
-            deadline_unix: started_unix + limit(timeout, a.timeout_secs).as_secs(),
+            deadline_unix: deadline(started_unix, timeout, a.timeout_secs),
             max_silent_secs: a.max_silent_secs,
             agent_socket: socket.clone(),
+            producer: rpc_socket.is_some(),
         };
         if let Err(e) = resume.persist(&self.dir) {
             tracing::warn!(id = a.build_id, "persisting resume state: {}", chain(&e));
@@ -192,7 +226,6 @@ impl ActiveBuild {
         let fin = supervise_agent(&self.ctx, &resume, self.dir.clone(), &socket, build);
         log_done.store(true, Ordering::Relaxed);
         let _ = tailer.join();
-        self.ctx.agents.release(socket);
         Ok(fin)
     }
 
@@ -250,7 +283,7 @@ pub(in crate::worker) fn supervise_agent(
     // The exit notice arrives on the lease connection. Wait for it on
     // its own thread so the abort conditions keep being polled.
     let waiter = thread::spawn(move || build.wait_exit());
-    let mut aborted: Option<String> = None;
+    let (mut aborted, mut expired): (Option<String>, bool) = (None, false);
     let mut silence = Silence::default();
     while !waiter.is_finished() {
         if aborted.is_none() {
@@ -260,8 +293,12 @@ pub(in crate::worker) fn supervise_agent(
             let silent = silence.observe(&log_path, Instant::now(), frozen);
             let silent = (!max_silent.is_zero() && silent > max_silent)
                 .then(|| format!("build produced no output for {}s", max_silent.as_secs()));
-            if let Some(r) = ctx.abort_reason(&st.dedupe_key, &log_path, timed_out, silent) {
-                aborted = Some(r);
+            // A producer's listener that reached no attach (DD10).
+            let lapsed = st.producer
+                && (ctx.handoffs.as_ref()).is_none_or(|h| h.lapsed(&st.dedupe_key, &dir));
+            let reason = ctx.abort_reason(&st.dedupe_key, &log_path, timed_out, silent);
+            if let Some(r) = lapsed.then(|| handoff::EXPIRED.to_owned()).or(reason) {
+                (aborted, expired) = (Some(r), lapsed);
                 if let Err(e) = agents::kill(socket, &st.build_id) {
                     tracing::warn!(
                         id = st.build_id,
@@ -273,7 +310,7 @@ pub(in crate::worker) fn supervise_agent(
         }
         thread::sleep(Duration::from_millis(200));
     }
-    let (code, usage) = match waiter.join() {
+    let (code, mut usage): (_, Usage) = match waiter.join() {
         Ok(Ok(n)) => (n.exit_code, n.into()),
         Ok(Err(e)) => {
             aborted.get_or_insert(format!("agent connection lost: {}", chain(&e)));
@@ -284,6 +321,7 @@ pub(in crate::worker) fn supervise_agent(
             (1, Usage::default())
         }
     };
+    usage.profile = tracking.profile().map(Into::into);
     tracing::info!(id = st.build_id, exit_code = code, aborted = ?aborted, "builder finished");
     let (exit_code, error, outputs) = if let Some(reason) = aborted {
         (1, reason, vec![])
@@ -301,7 +339,8 @@ pub(in crate::worker) fn supervise_agent(
         // packing.
         let deadline_unix = st.deadline_unix.saturating_add(tracking.frozen().as_secs());
         let remaining = Duration::from_secs(deadline_unix.saturating_sub(unix_now()));
-        let deadline = Instant::now() + remaining.max(Duration::from_mins(10));
+        // None past the clock's range: a build with no limit.
+        let deadline = Instant::now().checked_add(remaining.max(Duration::from_mins(10)));
         let packed = agents::finish(socket, &st.build_id)
             .map_err(err_ctx("finishing the build on its agent"))
             .and_then(|()| pack_outputs(&dir, &st.spec, deadline));
@@ -317,11 +356,12 @@ pub(in crate::worker) fn supervise_agent(
         outputs,
         dir,
         finished_at: Instant::now(),
+        handoff_expired: expired,
     };
     // On disk before the agent forgets the build: a worker stopped while
     // Cleanup runs leaves a result to deliver, not a running build no
     // agent has.
-    persist_finished(&st.dedupe_key, &st.build_id, &fin);
+    persist_finished(&st.dedupe_key, (&st.build_id, st.run), &fin);
     // The agent removes its scratch dir and the scratch outputs
     // (packing above already read them) and forgets the build.
     agents::retire(socket, &st.build_id, "agent cleanup");
@@ -336,6 +376,15 @@ fn limit(own: Duration, asked: u64) -> Duration {
         asked
     } else {
         own
+    }
+}
+
+/// When a build started at `started_unix` runs out its time (limit's),
+/// never where neither the worker nor its client set a limit.
+fn deadline(started_unix: u64, own: Duration, asked: u64) -> u64 {
+    match limit(own, asked).as_secs() {
+        0 => u64::MAX,
+        secs => started_unix + secs,
     }
 }
 
@@ -432,6 +481,17 @@ mod tests {
             let secs = Duration::from_secs;
             assert_eq!(limit(secs(own), asked), secs(lesser), "{own} {asked}");
         }
+    }
+
+    /// With no limit, the worker's or its client's, a build never runs
+    /// out its time; with either, it does at its start plus the lesser.
+    #[test]
+    fn a_build_with_no_limit_never_runs_out_its_time() {
+        let secs = Duration::from_secs;
+        let never = deadline(1000, Duration::ZERO, 0);
+        assert!(!past_deadline(never, u64::MAX - 1, Duration::ZERO));
+        assert_eq!(deadline(1000, secs(600), 0), 1600, "the worker's own");
+        assert_eq!(deadline(1000, Duration::ZERO, 60), 1060, "the client's");
     }
 
     /// 100 s of timeout from 1000: a build never frozen has run it out at

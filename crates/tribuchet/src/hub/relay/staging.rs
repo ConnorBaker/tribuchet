@@ -17,16 +17,17 @@ use tonic::Status;
 
 use super::daemon::DaemonWait;
 use super::send;
-use super::serve::{compute_recipe, serve_need};
+use super::serve::{Served, compute_recipe, serve_need};
 use crate::chunker::parse_hashes;
 use crate::chunkio;
 use crate::chunkstore::Hash;
-use crate::errors::{Result, err_msg};
+use crate::errors::{Error, Result, err_msg};
 use crate::hub::chunkcache::Recipe;
 use crate::hub::state::{HubState, Job};
 use crate::proto::{
     ChunkFrame, HubMessage, Manifest, Need, PathInfoMsg, TmpDirArchive, hub_message,
 };
+use crate::report::Ticker;
 
 /// Forget everything rather than track LRU. A miss costs one round trip.
 const KNOWN_CAP: usize = 1 << 18;
@@ -35,6 +36,8 @@ const KNOWN_CAP: usize = 1 << 18;
 pub(in crate::hub) struct WorkerSession {
     /// The worker's name, as it registered: for the log lines.
     pub(super) worker: String,
+    /// Its Session, for the session's bulk: manifests, chunks, tmp dirs.
+    pub(in crate::hub) bulk: mpsc::Sender<Result<HubMessage, Status>>,
     /// One permit: the Need that sends the next chunk frame. A path is
     /// asked for by one build only; the others wait on its claim
     /// (spec/staging.qnt).
@@ -47,9 +50,13 @@ pub(in crate::hub) struct WorkerSession {
 }
 
 impl WorkerSession {
-    pub(in crate::hub) fn new(worker: String) -> Self {
+    pub(in crate::hub) fn new(
+        worker: String,
+        bulk: mpsc::Sender<Result<HubMessage, Status>>,
+    ) -> Self {
         Self {
             worker,
+            bulk,
             sends: Semaphore::new(1),
             #[cfg(test)]
             asked: AtomicUsize::default(),
@@ -90,7 +97,24 @@ pub(super) struct Staging<'a> {
     /// reading the worker, so neither side blocks on a full peer.
     queued: VecDeque<HashSet<Hash>>,
     serving: Option<Serving<'a>>,
-    first_need: bool,
+    /// What its Needs were served (serve::Served), logged once (report.rs)
+    /// when the worker starts or resumes the build, else as the staging
+    /// ends: a line per Need (per late manifest) flooded journald. A hub
+    /// killed outright (SIGKILL, the watchdog's SIGABRT, the OOM killer)
+    /// loses the line of every staging in flight.
+    served: Arc<Served>,
+    /// Whether its "needs served" line was logged (report.rs summarize).
+    summarized: bool,
+    /// Needs the worker sent, the first included.
+    needs: u64,
+    /// When it says where it stands (report.rs).
+    report: Ticker,
+}
+
+impl Drop for Staging<'_> {
+    fn drop(&mut self) {
+        self.summarize(None);
+    }
 }
 
 impl<'a> Staging<'a> {
@@ -106,7 +130,10 @@ impl<'a> Staging<'a> {
             tasks: FuturesUnordered::new(),
             queued: VecDeque::new(),
             serving: None,
-            first_need: true,
+            served: Arc::default(),
+            summarized: false,
+            needs: 0,
+            report: Ticker::default(),
         }
     }
 
@@ -196,8 +223,9 @@ impl<'a> Staging<'a> {
         // sent before it.
         let sent = self.sent.clone();
         let out_tx = out_tx.clone();
+        let served = self.served.clone();
         self.serving = Some(Box::pin(async move {
-            serve_need(cache, job, &sent, needed, &out_tx, sess).await?;
+            serve_need(cache, job, &sent, needed, &out_tx, sess, &served).await?;
             send(
                 &out_tx,
                 hub_message::Msg::Chunk(ChunkFrame {
@@ -220,9 +248,9 @@ impl<'a> Staging<'a> {
                 return Err(err_msg(format!("worker requested unoffered path {p}")));
             }
         }
-        let first = self.first_need;
-        self.update_known(&n.paths);
-        self.first_need = false;
+        let first = self.needs == 0;
+        self.needs += 1;
+        self.update_known(first, &n.paths);
         if first {
             tracing::info!(
                 id = self.job.id,
@@ -262,9 +290,9 @@ impl<'a> Staging<'a> {
         Ok(())
     }
 
-    fn update_known(&self, missing: &[String]) {
+    fn update_known(&self, first: bool, missing: &[String]) {
         let mut known = self.sess.known.lock().unwrap();
-        if self.first_need {
+        if first {
             if known.len() > KNOWN_CAP {
                 known.clear();
             }
@@ -374,11 +402,7 @@ async fn query_path_info_chunk(state: &HubState, job: &Job, paths: &[String]) ->
                     out.push(path_info(p, &store_dir, info));
                     continue;
                 }
-                Ok(None) => {
-                    return Err(err_msg(format!(
-                        "{p} is not a valid path in the local store"
-                    )));
-                }
+                Ok(None) => return Err(Error::Missing(p.clone())),
                 Err(failed) => failed,
             };
             // Its slot is free during the backoff.
@@ -508,11 +532,13 @@ mod tests {
             replay: Arc::new(Replay::default()),
             listing: Arc::default(),
             attempts: 0,
-            resumed_losses: 0,
+            transport_losses: 0,
             queued_at: Instant::now(),
             loss: None,
             deferred: None,
             expected: Expected::prior(false),
+            expected_at: None,
+            sources: None,
             placed: Default::default(),
         }
     }
@@ -524,7 +550,7 @@ mod tests {
     async fn manifest_survives_full_channel() {
         let state = HubState::for_test(Duration::from_secs(1));
         let job = test_job();
-        let sess = WorkerSession::new("w".into());
+        let sess = WorkerSession::new("w".into(), mpsc::channel(1).0);
         let mut staging = Staging::new(&state, &job, &sess);
         let path = "/nix/store/00000000000000000000000000000000-x";
         staging.computing.insert(path.into());
@@ -566,5 +592,6 @@ mod tests {
     }
 }
 
+mod report;
 #[cfg(test)]
 mod serving_tests;

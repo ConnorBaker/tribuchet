@@ -1,18 +1,21 @@
 use super::*;
 use std::collections::HashMap;
 use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicUsize, Ordering::SeqCst};
 use std::sync::{OnceLock, mpsc};
 use std::thread;
 
 use crate::errors::Result;
-use crate::proto::{BuildAssignment, CancelBuild, WorkerMessage, worker_message};
+use crate::proto::{BuildAssignment, CancelBuild, RunId, WorkerMessage, worker_message};
 use crate::sockpath;
-use crate::worker::agents::tests::{Calls, fake_agent, spawn_agent};
+use crate::worker::agents::tests::pool::{Calls, fake_agent};
+use crate::worker::agents::tests::spawn_agent;
 use crate::worker::session::handle_cancel;
 use crate::worker::unix_now;
 
 mod cancel;
+mod slots;
 mod teardown;
 
 /// A worker starting up waits on no agent that never answers, as a
@@ -54,7 +57,11 @@ fn startup_waits_on_no_agent_that_does_not_answer() -> Result<()> {
     );
     assert!(build.exists(), "the held build's state is gone");
     assert_eq!(held(&ctx, "k"), Some((true, false)));
-    assert_eq!(ctx.free_slots(), 0, "the held build has no slot");
+    assert_eq!(
+        ctx.agents.room().free,
+        0,
+        "the held build left its slot free"
+    );
     Ok(())
 }
 
@@ -64,12 +71,14 @@ fn resume_state(id: &str, socket: PathBuf) -> ResumeState {
     ResumeState {
         dedupe_key: "k".into(),
         build_id: id.into(),
+        run: Some(RUN),
         pid: 42,
         spec: sandbox::SandboxSpec::default(),
         started_unix: 0,
         deadline_unix: unix_now() + 3600,
         max_silent_secs: 0,
         agent_socket: socket,
+        producer: false,
     }
 }
 
@@ -111,8 +120,36 @@ fn assignment(id: &str) -> BuildAssignment {
     }
 }
 
-/// The build id of a held build.
+/// The build id of a held build, and its run.
 const HELD: &str = "00000000000000000000000000000020";
+const RUN: RunId = RunId { epoch: 2, seq: 6 };
+
+/// A restarted worker reports lost a run it started that its agent no longer
+/// has, whether the agent says so at once or after it is held for it; not one
+/// the hub cancelled meanwhile, which the hub's own cancel ended.
+#[test]
+fn a_run_its_agent_no_longer_has_is_reported_lost() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let (build, socket) = (dir.path().join("builds/b1"), dir.path().join("agent.sock"));
+    fs::create_dir_all(&build)?;
+    let allow = Arc::new(AtomicUsize::new(usize::MAX));
+    let _calls = fake_agent(&socket, "", None, allow, String::new)?;
+    resume_state(HELD, socket.clone()).persist(&build)?;
+    let ctx = WorkerCtx::for_test(dir.path(), 4, vec![socket])?;
+    tokio::runtime::Runtime::new()?.block_on(adopt_builds(&ctx));
+    assert_eq!(*ctx.lost.lock().unwrap(), [RUN], "answered at once");
+    for cancel in [false, true] {
+        let h = held_build(false, None)?;
+        if cancel {
+            h.cancel("old");
+        }
+        h.allow.store(usize::MAX, SeqCst);
+        until("removed", || !h.build.exists());
+        let lost = h.ctx.lost.lock().unwrap().clone();
+        assert_eq!(lost, if cancel { vec![] } else { vec![RUN] }, "held");
+    }
+    Ok(())
+}
 
 /// A worker restarted with the running build HELD keyed "k" in builds/b1,
 /// its agent a stand-in that holds the build (or no longer has it) and
@@ -129,19 +166,27 @@ struct Held {
 }
 
 impl Held {
-    fn cancel(&self, session: &str, out: &tokio::sync::mpsc::Sender<WorkerMessage>) -> Result<()> {
+    fn cancel(&self, session: &str) {
         let c = CancelBuild {
             build_id: session.into(),
             dedupe_key: "k".into(),
         };
-        let rt = self.rt.as_ref().unwrap();
-        rt.block_on(handle_cancel(c, &mut HashMap::new(), out, &self.ctx))
+        let (rt, out_tx) = (self.rt.as_ref().unwrap(), tokio::sync::mpsc::channel(1).0);
+        rt.block_on(handle_cancel(c, &mut HashMap::new(), &out_tx, &self.ctx))
+            .unwrap();
     }
 
     /// Assign the build to `session`, on the runtime, as a session does.
+    /// ... and, adopted, delivered to.
     fn assign(&self, session: &str, out: &tokio::sync::mpsc::Sender<WorkerMessage>) -> bool {
-        let _rt = self.rt.as_ref().unwrap().enter();
-        self.ctx.adopt_assignment(&assignment(session), out)
+        let adoption = {
+            let _rt = self.rt.as_ref().unwrap().enter();
+            self.ctx.adopt_assignment(&assignment(session), out)
+        };
+        if let Some(n) = adoption {
+            try_deliver(&self.ctx, "k", Some(n));
+        }
+        adoption.is_some()
     }
 }
 
@@ -155,7 +200,7 @@ impl Drop for Held {
     }
 }
 
-fn held_build(has: bool, exit: Option<i32>, network: bool) -> Result<Held> {
+fn held_build(has: bool, exit: Option<i32>) -> Result<Held> {
     let dir = tempfile::tempdir()?;
     let (build, socket) = (dir.path().join("builds/b1"), dir.path().join("agent.sock"));
     fs::create_dir_all(&build)?;
@@ -171,9 +216,7 @@ fn held_build(has: bool, exit: Option<i32>, network: bool) -> Result<Held> {
     };
     let id = if has { HELD } else { "" };
     let calls = fake_agent(&socket, id, exit, allow.clone(), seen)?;
-    let mut st = resume_state(HELD, socket.clone());
-    st.spec.network = network;
-    st.persist(&build)?;
+    resume_state(HELD, socket.clone()).persist(&build)?;
     let ctx = WorkerCtx::for_test(dir.path(), 4, vec![socket])?;
     let _ = cell.set(ctx.clone());
     let rt = tokio::runtime::Runtime::new()?;
@@ -202,28 +245,36 @@ const SCENARIOS: &[&str] = &[
     // runs on for the new assignment: the cancel does not survive it.
     "has exit | assign:old cancel:old assign:new open done ok:new | adopt running k, finish running k, cleanup finished k, other finished k",
     // Cancelled while held, it is failed to the hub at once and stays held;
-    // once its agent answers, its key goes as the kill is decided and its
-    // state before the kill, then its agent is handed back: the cancel
-    // does not wait unseen, nor the state outlive the kill.
-    "has | assign:old cancel:old cancelled:old held open gone idle nodir | adopt running k, kill none, cleanup none, other none",
+    // once its agent answers, its state goes, then its key, before the
+    // kill, then its agent is handed back: the cancel does not wait unseen,
+    // nor the state outlive its key.
+    "has | assign:old cancel:old cancelled:old held open gone idle removed | adopt running k, kill none, cleanup none, other none",
     // ... also while its log replay waits on a session that takes nothing,
-    // killed before it drains, not the replay stopped first, which would
-    // keep the run alive.
-    "has cap1 | assign:old cancel:old cancelled:old log:65536 replayed:8192 open gone killed replayed:8192 drain:old idle nodir | adopt running k, kill none, cleanup none, other none",
+    // killed and its agent handed back before it drains, not the replay
+    // stopped first, which would keep the run alive and its agent taken.
+    "has cap1 | assign:old cancel:old cancelled:old log:65536 replayed:8192 open gone killed replayed:8192 idle drain:old removed | adopt running k, kill none, cleanup none, other none",
     // Once adopted, a cancel kills it like any run.
     "has | assign:old open running cancel:old cancelled:old | adopt running k, kill running k, cleanup finished k, other finished k",
-    // Its agent no longer has it: dropped, its state, then its key, then its
-    // agent handed back: not after 7 s, nor its key first.
-    "lost | fill assign:old open gone nodir idle | adopt running k",
-    // ... a cancel taken meanwhile leaves no flag, nor does a log replay
-    // keep its state (which fails its removal: "directory not empty").
-    "lost cap1 | fill log:1638400 assign:old open running cancel:old flagged drain:old gone idle nodir noflag | adopt running k",
-    // Cancelled and its agent without it: its key goes as that is decided,
-    // and its teardown leaves a new run of the key alone.
-    "lost | fill assign:old cancel:old open gone dir anew idle nodir running | adopt running k",
-    // Left by an older worker with network in the host's network: killed,
-    // not adopted, its key never offered.
-    "has net | gone open idle nodir gone | adopt running, kill none, cleanup none, other none",
+    // Its agent no longer has it: dropped, its state, then its key, then
+    // its dir: not after 7 s, nor its key first; its agent handed back.
+    "lost | assign:old open gone idle removed | adopt running k",
+    // ... its agent handed back while its log replay waits on a session
+    // that takes nothing; a cancel then leaves no flag, and its dir stays
+    // until the replay stops (one removed meanwhile could fail: "directory
+    // not empty").
+    "lost cap1 | log:1638400 assign:old open gone idle cancel:old dir drain:old removed noflag | adopt running k",
+    // Its state.json staying: killed if its agent has it, its key kept, no takeover.
+    "has | assign:old cancel:old cancelled:old jam open killed idle running cancel:old refused:new noflag unjam | adopt running k, kill running k, cleanup running k, other running k",
+    "lost | assign:old jam open idle running cancel:old refused:new noflag unjam | adopt running k",
+    // Cancelled and its agent without it: its key goes after its state,
+    // and its teardown (held by its log replay until the session drains)
+    // leaves a new run of the key alone.
+    "lost cap1 | assign:old cancel:old cancelled:old log:1638400 replayed:8192 open gone dir anew idle drain:old removed running | adopt running k",
+    // ... while its log replay waits on a session that takes nothing, its
+    // agent is handed back and its state goes, not after the drain, and the
+    // replay is stopped before its dir goes, not left to write an offset
+    // there meanwhile ("directory not empty").
+    "lost cap1 | assign:old cancel:old cancelled:old log:1638400 replayed:8192 open gone idle unrecorded drain:old removed stopped:old | adopt running k",
 ];
 
 /// Each held build's scenario, all at once (each waits on its agent).
@@ -249,11 +300,12 @@ fn run(row: &str) -> Result<()> {
     };
     let flag = |f| flags.split(' ').any(|x| x == f);
     // The agent "has" the build or has "lost" it; it "exit"s 0 once adopted
-    // (or runs until killed); its spec had network in the host's ("net").
-    let h = held_build(flag("has"), flag("exit").then_some(0), flag("net"))?;
+    // (or runs until killed).
+    let h = held_build(flag("has"), flag("exit").then_some(0))?;
     let (ctx, build, log) = (&h.ctx, &h.build, h.build.join("build.log"));
     let mut sessions = HashMap::new();
     let mut results: HashMap<&str, Vec<(String, String)>> = HashMap::new();
+    let mut drained = HashMap::new();
     for step in steps.split(' ') {
         let (what, arg) = step.split_once(':').unwrap_or((step, ""));
         let cap = if flag("cap1") { 1 } else { 64 };
@@ -265,21 +317,25 @@ fn run(row: &str) -> Result<()> {
                     .or_insert_with(|| tokio::sync::mpsc::channel(cap));
                 let tx = tx.0.clone();
                 if what == "cancel" {
-                    h.cancel(arg, &tx)?;
+                    h.cancel(arg);
                 } else {
                     assert!(h.assign(arg, &tx), "{row}");
                 }
             }
+            "refused" => assert!(!h.assign(arg, &tokio::sync::mpsc::channel(1).0), "{row}"),
             // Until the agent was asked n times, answered or not; it
             // answers; until "k" is held, running, done or gone, until its
-            // agent is handed back, or asked to kill the run.
+            // agent and its slot are handed back, or its agent asked to kill
+            // the run.
             "asked" => until(row, || h.calls.asked.load(SeqCst) >= arg.parse().unwrap()),
             "open" => h.allow.store(usize::MAX, SeqCst),
             "held" => state(Some((true, false))),
             "running" => state(Some((false, false))),
             "done" => state(Some((false, true))),
             "gone" => state(None),
-            "idle" => until(row, || !ctx.agents.idle_sockets().is_empty()),
+            "idle" => until(row, || {
+                !ctx.agents.idle_sockets().is_empty() && ctx.agents.room().free > 0
+            }),
             "killed" => until(&format!("killed while the replay waits: {row}"), || {
                 (h.calls.answered.lock().unwrap().iter()).any(|c| c.starts_with("kill"))
             }),
@@ -295,8 +351,14 @@ fn run(row: &str) -> Result<()> {
                 let error = if what == "ok" { "" } else { CANCELLED };
                 *got == [(arg.to_owned(), error.to_owned())]
             }),
+            // b1 is there or not; until it is not; until its state is not.
             "dir" | "nodir" => assert_eq!(build.exists(), what == "dir", "{step}: {row}"),
-            "fill" => fill(build, "top/build")?,
+            "removed" => until(&format!("{step}: {row}"), || !build.exists()),
+            "unrecorded" => until(&format!("{step}: {row}"), || {
+                !build.join("state.json").exists()
+            }),
+            "jam" => fs::set_permissions(build, fs::Permissions::from_mode(0o500))?,
+            "unjam" => fs::set_permissions(build, fs::Permissions::from_mode(0o700))?,
             // The run logs n bytes; until n were replayed; session s takes
             // what it is sent, slowly; "k" runs anew in b2.
             "log" => {
@@ -310,13 +372,16 @@ fn run(row: &str) -> Result<()> {
                 fs::read_to_string(build.join("log.offset")).is_ok_and(|o| o == arg)
             }),
             "drain" => {
-                let mut rx = sessions.remove(arg).unwrap().1;
+                let (tx, mut rx) = sessions.remove(arg).unwrap();
+                drained.insert(arg, tx.downgrade());
                 thread::spawn(move || {
                     while rx.blocking_recv().is_some() {
                         thread::sleep(Duration::from_millis(5));
                     }
                 });
             }
+            // Nothing sends to drained session s any more: its replay ended.
+            "stopped" => assert!(drained[arg].upgrade().is_none(), "{step}: {row}"),
             "anew" => {
                 let anew = build.with_file_name("b2");
                 fs::create_dir_all(&anew)?;
@@ -345,14 +410,15 @@ fn unreachable_agents_do_not_count_until_they_answer() -> Result<()> {
     drop(sockpath::bind(&stale)?);
     let ctx = WorkerCtx::for_test(dir.path(), 4, vec![live, stale.clone()])?;
     sweep_orphaned_agent_builds(&ctx, ctx.agents.idle_sockets());
-    assert_eq!(ctx.jobs(), 1);
-    let _slot = ctx.try_slot().unwrap();
-    assert!(ctx.try_slot().is_none());
+    assert_eq!(ctx.agents.room().capacity, 1);
+    let _lease = ctx.agents.lease().unwrap();
+    assert!(ctx.agents.lease().is_none());
 
     fs::remove_file(&stale)?;
     spawn_agent(&stale, dir.path().join("a2"))?;
     rescan_agents(&ctx, None);
-    assert_eq!((ctx.jobs(), ctx.free_slots()), (2, 1));
+    let room = ctx.agents.room();
+    assert_eq!((room.capacity, room.free), (2, 1));
     Ok(())
 }
 
@@ -385,7 +451,7 @@ fn a_silent_agent_does_not_stop_the_rescan() -> Result<()> {
         "the rescan still waits on the silent agent after 30 s"
     );
     assert_eq!(ctx.agents.down_sockets(), vec![silent]);
-    assert_eq!(ctx.jobs(), 1);
+    assert_eq!(ctx.agents.room().capacity, 1);
     Ok(())
 }
 
@@ -406,7 +472,7 @@ fn an_agent_silent_on_shutdown_does_not_stop_the_rescan() -> Result<()> {
         "the rescan still waits on Shutdown after 30 s"
     );
     assert_eq!(calls.asked.load(SeqCst), 2, "Status and Shutdown");
-    assert_eq!(ctx.jobs(), 1);
+    assert_eq!(ctx.agents.room().capacity, 1);
     Ok(())
 }
 
@@ -419,7 +485,7 @@ fn rescan_adds_new_agent_sockets() -> Result<()> {
     fs::create_dir(&agents)?;
     spawn_agent(&agents.join("1.sock"), dir.path().join("a1"))?;
     let ctx = WorkerCtx::for_test(dir.path(), 2, agent_sockets_in(&agents)?)?;
-    assert_eq!(ctx.jobs(), 1);
+    assert_eq!(ctx.agents.room().capacity, 1);
     for i in 2..=3 {
         spawn_agent(
             &agents.join(format!("{i}.sock")),
@@ -427,77 +493,49 @@ fn rescan_adds_new_agent_sockets() -> Result<()> {
         )?;
     }
     rescan_agents(&ctx, Some(&agents));
-    assert_eq!(ctx.agents.usable(), 3);
-    assert_eq!(ctx.jobs(), 2);
+    assert_eq!(ctx.agents.idle_sockets().len(), 3);
+    assert_eq!(ctx.agents.room().capacity, 2);
     Ok(())
-}
-
-#[test]
-fn a_finished_state_written_before_usage_existed_still_loads() {
-    let old = r#"{"phase":"finished","dedupe_key":"k","build_id":"b","exit_code":0,"error":"","outputs":[]}"#;
-    let Ok(BuildState::Finished {
-        usage, exit_code, ..
-    }) = serde_json::from_str(old)
-    else {
-        panic!("old finished state did not load");
-    };
-    assert_eq!((exit_code, usage), (0, Usage::default()));
-}
-
-#[test]
-fn a_finished_state_keeps_its_usage() {
-    let u = Usage {
-        wall_ms: 1500,
-        cpu_usec: 2_000_000,
-        peak_memory_bytes: 1 << 30,
-        oom_killed: true,
-        frozen_ms: 500,
-    };
-    let st = BuildState::Finished {
-        dedupe_key: "k".into(),
-        build_id: "b".into(),
-        exit_code: 1,
-        usage: u,
-        error: String::new(),
-        outputs: vec![],
-    };
-    let json = serde_json::to_string(&st).unwrap();
-    let Ok(BuildState::Finished { usage, .. }) = serde_json::from_str(&json) else {
-        panic!("finished state did not round trip");
-    };
-    assert_eq!(usage, u);
 }
 
 /// persist() serializes through a borrowing mirror of BuildState.
 #[test]
 fn persisted_running_state_round_trips() {
     let dir = tempfile::tempdir().unwrap();
+    let run = Some(RunId { epoch: 5, seq: 9 });
     let st = ResumeState {
         dedupe_key: "k".into(),
         build_id: "b1".into(),
+        run,
         pid: 42,
         spec: sandbox::SandboxSpec::default(),
         started_unix: 11,
         deadline_unix: 7,
         max_silent_secs: 13,
         agent_socket: PathBuf::from("/run/agent.sock"),
+        producer: false,
     };
     st.persist(dir.path()).unwrap();
     let json = fs::read_to_string(dir.path().join("state.json")).unwrap();
     let BuildState::Running(back) = serde_json::from_str(&json).unwrap() else {
         panic!("expected Running");
     };
-    assert_eq!(back.build_id, "b1");
+    assert_eq!((back.build_id.as_str(), back.run), ("b1", run));
     assert_eq!(back.agent_socket, st.agent_socket);
     assert_eq!(back.deadline_unix, 7);
     assert_eq!((back.started_unix, back.max_silent_secs), (11, 13));
-    // As persisted before started_unix and max_silent_secs: 0 each.
+    // As persisted before started_unix, max_silent_secs and run: 0 each, none.
     let before = json
         .replace("\"started_unix\":11,", "")
-        .replace("\"max_silent_secs\":13,", "");
+        .replace("\"max_silent_secs\":13,", "")
+        .replace("\"run\":{\"epoch\":5,\"seq\":9},", "");
     assert!(!before.contains("started_unix") && !before.contains("max_silent_secs"));
+    assert!(!before.contains("\"run\""), "{before}");
     let Ok(BuildState::Running(old)) = serde_json::from_str(&before) else {
         panic!("a state persisted before the limits does not read");
     };
-    assert_eq!((old.started_unix, old.max_silent_secs), (0, 0));
+    assert_eq!(
+        (old.started_unix, old.max_silent_secs, old.run),
+        (0, 0, None)
+    );
 }

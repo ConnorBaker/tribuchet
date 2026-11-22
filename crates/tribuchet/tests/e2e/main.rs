@@ -22,13 +22,18 @@
 #![allow(clippy::too_many_lines, clippy::struct_field_names)]
 
 mod arbiter;
+mod canlocal;
+mod client;
 mod daemon;
+mod dyndrv;
 mod fod_ipv6;
 mod harness;
 mod held;
 mod history;
+mod oom;
 mod pairs;
 mod spread;
+mod syscalls;
 
 use std::time::Instant;
 
@@ -202,28 +207,6 @@ fn build_impure() {
     succeed(Node::Hub, &format!("grep -q impure-ok {}", out.trim()));
 }
 
-#[test]
-fn build_kvm() {
-    if run(Node::Worker, "test -e /dev/kvm").code == 0 {
-        build_grep("/etc/tt/kvm.nix", "kvm-ok");
-    } else {
-        // No worker serves the kvm feature and the hub cannot build it
-        // locally, so the declined build (exit 222) fails.
-        let err = fail(Node::Hub, "nix-build /etc/tt/kvm.nix --no-out-link 2>&1");
-        assert!(err.contains("exit code 222"), "{err}");
-    }
-}
-
-#[test]
-fn build_kvm_emulated() {
-    // An emulated system must not inherit the host's kvm feature.
-    let err = fail(
-        Node::Hub,
-        "nix-build /etc/tt/kvm-emulated.nix --no-out-link 2>&1",
-    );
-    assert!(err.contains("exit code 222"), "{err}");
-}
-
 /// build-memory-max-bytes OOM-kills the builder, exit code 137, and
 /// the agent notes the OOM kill.
 #[test]
@@ -291,6 +274,13 @@ fn build_fod() {
 
     // 1) fetch via the hub's IP, isolated from the worker's loopback socket
     build_grep("/etc/tt/fod.nix", "hello-fod");
+    // 1a) --check runs it at another path, not told fixed-output: without
+    // network its output mismatches its hash, and its log says why.
+    let err = fail(Node::Hub, "nix-build /etc/tt/fod.nix --check 2>&1");
+    assert!(
+        err.contains("not at a path it derives from the outputHash"),
+        "{err}"
+    );
 
     // 1b) fod-network policy: denied port unreachable, allowed port works
     build_grep("/etc/tt/fod-policy.nix", "hello-fod");
@@ -432,11 +422,12 @@ fn lifecycle() {
         &format!("[ $(journalctl -u tribuchet-worker | grep -c 'build assigned') -gt {assigned} ]"),
         60,
     );
-    // Settings changes also arrive via restart: bump max-jobs in the config.
+    // Settings changes also arrive via restart: set max-jobs in the config
+    // (unset, one per core: 2).
     succeed(
         Node::Worker,
         "cp --remove-destination $(readlink -f /etc/tribuchet/worker.toml) /etc/tribuchet/worker.toml \
-         && sed -i 's/max-jobs = 2/max-jobs = 3/' /etc/tribuchet/worker.toml",
+         && sed -i '1i max-jobs = 3' /etc/tribuchet/worker.toml",
     );
     succeed(Node::Worker, "systemctl restart tribuchet-worker");
     wait_until_succeeds(Node::Hub, "test -f /tmp/reload.ok", 120);
@@ -573,6 +564,7 @@ fn lifecycle() {
         &format!("grep -q 'fallback-payload built-locally' {}", out.trim()),
     );
     assert_journal(Node::Hub, "tribuchet-hub", "no capable worker; declining");
+    canlocal::declined("tt-fallback-build", "x86_64-linux", true);
 
     // --- the restarted worker re-adopts and delivers the stopped build ----
     succeed(Node::Worker, "systemctl start tribuchet-worker");

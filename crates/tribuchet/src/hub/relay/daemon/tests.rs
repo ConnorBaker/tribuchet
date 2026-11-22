@@ -15,8 +15,9 @@ use tokio::time::Instant;
 
 use super::*;
 use crate::hub::state::Replay;
-use crate::hub::tests::fake_daemon::{Daemon, hub_with, told};
+use crate::hub::tests::fake_daemon::{Daemon, hub_with};
 use crate::hub::tests::job;
+use crate::proto::{AttachEvent, DECLINE_EXIT_CODE, attach_event};
 use Failure::{Closed, Dropped, Refused, Retried, Unknown, Unspoken};
 
 /// The class of the first failure a daemon behaving as `daemon` gives:
@@ -87,6 +88,10 @@ const P: &str = "p";
 /// A run that never fails: the build waits.
 const WAITS: Option<(usize, &str)> = None;
 
+/// A run that reaches θ with a count, no fact (cut-over 10): it never
+/// fails, and its client, whose Nix builds the key, is declined.
+const DECLINES: Option<(usize, &str)> = Some((0, ""));
+
 /// A run that fails at attempt `n`, its error saying `says`.
 fn fails(n: usize, says: &str) -> Option<(usize, &str)> {
     Some((n, says))
@@ -99,8 +104,9 @@ fn n_of(class: Failure, request: &'static str, k: usize) -> Vec<Attempt> {
 
 /// A wait fails at the attempt that brings run(c, r) to θ(c), saying why:
 /// θ is 1 for a refusal, an unspeakable handshake, a close the journal
-/// says refused the hub's user; 2 for an unknown message; 3 for a drop the
-/// journal tells of as a crash. Else it waits, its clients told once. A
+/// says refused the hub's user. At 2 unknown messages, or 3 drops the
+/// journal tells of as crashes, counts and no fact, it declines its client
+/// whose Nix builds the key and waits on. Else it waits, its clients told once. A
 /// run is one class on one request in a row (an unexplained drop breaks
 /// it); a crash line counts once, and only once its attempt began.
 #[tokio::test(start_paused = true)]
@@ -130,8 +136,8 @@ async fn a_run_of_failures_comes_to_its_verdict() {
         (n_of(Refused, P, 1), fails(1, WHAT)),
         (n_of(Unspoken, CONNECT, 1), fails(1, "cannot speak")),
         (refusing(&me), fails(1, "allowed-users")),
-        (n_of(Unknown, P, 2), fails(2, "does not know")),
-        (crashes(&[P; 3]), fails(3, "crashes its worker every time")),
+        (n_of(Unknown, P, 2), DECLINES),
+        (crashes(&[P; 3]), DECLINES),
         ([n_of(Unknown, P, 1), n_of(Retried, P, 1)].concat(), WAITS),
         (crashes(&[P; 2]), WAITS),
         (n_of(Retried, P, 13), WAITS),
@@ -169,13 +175,26 @@ async fn a_run_of_failures_comes_to_its_verdict() {
                 break;
             }
         }
-        let told = told(&mut client).0.len();
+        tokio::task::yield_now().await;
+        let mut events = Vec::new();
+        while let Ok(Ok(AttachEvent { event: Some(e) })) = client.try_recv() {
+            events.push(e);
+        }
+        let declined = events.contains(&attach_event::Event::ExitCode(DECLINE_EXIT_CODE));
+        let note = |e: &attach_event::Event| match e {
+            attach_event::Event::Log(l) => {
+                String::from_utf8_lossy(l).contains("the hub's nix-daemon")
+            }
+            _ => false,
+        };
+        let told = events.iter().filter(|e| note(e)).count();
         match (verdict, failed) {
+            (DECLINES, None) => assert_eq!((told, declined), (1, true), "row {n}"),
             (Some((at, says)), Some((a, e))) => {
                 assert!(a == at && e.contains(says), "row {n}: failed at {a}: {e}");
-                assert_eq!(told, usize::from(at > 1), "row {n}");
+                assert_eq!((told, declined), (usize::from(at > 1), false), "row {n}");
             }
-            (None, None) => assert_eq!(told, 1, "row {n}"),
+            (None, None) => assert_eq!((told, declined), (1, false), "row {n}"),
             (_, failed) => panic!("row {n}: {failed:?}"),
         }
         let untold = j.replay.tell_waiting(Wait::Worker, "w\n".into()).await;

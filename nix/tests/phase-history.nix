@@ -3,7 +3,10 @@
 # VM, started by the test; three agents on two cores on either worker;
 # a build record of its own on the hub; and on the hub, builds that declare no system feature, each running
 # `secs` seconds: /etc/tt/hot.nix keeps both cores busy, /etc/tt/nap.nix
-# sleeps on none.
+# sleeps on none, and /etc/tt/src.nix sleeps too, reading `input` as
+# blob-deps' observations read a program: the output of a fixed-output
+# input derivation at the path of the bytes themselves (blob-deps'
+# per-file.nix), valid as evaluation copies them, so never built.
 {
   pkgs,
   lib,
@@ -24,6 +27,8 @@ in
     virtualisation.cores = 2;
     # a record of its own, so that the test sees the setting used
     services.tribuchet-hub.settings.placement.record = "/var/lib/tt-history/record.sqlite";
+    # the test reads the record's profile rows
+    environment.systemPackages = [ pkgs.sqlite ];
     environment.etc."tt/hot.nix".text = ''
       { name, secs }:
       derivation {
@@ -39,6 +44,34 @@ in
         inherit name;
         system = "x86_64-linux";
         builder = ${bash};
+        args = [ "-c" "''${${sleep}} ''${toString secs}; echo ok > $out" ];
+      }
+    '';
+    environment.etc."tt/src.nix".text = ''
+      { name, input, secs }:
+      let
+        sha256 = builtins.hashString "sha256" input;
+        bytes = builtins.path {
+          path = builtins.toFile "input" input;
+          name = "input";
+          recursive = false;
+          inherit sha256;
+        };
+        fixed = derivation {
+          name = "input";
+          system = "x86_64-linux";
+          builder = ${bash};
+          args = [ "-c" "cat ''${bytes} > $out" ];
+          outputHashMode = "flat";
+          outputHashAlgo = "sha256";
+          outputHash = sha256;
+        };
+      in
+      derivation {
+        inherit name;
+        system = "x86_64-linux";
+        builder = ${bash};
+        src = fixed;
         args = [ "-c" "''${${sleep}} ''${toString secs}; echo ok > $out" ];
       }
     '';

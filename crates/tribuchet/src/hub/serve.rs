@@ -17,9 +17,13 @@ use rustix::process::umask;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
 
+use super::admin::AdminSvc;
 use super::chunkcache::ChunkCache;
+use super::known::Known;
+use super::lost::Lost;
 use super::metrics;
 use super::record;
+use super::runs::Runs;
 use super::state::HubState;
 use super::submit::AttachSvc;
 use super::{PeerAuth, WorkerSvc};
@@ -27,7 +31,7 @@ use crate::config::{Auth, HubConfig, default_chunk_cache_dir, default_record};
 use crate::errors::{Result, chain, err_ctx, err_msg};
 use crate::fsutil::io_ctx;
 use crate::proto::worker_hub_server::WorkerHubServer;
-use crate::proto::{MAX_MSG_SIZE, attach_hub_server};
+use crate::proto::{MAX_MSG_SIZE, attach_hub_server, hub_admin_server};
 use crate::{chunkio, rt, sd};
 
 /// Bind the attach socket ourselves (no socket activation).
@@ -144,22 +148,31 @@ fn run_extending(cfg: HubConfig, period: Duration) -> Result<()> {
     rt.block_on(run_async(cfg, period))
 }
 
+/// The hub's state as `cfg` sets it, its nix.conf fragment listing the known
+/// workers before any connects (/run is emptied by a reboot). The run epoch,
+/// the known workers and the lost keys are kept beside the record at
+/// `record`: all are the hub's state.
+fn open_state(cfg: &HubConfig, chunks: Arc<ChunkCache>, record: &Path) -> HubState {
+    let grace = Duration::from_secs(cfg.worker_grace_secs);
+    let mut state = HubState::new(grace, cfg.nix_config.clone(), chunks);
+    state.runs = Runs::open(&record.with_file_name("run-epoch"));
+    state.known = Known::open(&record.with_file_name("known-workers"));
+    state.lost = Lost::open(&record.with_file_name("lost-keys"));
+    state.regen_nix_config();
+    state
+}
+
 async fn run_async(cfg: HubConfig, period: Duration) -> Result<()> {
     let socket = cfg.socket.as_path();
     let listen = cfg.listen.as_str();
     let config_dir = cfg.config_dir.as_path();
     let chunks = open_chunk_cache(&cfg)?;
 
-    let state = Arc::new(HubState::new(
-        Duration::from_secs(cfg.worker_grace_secs),
-        cfg.nix_config.clone(),
-        chunks,
-    ));
-
     // The record is folded into the history before the hub serves: a
     // migration of it may outlast the start timeout, so extend it while
     // it progresses.
     let path = cfg.placement.record.clone().unwrap_or_else(default_record);
+    let state = Arc::new(open_state(&cfg, chunks, &path));
     let opened = sd::extending_start(
         tokio::task::spawn_blocking(move || record::open(&path)),
         &record::PROGRESS,
@@ -189,21 +202,16 @@ async fn run_async(cfg: HubConfig, period: Duration) -> Result<()> {
         .await
         .map_err(err_ctx("binding worker listen address"))?,
     };
-    let mut builder = Server::builder();
+    let mut builder = chunkio::session_server();
     if let Some(tls) = tls {
         builder = builder.tls_config(tls)?;
     }
     let worker_server = builder
-        // Detect dead/half-open worker connections instead of relying on
-        // the workers' own traffic.
-        .http2_keepalive_interval(Some(Duration::from_secs(30)))
-        .http2_keepalive_timeout(Some(Duration::from_secs(20)))
-        .initial_stream_window_size(Some(chunkio::H2_STREAM_WINDOW))
-        .initial_connection_window_size(Some(chunkio::H2_CONNECTION_WINDOW))
         .add_service(
             WorkerHubServer::new(WorkerSvc {
                 state: state.clone(),
                 auth: Arc::new(peer_auth),
+                pending: Default::default(),
             })
             .max_decoding_message_size(MAX_MSG_SIZE)
             .max_encoding_message_size(MAX_MSG_SIZE),
@@ -233,6 +241,9 @@ async fn run_async(cfg: HubConfig, period: Duration) -> Result<()> {
             .max_decoding_message_size(MAX_MSG_SIZE)
             .max_encoding_message_size(MAX_MSG_SIZE),
         )
+        .add_service(hub_admin_server::HubAdminServer::new(AdminSvc {
+            state: state.clone(),
+        }))
         .serve_with_incoming(UnixListenerStream::new(uds));
 
     if let Some(metrics_addr) = cfg.metrics_listen.clone() {
@@ -290,6 +301,22 @@ mod tests {
 
     use super::*;
     use crate::config;
+    use crate::hub::tests::caps;
+
+    /// The hub opens its known workers as it starts, and lists their systems
+    /// in the nix.conf fragment before any of them connects.
+    #[tokio::test]
+    async fn a_starting_hub_lists_its_known_workers() {
+        let dir = tempfile::tempdir().unwrap();
+        let (record, path) = (dir.path().join("record"), dir.path().join("nix.conf"));
+        Known::open(&record.with_file_name("known-workers")).learn(&caps("w"));
+        let set = format!("[nix-config]\npath = {path:?}\nattach-program = '/a'");
+        let cfg: HubConfig = toml::from_str(&set).unwrap();
+        let chunks = Arc::new(ChunkCache::open(dir.path().join("chunks"), 1 << 20).unwrap());
+        let (_, rendered) = open_state(&cfg, chunks, &record).nix_config.unwrap();
+        let listed = rendered.borrow().clone();
+        assert!(listed.contains(r#""systems":["x86_64-linux"]"#), "{listed}");
+    }
 
     /// A hub, as `tribuchet hub` runs it but asking for more start time
     /// every 100 ms, on the config TT_HUB_CONFIG names: the child of the

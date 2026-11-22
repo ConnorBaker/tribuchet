@@ -39,7 +39,7 @@ fn speed_round_trip(
             };
             let mut p = state.placement.lock().unwrap();
             let s = p.sessions.get_mut(&session).unwrap();
-            s.committed.insert("in-flight".into(), busy);
+            s.committed.insert("in-flight".into(), in_flight(busy));
         }
         j.placed = placement::dispatch(&state, (session, worker), &j, false, &admission);
         hook(&state, n, (session, worker), &mut j, &mut usage);
@@ -104,7 +104,8 @@ fn the_last_dispatch_decides() {
                     };
                     let mut p = state.placement.lock().unwrap();
                     p.settled(to.0, &j.id);
-                    (p.sessions.get_mut(&to.0).unwrap().committed).insert("in-flight".into(), busy);
+                    (p.sessions.get_mut(&to.0).unwrap().committed)
+                        .insert("in-flight".into(), in_flight(busy));
                 }
                 j.placed = placement::dispatch(state, to, j, false, &admission);
                 state.placement.lock().unwrap().settled(to.0, "in-flight");
@@ -213,8 +214,11 @@ async fn wired(resumed: bool) -> [HashMap<String, (Vec<placement::Entry>, u32)>;
         let build_id = w.assignment().await.expect("not assigned").build_id;
         if resumed {
             let build_id = build_id.clone();
-            w.send(worker_message::Msg::Resumed(Resumed { build_id }))
-                .await;
+            let resumed = Resumed {
+                build_id,
+                ..Resumed::default()
+            };
+            w.send(worker_message::Msg::Resumed(resumed)).await;
         }
         tokio::time::sleep(Duration::from_millis(ms + 1)).await;
         let usage = BuildUsage {
@@ -338,7 +342,7 @@ fn quiet_counts_the_other_builds_alone() {
                 cores: others,
                 memory: 0.0,
             };
-            s.committed.insert("in-flight".into(), busy);
+            s.committed.insert("in-flight".into(), in_flight(busy));
         }
         let placed = placement::dispatch(&state, (1, "wa"), &j, false, &admission);
         assert_eq!(placed.quiet, want, "beside {others} cores");
@@ -348,4 +352,14 @@ fn quiet_counts_the_other_builds_alone() {
     state.placement.lock().unwrap().settled(1, "in-flight");
     let placed = placement::dispatch(&state, (1, "wa"), &j, true, &admission);
     assert!(!placed.quiet, "a resumed dispatch quiet");
+}
+
+/// A build in flight on a session, of demand `demand`.
+fn in_flight(demand: placement::Demand) -> placement::Placed {
+    placement::Placed {
+        demand,
+        owners: Vec::new(),
+        key: None,
+        ends: None,
+    }
 }

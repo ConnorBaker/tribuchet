@@ -22,6 +22,7 @@
 
 mod memory;
 mod policy;
+mod profile;
 mod sample;
 #[cfg(test)]
 mod tests;
@@ -36,10 +37,11 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::errors::chain;
+use crate::proto::{BuildProfile, Heartbeat};
 use crate::worker::resume::ResumeState;
 use policy::{Action, Policy};
 
-pub(crate) use sample::{cgroup_path, frozen_usec, subgroups};
+pub(crate) use sample::{frozen_usec, subgroups};
 
 const SAMPLE_EVERY: Duration = Duration::from_millis(200);
 /// Samples in the demand mean: one second.
@@ -73,6 +75,10 @@ struct Tracked {
     /// May be frozen: it has a handle, and no freeze of it went unreached.
     eligible: bool,
     samples: VecDeque<u32>,
+    /// Its run as sampled (profile.rs), and when it was last sampled with
+    /// its cgroup's frozen and CPU time then, in µs.
+    profile: profile::Profile,
+    last: (Instant, u64, u64),
     /// Asked to be frozen, and not thawed since.
     frozen: bool,
     /// When a freeze not yet reached was asked for.
@@ -80,6 +86,20 @@ struct Tracked {
 }
 
 impl Tracked {
+    /// Sample it at `at`, its cgroup's frozen and CPU time `frozen` and
+    /// `cpu` µs: the running and CPU time since the last sample, and
+    /// `runnable` (None while frozen) and `memory`.
+    fn sample(&mut self, at: Instant, frozen: u64, cpu: u64, runnable: Option<u32>, memory: u64) {
+        let (was, was_frozen, was_cpu) = self.last;
+        let elapsed =
+            u64::try_from(at.saturating_duration_since(was).as_micros()).unwrap_or(u64::MAX);
+        let running = elapsed.saturating_sub(frozen.saturating_sub(was_frozen));
+        let used = cpu.saturating_sub(was_cpu);
+        self.profile
+            .push(profile::Sample::new(running, used, runnable, memory));
+        self.last = (at.max(was), frozen.max(was_frozen), cpu.max(was_cpu));
+    }
+
     /// Write `state` ("1" freezes, "0" thaws) to its cgroup.freeze; false,
     /// said, if it cannot be.
     fn ask(&self, state: &str) -> bool {
@@ -124,6 +144,21 @@ impl Tracking {
             .and_then(|t| t.cgroup.clone());
         let us = cgroup.as_deref().and_then(frozen_usec).unwrap_or(0);
         Duration::from_micros(self.most_usec.fetch_max(us, Ordering::Relaxed).max(us))
+    }
+
+    /// The build's profile, for its usage report once it has exited: a
+    /// last sample takes it to now, so that its CPU times sum to its
+    /// cgroup's.
+    pub(super) fn profile(&self) -> Option<BuildProfile> {
+        let mut state = self.arbiter.lock();
+        let t = state.builds.get_mut(&self.key)?;
+        if let Some(cg) = t.cgroup.clone()
+            && let Some(cpu) = sample::cpu_usec(&cg)
+        {
+            let frozen = frozen_usec(&cg).unwrap_or(0);
+            t.sample(Instant::now(), frozen, cpu, None, 0);
+        }
+        t.profile.report()
     }
 }
 
@@ -218,6 +253,10 @@ impl Arbiter {
             freeze,
             order,
             samples: VecDeque::with_capacity(WINDOW),
+            profile: profile::Profile::default(),
+            // A cgroup counts from its creation: CPU time before the
+            // worker tracks the build lands in its first sample.
+            last: (Instant::now(), 0, 0),
             frozen: false,
             unreached: None,
         };
@@ -238,6 +277,24 @@ impl Arbiter {
         self.lock().builds.insert(key.to_owned(), t);
     }
 
+    /// The keys of the builds held frozen, and of their leader (running,
+    /// with one frozen), as the worker's heartbeat tells the hub.
+    pub(super) fn frozen_by(&self) -> Heartbeat {
+        let state = self.lock();
+        let frozen = state.builds.iter().filter(|(_, t)| t.frozen);
+        let frozen_keys: Vec<String> = frozen.map(|(k, _)| k.clone()).collect();
+        let running = |k: &&str| state.builds.get(*k).is_some_and(|t| !t.frozen);
+        let leader = state.policy.leader().filter(running);
+        let leader_key = leader
+            .filter(|_| !frozen_keys.is_empty())
+            .map(str::to_owned);
+        Heartbeat {
+            frozen_keys,
+            leader_key,
+            ..Heartbeat::default()
+        }
+    }
+
     /// One sample: read every build's demand without the lock, then decide
     /// and write each build's cgroup.freeze under it.
     fn tick(&self, now: Instant) {
@@ -255,16 +312,24 @@ impl Arbiter {
             .map(|(key, cg)| {
                 let held = memory::held(&cg, &self.memory);
                 let reached = sample::frozen_reached(&cg);
-                (key, sample::runnable_threads(&cg), held, reached)
+                let times = sample::cpu_usec(&cg).map(|cpu| (frozen_usec(&cg).unwrap_or(0), cpu));
+                (key, sample::runnable_threads(&cg), held, reached, times)
             })
             .collect();
         let mut state = self.lock();
         let State { builds, policy, .. } = &mut *state;
         let mut held = HashMap::new();
-        for (key, runnable, h, reached) in counts {
+        for (key, runnable, h, reached, times) in counts {
             let Some(t) = builds.get_mut(&key) else {
                 continue;
             };
+            // Frozen since the last sample (asked then), its runnable
+            // count is the freeze, not its demand; a build whose cgroup is
+            // gone has ended.
+            if let Some((frozen, cpu)) = times {
+                let current = h.as_ref().and_then(|h| h.current).unwrap_or(0);
+                t.sample(now, frozen, cpu, (!t.frozen).then_some(runnable), current);
+            }
             if t.samples.len() == WINDOW {
                 t.samples.pop_front();
             }

@@ -64,6 +64,8 @@ mod platform;
 #[cfg(target_os = "macos")]
 #[path = "agent/darwin.rs"]
 mod platform;
+#[cfg(target_os = "linux")]
+mod rpc;
 mod rusage;
 #[cfg(any(target_os = "macos", test))]
 mod sampler;
@@ -276,6 +278,7 @@ fn dispatch(
         call::Call::Finish(req) => handle_finish(agent, conn, &req),
         call::Call::Cleanup(req) => handle_cleanup(agent, conn, &req),
         call::Call::Shutdown(_) => Err(msg("shutdown handled in the accept loop")),
+        call::Call::Handoff(_) => Err(msg("a handoff is for the worker's handoff socket")),
     }
 }
 
@@ -293,7 +296,7 @@ fn handle_start(
     let log_w = fs::File::from(fds.next().ok_or_else(|| msg("missing log fd"))?);
     // The lock is held until the build is registered: a losing
     // concurrent Start gets Busy without ever spawning anything.
-    let (build_dir, exit, pid) = {
+    let (build_dir, exit, pid, rpc) = {
         let mut current = agent.current.lock().unwrap();
         if current.is_some() {
             return Ok(framing::send_error(conn, ERROR_BUSY)?);
@@ -315,6 +318,11 @@ fn handle_start(
         fs::create_dir(&scratch_root).map_err(io_ctx("creating", &scratch_root))?;
         platform::stage_tmp_dir(&agent.confinement, &scratch_root, &build_dir, tmp_pack)
             .map_err(err_ctx("staging the tmp dir"))?;
+        // A producer's socket, before its builder could connect (DD3).
+        let rpc = (req.rpc_socket.as_deref())
+            .map(|name| platform::rpc_listener(&agent.confinement, &build_dir, name))
+            .transpose()
+            .map_err(err_ctx("creating the producer's socket"))?;
 
         let (child, sandbox_root) =
             platform::spawn_builder(&agent.confinement, &req, &scratch_root, &build_dir, &log_w)?;
@@ -336,7 +344,7 @@ fn handle_start(
             outputs: req.outputs,
             exit: exit.clone(),
         });
-        (build_dir, exit, pid)
+        (build_dir, exit, pid, rpc)
     };
     tracing::info!(id = req.build_id, pid, "builder started");
     let freeze = platform::freeze_handle(&agent.confinement, &req.build_id, conn);
@@ -345,9 +353,14 @@ fn handle_start(
         reply::Reply::Start(StartReply {
             pid,
             scratch_dir: build_dir.to_string_lossy().into_owned(),
+            rpc_listener: rpc.is_some(),
         }),
-        &freeze.iter().map(AsRawFd::as_raw_fd).collect::<Vec<_>>(),
+        &(freeze.iter().map(AsRawFd::as_raw_fd))
+            .chain(rpc.as_ref().map(AsRawFd::as_raw_fd))
+            .collect::<Vec<_>>(),
     )?;
+    // The worker holds the listener now; the agent keeps no copy (DD10).
+    drop(rpc);
     notify_exit(conn, &exit)
 }
 

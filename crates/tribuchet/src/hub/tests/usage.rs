@@ -9,7 +9,7 @@ use rusqlite::types::Value;
 
 use super::rank::{declare, sized_worker};
 use super::*;
-use crate::proto::{BuildResult, BuildUsage};
+use crate::proto::{BuildProfile, BuildResult, BuildUsage, DECLINE_EXIT_CODE};
 
 #[path = "usage/speed.rs"]
 mod speed;
@@ -46,19 +46,47 @@ async fn the_usage_line_names_the_worker_and_the_output_path() {
     assert!(line.contains(&format!(r#"out_path="{OUT}""#)), "{line}");
 }
 
-/// What a build's run used is learned, here an OOM-killed run's peak: the
-/// next build of its pname, submitted as the attach program does, is
-/// dispatched expecting it, where the first had only the prior. A failed
-/// run that was not OOM-killed teaches nothing: the next build of its
-/// pname takes its prefix's, `tt`.
+/// A builder that exits with the decline code on a worker failed: its
+/// client gets another failure, not a decline its Nix would then build
+/// itself, a fixed-output one in its host's network.
 #[tokio::test]
-async fn a_run_teaches_the_next_dispatch_of_its_pname() {
+async fn a_builder_exiting_with_the_decline_code_is_not_a_decline() {
+    let state = Arc::new(HubState::for_test(Duration::from_secs(30)));
+    let replay = Arc::new(Replay::default());
+    let mut client = replay.subscribe().await;
+    state.queue.lock().await.push_back(job(0, replay));
+    let mut w = connect(&state, "w1", 1, &[]);
+    w.to_hub.send(request_job(1, Some(0))).await.unwrap();
+    let build_id = w.assignment().await.expect("not assigned").build_id;
+    let result = BuildResult {
+        build_id,
+        exit_code: DECLINE_EXIT_CODE,
+        ..Default::default()
+    };
+    w.send(worker_message::Msg::Result(result)).await;
+    let mut codes = Vec::new();
+    while let Some(Ok(ev)) = client.recv().await {
+        if let Some(attach_event::Event::ExitCode(c)) = ev.event {
+            codes.push(c);
+        }
+    }
+    assert_eq!(codes, [1]);
+}
+
+/// What a build's run used is learned, here an OOM-killed run's peak: the
+/// next build of its stem, submitted as the attach program does, is
+/// dispatched expecting it, where the first had only the prior. A failed
+/// run that was not OOM-killed teaches its key too, as a lower bound: the
+/// next build of its stem expects its peak from its key, not its
+/// prefix's guess (`tt`).
+#[tokio::test]
+async fn a_run_teaches_the_next_dispatch_of_its_stem() {
     let log = Captured;
     let _guard = log.install();
     let state = Arc::new(HubState::for_test(Duration::from_secs(30)));
     let mut w = connect(&state, "w1", 1, &[]);
     for n in 0..4u64 {
-        let (pname, oom_killed) = if n < 2 {
+        let (stem, oom_killed) = if n < 2 {
             ("learn", true)
         } else {
             ("fail", false)
@@ -66,7 +94,7 @@ async fn a_run_teaches_the_next_dispatch_of_its_pname() {
         let req = BuildRequest {
             system: "x86_64-linux".into(),
             builder: format!("/nix/store/{H}-bash/bin/bash"),
-            outputs: [("out".to_owned(), format!("/nix/store/{H}-tt-{pname}-{n}.0"))].into(),
+            outputs: [("out".to_owned(), format!("/nix/store/{H}-tt-{stem}-{n}.0"))].into(),
             tmp_dir_in_sandbox: "/build".into(),
             store_dir: "/nix/store".into(),
             ..Default::default()
@@ -98,7 +126,9 @@ async fn a_run_teaches_the_next_dispatch_of_its_pname() {
         assert!(second.contains(field), "{field} missing from {second}");
     }
     let failed = log.line(r#"drv="tt-fail-3.0" resumed"#);
-    assert!(failed.contains(r#"learned="prefix""#), "{failed}");
+    for field in [r#"learned="key""#, "expect_mem=5368709120"] {
+        assert!(failed.contains(field), "{field} missing from {failed}");
+    }
 }
 
 /// A build that ran and the usage it reported, to learn from.
@@ -153,19 +183,20 @@ fn learning_survives_a_restart() {
     let path = dir.path().join("state/tribuchet/record.sqlite");
     let state = HubState::for_test(Duration::from_secs(30));
     let writer = open_record(&state, &path);
-    let (j, usage) = learned_build();
+    let (mut j, usage) = learned_build();
+    j.sources = Some("s".to_owned());
     learn(&state, &j, 0, &usage);
     record::close(&state, writer);
     let restarted = HubState::for_test(Duration::from_secs(30));
     let _writer = open_record(&restarted, &path);
     let after = expected(&restarted, &j);
-    assert_eq!(after, ("key", 5 << 30), "after a restart");
+    assert_eq!(after, ("source", 5 << 30), "after a restart");
 }
 
 /// The history a hub learned is the fold of the record it wrote, in the
 /// order learned, over runs that teach (successes, an OOM kill), one
-/// that does not (a failure), pnames sharing a prefix, and more runs of
-/// a key than its window.
+/// that does not (a failure), stems sharing a prefix, more runs of a key
+/// than its window, and runs of two sources and of none.
 #[test]
 fn the_history_is_the_fold_of_the_record() {
     let dir = tempfile::tempdir().unwrap();
@@ -174,7 +205,8 @@ fn the_history_is_the_fold_of_the_record() {
     let writer = open_record(&state, &path);
     for n in 0..30u64 {
         let name = ["tt-a", "tt-b-c", "tt-b-d"][usize::try_from(n % 3).unwrap()];
-        let (j, mut usage) = run_of(&format!("{name}-{n}.0"), n + 1);
+        let (mut j, mut usage) = run_of(&format!("{name}-{n}.0"), n + 1);
+        j.sources = (n % 4 != 0).then(|| format!("s{}", n % 2));
         usage.oom_killed = n == 4;
         // Received in an order its times do not follow: the fold's is
         // the rows' (rowid), the order learned.
@@ -221,6 +253,12 @@ async fn a_build_appends_a_dispatch_and_a_result_row() {
         peak_memory_bytes: 7,
         oom_killed: true,
         frozen_ms: 500,
+        profile: Some(BuildProfile {
+            running_usec: vec![400_000, 61_000],
+            cpu_usec: vec![400_000, 1_921_500],
+            runnable_milli: vec![1000, 31_500],
+            memory_bytes: vec![1 << 30, 7],
+        }),
     };
     let result = BuildResult {
         build_id: build_id.clone(),
@@ -269,8 +307,29 @@ async fn a_build_appends_a_dispatch_and_a_result_row() {
         dispatch,
         [format!("Text({build_id:?})"), r#"Text("k0")"#.to_owned()]
     );
-    let rows = text("SELECT (SELECT count(*) FROM result), (SELECT count(*) FROM dispatch)");
-    assert_eq!(rows, ["Integer(1)", "Integer(1)"], "one row each");
+    let rows = text(
+        "SELECT (SELECT count(*) FROM result), (SELECT count(*) FROM dispatch), \
+         (SELECT count(*) FROM profile)",
+    );
+    assert_eq!(
+        rows,
+        ["Integer(1)", "Integer(1)", "Integer(1)"],
+        "one row each"
+    );
+    // Its profile, by the result row's id and at_ms.
+    let profile = text(
+        "SELECT p.id, p.running_usec, p.cpu_usec, p.runnable, p.memory, p.at_ms = r.at_ms \
+         FROM profile p JOIN result r ON r.id = p.id",
+    );
+    let want = [
+        format!("Text({build_id:?})"),
+        r#"Text("[400000,61000]")"#.to_owned(),
+        r#"Text("[400000,1921500]")"#.to_owned(),
+        r#"Text("[1000,31500]")"#.to_owned(),
+        r#"Text("[1073741824,7]")"#.to_owned(),
+        "Integer(1)".to_owned(),
+    ];
+    assert_eq!(profile, want);
     for table in ["result", "dispatch"] {
         let at = text(&format!("SELECT at_ms FROM {table}"));
         let at: i64 = at[0]
@@ -382,4 +441,31 @@ async fn the_dispatch_row_holds_the_dispatch_lines_values() {
     }
     assert_eq!(compared, 19, "columns compared");
     drop(workers);
+}
+
+/// The history a hub learned from runs that did not succeed is the fold
+/// of its record too: their bound is what history expected when it
+/// learned them, not what the build was expected to use when queued.
+#[test]
+fn history_after_a_failed_run_equals_its_fold() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record.sqlite");
+    let state = HubState::for_test(Duration::from_secs(30));
+    let writer = open_record(&state, &path);
+    // Queued expecting 3 GiB; history expects 4 when its runs end.
+    let (mut queued, _) = run_of("tt-x-1.0", 1);
+    queued.expected.demand.memory = f64::from(3u32 << 30);
+    let (ok, ok_usage) = run_of("tt-x-1.0", 4);
+    learn(&state, &ok, 0, &ok_usage);
+    let (_, mut killed) = run_of("tt-x-1.0", 2);
+    killed.oom_killed = true;
+    for (exit_code, usage) in [(1, run_of("tt-x-1.0", 1).1), (0, killed)] {
+        learn(&state, &queued, exit_code, &usage);
+    }
+    let learned = state.placement.lock().unwrap().history.entries();
+    record::close(&state, writer);
+    let restarted = HubState::for_test(Duration::from_secs(30));
+    let _writer = open_record(&restarted, &path);
+    let folded = restarted.placement.lock().unwrap().history.entries();
+    assert_eq!(folded, learned);
 }

@@ -10,6 +10,8 @@
   # long serial run, and only nspawn seeds the ~900 MB container closure
   # into the VM stores.
   phase,
+  # The dyndrv phase's Nix (flake.nix).
+  nixDyndrv ? null,
 }:
 {
   pkgs,
@@ -27,19 +29,28 @@ let
     let
       f = ./tests + "/phase-${phase}.nix";
     in
-    if builtins.pathExists f then import f { inherit pkgs lib tribuchet; } else { };
-  # one agent socket per agent: per core with agents = "auto"
-  agents =
-    let
-      w = nodes.worker;
-    in
-    if w.services.tribuchet-worker.agents == "auto" then
-      w.virtualisation.cores
+    if builtins.pathExists f then
+      import f {
+        inherit
+          pkgs
+          lib
+          tribuchet
+          nixDyndrv
+          ;
+      }
     else
-      w.services.tribuchet-worker.agents;
+      { };
+  # one agent socket per agent: per core and a spare with agents = "auto",
+  # whose worker takes one build per core
+  inherit (nodes.worker.virtualisation) cores;
+  auto = nodes.worker.services.tribuchet-worker.agents == "auto";
+  agents = if auto then cores + 1 else nodes.worker.services.tribuchet-worker.agents;
   # evaluated here so the container closure can be pre-seeded into both
   # VM stores; the hub re-evaluates the same expression at test time
   nspawn = import ./nspawn-container.nix { nixpkgs = pkgs.path; };
+  syscallProbe = pkgs.runCommandCC "tt-syscall-probe" { } ''
+    $CC -Wall -Werror -o $out ${./tests/syscalls.c}
+  '';
   # the container closure and the stdenvNoCC that builds it stay out
   # of the other phases' VM stores
   nspawnPaths = lib.optionals (phase == "nspawn") [
@@ -75,6 +86,15 @@ in
   defaults.services.openssh.settings.LogLevel = "ERROR";
   defaults.services.journald.settings.Journal.MaxLevelConsole = lib.mkForce "notice";
   defaults.boot.kernelParams = [ "loglevel=4" ];
+  # on both nodes: the worker's own nix-daemon builds the stock reference
+  defaults.environment.etc."tt/syscalls.nix".text = ''
+    { variant }:
+    import ${./tests/syscalls.nix} {
+      bash = "${pkgs.bash}";
+      probe = "${syscallProbe}";
+      inherit variant;
+    }
+  '';
   defaults.systemd.services =
     lib.genAttrs [ "tribuchet-hub" "tribuchet-worker" "nix-daemon" "tribuchet-agent@" ]
       (_: {
@@ -84,6 +104,7 @@ in
   nodes = {
     hub =
       {
+        config,
         pkgs,
         nodes,
         ...
@@ -204,6 +225,9 @@ in
         environment.etc."tt/memhog.nix".text = ''
           import ${./tests/memhog.nix} { bash = "${pkgs.bash}"; }
         '';
+        environment.etc."tt/oomscore.nix".text = ''
+          import ${./tests/oomscore.nix} { bash = "${pkgs.bash}"; }
+        '';
         environment.etc."tt/drain.nix".text = ''
           import ${./tests/drain.nix} { bash = "${pkgs.bash}"; }
         '';
@@ -247,8 +271,12 @@ in
         ];
         services.tribuchet-hub = {
           enable = true;
-          # keep the no-worker decline quick for the fallback subtest
-          settings.worker-grace-secs = 2;
+          settings = {
+            # keep the no-worker decline quick for the fallback subtest
+            worker-grace-secs = 2;
+            # the workers' max-jobs as the hub has them, at /workers
+            metrics-listen = "127.0.0.1:9437";
+          };
           externalBuilders = {
             enable = true;
             systems = [
@@ -261,6 +289,23 @@ in
         # started by the test script once certificates exist
         systemd.sockets.tribuchet-hub.wantedBy = lib.mkForce [ ];
         systemd.services.tribuchet-hub.wantedBy = lib.mkForce [ ];
+        # The module's attach, but keeping a copy of each build.json, so
+        # that the e2e tests read Nix's own canBuildLocally.
+        nix.settings.external-builders = lib.mkForce (
+          builtins.toJSON [
+            {
+              systems = config.services.tribuchet-hub.externalBuilders.systems;
+              program = pkgs.writeShellScript "tt-attach" ''
+                set -e
+                cp "$1" "$(mktemp /var/lib/tt-buildjson/XXXXXX)"
+                exec ${lib.getExe' tribuchet "tribuchet"} attach "$1" \
+                  --socket ${config.services.tribuchet-hub.socketPath}
+              '';
+              args = [ ];
+            }
+          ]
+        );
+        systemd.tmpfiles.rules = [ "d /var/lib/tt-buildjson 1777 root root -" ];
       };
 
     worker =
@@ -314,6 +359,9 @@ in
         # other nodes get for it, at normal priority.
         networking.interfaces.eth1.ipv6.addresses = lib.mkForce [ ];
         networking.primaryIPv6Address = lib.mkForce "";
+        # The stock reference of build_syscalls: Nix since 2.35, as the
+        # farm runs, also answers the *listxattr calls ENOTSUP.
+        nix.package = pkgs.nixVersions.latest;
         # Private store image instead of the shared host store, so input
         # paths the worker lacks really travel over the wire.
         virtualisation.useNixStoreImage = true;
@@ -323,7 +371,7 @@ in
         # the memhog subtest relies on a plain memcg OOM kill
         boot.kernel.sysctl."vm.panic_on_oom" = lib.mkForce 0;
         virtualisation.diskSize = 4096;
-        # agents = "auto": one agent per core
+        # agents = "auto": one build per core, and an agent more
         virtualisation.cores = 2;
         virtualisation.additionalPaths = nspawnPaths;
 
@@ -339,7 +387,6 @@ in
             hub = "https://hub:7437";
             cert = "/etc/tribuchet/tls/worker.crt";
             ca-cert = "/etc/tribuchet/tls/ca.crt";
-            max-jobs = 2;
             max-log-size = 1048576;
             # 2 GiB, exceeded only by the memhog subtest
             build-memory-max-bytes = 2147483648;
@@ -388,19 +435,32 @@ in
     with subtest("worker registers at hub over mTLS"):
         hub.succeed("systemctl start tribuchet-hub.socket")
         hub.succeed("systemctl start tribuchet-hub")
+        # the hub process itself runs with the agents' descriptor limit,
+        # soft and hard, not the systemd default soft limit of 1024
+        hub.succeed(
+            "grep -E '^Max open files +1048576 +1048576 ' /proc/$(systemctl show -P MainPID tribuchet-hub)/limits"
+        )
         worker.succeed("systemctl start tribuchet-worker")
-        # agents = "auto": the generator made one agent socket per core
+        # agents = "auto": the generator made one agent socket per core and
+        # a spare, and the hub has the worker's max-jobs, one per core
         worker.succeed(
-            "systemctl is-active tribuchet-agent@1.socket tribuchet-agent@${toString agents}.socket"
+            # one unit per call: with several, is-active succeeds if any is
+            "systemctl is-active tribuchet-agent@1.socket && systemctl is-active tribuchet-agent@${toString agents}.socket"
         )
         worker.fail("systemctl is-active tribuchet-agent@${toString (agents + 1)}.socket")
         hub.wait_until_succeeds(
             "journalctl -u tribuchet-hub | grep -q 'worker registered'"
         )
+        ${lib.optionalString auto ''hub.wait_until_succeeds("printf 'GET /workers HTTP/1.0\\r\\n\\r\\n' | socat - TCP:127.0.0.1:9437 | grep -q '\"max_jobs\": ${toString cores},'", timeout=60)''}
         # The startup sweep activates every agent. Idle ones exit again so
         # they do not pin the binary they were started with.
         worker.wait_until_succeeds(
             "test $(systemctl list-units --state=active --no-legend 'tribuchet-agent@*.service' | wc -l) = 0",
+            timeout=30,
+        )
+        # agent 1's state dir: its own, traverse-only for the worker and the uid block
+        worker.wait_until_succeeds(
+            "test \"$(stat -c '%a %U %G' /var/lib/tribuchet/a1)\" = '711 tribuchet-agent-1 tribuchet-agent-1'",
             timeout=30,
         )
 

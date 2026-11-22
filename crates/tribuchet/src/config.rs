@@ -8,7 +8,6 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::io;
-use std::num::NonZeroU64;
 use std::path::{Path, PathBuf};
 use std::thread;
 
@@ -90,10 +89,10 @@ pub struct HubConfig {
     /// register as a worker (auth = tailscale).
     #[serde(default)]
     pub tailscale_allowed_tags: Vec<String>,
-    /// When set, the hub rewrites a nix.conf fragment (the
-    /// external-builders and max-jobs settings) whenever the
-    /// connected-worker set changes, so a local nix-daemon offloads to
-    /// whatever systems are available right now.
+    /// When set, the hub writes a nix.conf fragment: external-builders
+    /// over the systems its known workers serve, so a local nix-daemon
+    /// hands it their builds even while those workers are away, and
+    /// max-jobs from the capacity of those connected.
     #[serde(default)]
     pub nix_config: Option<NixConfig>,
     /// Disk budget for the staging chunk cache.
@@ -214,10 +213,10 @@ pub struct WorkerConfig {
     pub key: PathBuf,
     /// Kill builds running longer than this many seconds, counted from
     /// when a build agent starts the build: waiting for a free agent
-    /// does not count, nor does time frozen by the CPU arbiter. 0 is
-    /// refused at load, not taken as none.
-    #[serde(default = "default_build_timeout")]
-    pub build_timeout_secs: NonZeroU64,
+    /// does not count, nor does time frozen by the CPU arbiter; 0, the
+    /// default, sets none (a client's own timeout still applies).
+    #[serde(default)]
+    pub build_timeout_secs: u64,
     /// Kill builds producing no log output for this many seconds
     /// (Nix's max-silent-time), not counting time frozen by the CPU
     /// arbiter; 0 disables.
@@ -278,6 +277,15 @@ pub struct WorkerConfig {
     #[serde(default)]
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub agent_uid_base: Option<u32>,
+    /// Where to serve dynamic-derivation producers' listeners to attach
+    /// on this host (worker/handoff.rs). Only the worker beside the hub
+    /// sets it; it alone then advertises builder-rpc-v0.
+    #[serde(default)]
+    pub handoff_socket: Option<PathBuf>,
+    /// The group that socket is given to: the build users', which attach
+    /// runs as. Unset, the worker's own.
+    #[serde(default)]
+    pub handoff_gid: Option<u32>,
 }
 
 impl WorkerConfig {
@@ -309,9 +317,6 @@ fn default_cert() -> PathBuf {
 fn default_key() -> PathBuf {
     "/var/lib/tribuchet/tls/worker.key".into()
 }
-fn default_build_timeout() -> NonZeroU64 {
-    NonZeroU64::new(24 * 3600).unwrap()
-}
 fn default_import_jobs() -> u32 {
     4
 }
@@ -323,6 +328,11 @@ fn default_max_jobs() -> u32 {
         .ok()
         .and_then(|n| u32::try_from(n.get()).ok())
         .unwrap_or(1)
+}
+/// The agents of "auto": one per build of the default max-jobs, and a
+/// spare, which takes the slot of a build frozen holding its own agent.
+pub(crate) fn auto_agents() -> usize {
+    usize::try_from(default_max_jobs()).map_or(usize::MAX, |n| n + 1)
 }
 #[cfg(test)]
 mod tests;

@@ -11,7 +11,7 @@
         (types.enum "auto" [ "auto" ])
       ];
       default = "auto";
-      description = "Build agent count, or \"auto\" for one per CPU, decided on the machine.";
+      description = "Build agent count, or \"auto\" for one per CPU and a spare, decided on the machine.";
     };
     agentUidBase = {
       type = types.int;
@@ -49,9 +49,7 @@
     in
     {
       inherit (units) generators;
-      sockets."agent@" = units.agentSocketConfig // {
-        instances = units.agentInstances;
-      };
+      sockets."agent@" = units.agentSocketConfig;
       services."agent@" = units.agentServiceConfig;
       services.${name} = units.workerServiceConfig;
 

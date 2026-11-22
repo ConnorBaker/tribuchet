@@ -6,17 +6,15 @@ use hyper_util::rt::TokioIo;
 use tonic::transport::{Endpoint, Server, Uri};
 use tower::service_fn;
 
-use chunkcache::ChunkCache;
+use crate::testlog::Captured;
 use state::{FLOOR, Replay};
 use submit::AttachSvc;
-use testlog::Captured;
 
-use crate::chunkstore::{Hash, io_hook};
 use crate::config::NixConfig;
 use crate::proto::attach_hub_client::AttachHubClient;
 use crate::proto::{
-    AttachEvent, BuildAssignment, BuildMessage, BuildRequest, Heartbeat, SystemCaps, TmpDirChunk,
-    attach_hub_server, build_message,
+    AttachEvent, BuildAssignment, BuildMessage, BuildRequest, Heartbeat, Need, Resumed, SystemCaps,
+    TmpDirChunk, attach_hub_server, build_message,
 };
 
 mod attempts;
@@ -24,9 +22,15 @@ mod clientless;
 mod clientless_chain;
 mod clientless_farm;
 mod daemon;
+mod diverge;
 pub(super) mod fake_daemon;
+mod isolation;
+mod order;
 mod rank;
 mod reconnect;
+mod share;
+pub(crate) mod slow_link;
+use slow_link::spawn_session;
 mod unlisted;
 mod usage;
 
@@ -85,26 +89,6 @@ pub(super) async fn try_submit(
         .map(tonic::Response::into_inner)
 }
 
-/// `n` chunks of 16 KiB, admitted to `cache` off the runtime as an
-/// output's: its recipe and their frames.
-pub(super) fn cached_output(cache: &ChunkCache, n: u8) -> (Vec<(Hash, usize)>, Vec<Vec<u8>>) {
-    io_hook::off_runtime(|| {
-        (0..n)
-            .map(|i| {
-                let mut raw = vec![0u8; 16 * 1024];
-                blake3::Hasher::new()
-                    .update(&[i])
-                    .finalize_xof()
-                    .fill(&mut raw);
-                let hash = *blake3::hash(&raw).as_bytes();
-                let frame = zstd::bulk::compress(&raw, 3).unwrap();
-                cache.admit(hash, &frame).unwrap();
-                ((hash, raw.len()), frame)
-            })
-            .unzip()
-    })
-}
-
 /// Heartbeats on `to_hub` every minute, as a worker sends them every
 /// 30 s. Without them the hub ends the session at WORKER_SILENCE_TIMEOUT,
 /// which long waits outlast, and a build whose session died is requeued.
@@ -125,12 +109,12 @@ async fn heartbeat_updates_the_advertised_capacity() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("nix.conf");
     let mut state = HubState::for_test(Duration::ZERO);
-    state.nix_config = Some(NixConfig {
+    state.nix_config = Some(HubState::nix_config_writer(NixConfig {
         path: path.clone(),
         attach_program: "/attach".into(),
         oversubscribe_percent: 100,
         max_jobs_cap: 256,
-    });
+    }));
     let state = Arc::new(state);
     let caps = WorkerCaps {
         name: "w".into(),
@@ -138,7 +122,18 @@ async fn heartbeat_updates_the_advertised_capacity() {
         systems: HashMap::new(),
         max_jobs: 2,
     };
+    // Written on a blocking thread: the registration's rendering, then,
+    // once the heartbeat is routed, its own.
+    let conf = || fs::read_to_string(&path).unwrap_or_default();
+    let written = async |jobs: u32| {
+        let line = format!("max-jobs = {jobs}\n");
+        for _ in (0..1000).take_while(|_| !conf().contains(&line)) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        conf().contains(&line)
+    };
     let guard = CapsGuard::new(state.clone(), caps);
+    assert!(written(2).await, "{}", conf());
     let id = guard.id;
     let (tx, rx) = mpsc::channel(4);
     tx.send(heartbeat(Some(3))).await.unwrap();
@@ -148,15 +143,10 @@ async fn heartbeat_updates_the_advertised_capacity() {
     route_loop(rx, Router::default(), admission, state.clone(), id).await;
     let jobs = state.worker_caps.lock().unwrap()[&id].max_jobs;
     assert_eq!(jobs, 3);
-    // Written on a blocking thread, after the heartbeat is routed.
-    let conf = || fs::read_to_string(&path).unwrap_or_default();
-    for _ in (0..1000).take_while(|_| !conf().contains("max-jobs = 3\n")) {
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
-    assert!(conf().contains("max-jobs = 3\n"), "{}", conf());
+    assert!(written(3).await, "{}", conf());
 }
 
-fn caps(name: &str) -> WorkerCaps {
+pub(super) fn caps(name: &str) -> WorkerCaps {
     WorkerCaps {
         name: name.into(),
         connected_at: Instant::now(),
@@ -166,13 +156,10 @@ fn caps(name: &str) -> WorkerCaps {
 }
 
 /// A worker session as worker_loop registers it.
-fn register(state: &Arc<HubState>, name: &str, held: &[&str]) -> CapsGuard {
+pub(super) fn register(state: &Arc<HubState>, name: &str, held: &[&str]) -> CapsGuard {
     let guard = CapsGuard::new(state.clone(), caps(name));
-    state.hold(
-        guard.id,
-        held.iter().map(|k| (*k).to_owned()).collect(),
-        false,
-    );
+    let held: Vec<String> = held.iter().map(|k| (*k).to_owned()).collect();
+    state.hold(guard.id, &held, false);
     guard
 }
 
@@ -189,11 +176,13 @@ pub(super) fn job(n: usize, replay: Arc<Replay>) -> Job {
         replay,
         listing: Arc::default(),
         attempts: 0,
-        resumed_losses: 0,
+        transport_losses: 0,
         queued_at: Instant::now(),
         loss: None,
         deferred: None,
         expected: placement::Expected::prior(false),
+        expected_at: None,
+        sources: None,
         placed: Default::default(),
     }
 }
@@ -205,19 +194,18 @@ async fn lose_session(
     state: &Arc<HubState>,
     job: Job,
     worker: CapsGuard,
-    said: Option<worker_message::Msg>,
+    said: impl IntoIterator<Item = worker_message::Msg>,
 ) {
     let router = Router::default();
     let in_rx = router.register(&job.id);
-    if let Some(m) = said {
-        let tx = router.builds.lock().unwrap()[&job.id].clone();
-        tx.send(m).await.unwrap();
+    for m in said {
+        router.route(m).await;
     }
     let (out_tx, _out_rx) = mpsc::channel(64);
     let session = (worker.id, worker.caps.name.clone());
     router.close_all();
     drop(worker);
-    let sess = Arc::new(WorkerSession::new("w".into()));
+    let sess = Arc::new(WorkerSession::new("w".into(), out_tx.clone()));
     let admission = Arc::new(Mutex::new(Admission::default()));
     supervise_job(
         state.clone(),
@@ -230,6 +218,16 @@ async fn lose_session(
         admission,
     )
     .await;
+}
+
+/// The worker says it holds a run of build `build_id`, `finished` or not.
+fn resumed(build_id: &str, finished: bool) -> worker_message::Msg {
+    let build_id = build_id.into();
+    worker_message::Msg::Resumed(Resumed {
+        build_id,
+        finished,
+        run: None,
+    })
 }
 
 #[tokio::test]
@@ -281,7 +279,7 @@ async fn build_is_released_when_its_worker_returns_without_it() {
 /// No worker returns and none other serves the system: the build is
 /// held, not failed, and its client is told it waits. A capable
 /// worker that registers later gets it.
-#[tokio::test]
+#[tokio::test(start_paused = true)]
 async fn client_waits_when_no_worker_returns() {
     let mut state = Arc::new(HubState::for_test(Duration::from_millis(200)));
     Arc::get_mut(&mut state).unwrap().started_at =
@@ -289,7 +287,7 @@ async fn client_waits_when_no_worker_returns() {
     let replay = Arc::new(Replay::default());
     let mut client = replay.subscribe().await;
     let worker = register(&state, "w1", &[]);
-    let lost = Instant::now();
+    let lost = tokio::time::Instant::now();
     lose_session(&state, job(1, replay), worker, None).await;
     let told = tokio::time::timeout(Duration::from_secs(5), async {
         while let Some(Ok(AttachEvent { event: Some(e) })) = client.recv().await {
@@ -356,7 +354,7 @@ pub(super) fn connect(state: &Arc<HubState>, name: &str, slots: u32, held: &[&st
     };
     let (out_tx, from_hub) = mpsc::channel(256);
     let (to_hub, in_rx) = mpsc::channel(64);
-    let hub = tokio::spawn(worker_loop(state.clone(), register, out_tx, in_rx));
+    let hub = spawn_session(state.clone(), register, out_tx, in_rx);
     Worker {
         to_hub,
         from_hub,
@@ -592,7 +590,7 @@ async fn a_worker_advertising_recursive_nix_gets_no_build_requiring_it() {
     };
     let (out_tx, mut from_hub) = mpsc::channel(256);
     let (to_hub, in_rx) = mpsc::channel(64);
-    let hub = tokio::spawn(worker_loop(state.clone(), register, out_tx, in_rx));
+    let hub = spawn_session(state.clone(), register, out_tx, in_rx);
     to_hub.send(request_job(2, Some(0))).await.unwrap();
     let sent = assignments(&mut from_hub, QUIET).await;
     hub.abort();

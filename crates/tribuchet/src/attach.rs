@@ -6,9 +6,11 @@
 //! performs self-reference rewriting and registration afterwards).
 //! Exits with the builder's exit code.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fs;
+use std::future;
 use std::io::{self, Write};
+use std::ops::ControlFlow;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::Once;
@@ -25,16 +27,21 @@ use crate::chunkio;
 use crate::errors::{Error, Result, chain, err_ctx, err_msg};
 use crate::nar;
 use crate::proto::{
-    BuildMessage, BuildRequest, DECLINE_EXIT_CODE, MAX_MSG_SIZE, OutputNar, TmpDirChunk,
-    attach_event, attach_hub_client::AttachHubClient, build_message,
+    BuildMessage, BuildRequest, DECLINE_EXIT_CODE, MAX_MSG_SIZE, OutputNar, RelayStarted,
+    TmpDirChunk, attach_event, attach_hub_client::AttachHubClient, build_message, producer,
 };
 use crate::rt;
 use crate::tmpdir;
 
-pub fn run(build_json: &Path, socket: &Path) -> Result<()> {
+#[path = "attach/client.rs"]
+mod client;
+use client::daemon_connection;
+
+pub fn run(build_json: &Path, socket: &Path, handoff: Option<&Path>) -> Result<()> {
     let build = BuildJson::load(build_json)?;
     let rt = rt::runtime("trib-attach").map_err(err_ctx("creating the tokio runtime"))?;
-    let code = rt.block_on(run_async(build, socket.to_owned()))?;
+    let handoff = handoff.map(Path::to_owned);
+    let code = rt.block_on(run_async(build, socket.to_owned(), handoff))?;
     // Unix exposes only the low 8 bits of the exit status; never let a
     // nonzero code collapse to an observed 0.
     process::exit(if code != 0 && code.trailing_zeros() >= 8 {
@@ -50,7 +57,14 @@ pub fn run(build_json: &Path, socket: &Path) -> Result<()> {
 const RECONNECT_ATTEMPTS: u32 = 30;
 const RECONNECT_DELAY: Duration = Duration::from_secs(2);
 
-async fn run_async(build: BuildJson, socket: PathBuf) -> Result<i32> {
+/// What attach says of a producer whose client's Nix cannot build it
+/// itself (OQ1, decided (c)): a lost run of it, once it reached the
+/// client, could only fail; so it never starts.
+pub(crate) const PRODUCER_REFUSED: &str = "tribuchet refuses a dynamic-derivation producer \
+    (builder-rpc-v0) that this Nix cannot build itself (build.json canBuildLocally: false): \
+    once its run reached this Nix, a lost run could only fail the build";
+
+async fn run_async(build: BuildJson, socket: PathBuf, handoff: Option<PathBuf>) -> Result<i32> {
     if build
         .real_store_dir
         .as_deref()
@@ -59,43 +73,45 @@ async fn run_async(build: BuildJson, socket: PathBuf) -> Result<i32> {
         tracing::info!("diverted store; declining so Nix builds locally");
         return Ok(DECLINE_EXIT_CODE);
     }
-    let attrs = build.attrs();
-    let fixed_output = build.network_allowed(attrs.as_ref());
-    let required_features = required_system_features(&build.env, attrs.as_ref());
-    let local_networking = flag(&build.env, attrs.as_ref(), "__darwinAllowLocalNetworking");
-    tracing::info!(fixed_output, system = %build.system, "submitting build");
-    let req = BuildRequest {
-        system: build.system,
-        builder: build.builder,
-        args: build.args,
-        env: build.env.into_iter().collect(),
-        outputs: build.outputs.into_iter().collect(),
-        input_paths: build.input_paths,
-        tmp_dir_in_sandbox: build.tmp_dir_in_sandbox.to_string_lossy().into_owned(),
-        store_dir: build.store_dir,
-        fixed_output,
-        required_features,
-        local_networking,
-        timeout_secs: build.timeout,
-        max_silent_secs: build.max_silent_time,
-    };
-    // Packed once and resent verbatim on every reconnect attempt.
     // Nix places everything the builder consumes in topTmpDir/build.
-    let tmp_dir_pack = tokio::task::spawn_blocking({
-        let dir = build.top_tmp_dir.join("build");
-        move || tmpdir::pack_zstd_dir(&dir)
-    })
-    .await??;
-    let expected_outputs: Vec<String> = req.outputs.values().cloned().collect();
+    let dir = build.top_tmp_dir.join("build");
+    let ControlFlow::Continue(mut relay) = relay::of(&build, handoff)? else {
+        tracing::info!("no handoff socket on this host; declining a producer so Nix builds it");
+        return Ok(DECLINE_EXIT_CODE);
+    };
+    let (mut req, told) = request(build);
+    // Packed once and resent verbatim on every reconnect attempt.
+    let tmp_dir_pack = tokio::task::spawn_blocking(move || tmpdir::pack_zstd_dir(&dir)).await??;
+    // A producer's outputs are what it submits to Nix itself (DD6).
+    let expected_outputs: Vec<String> = match relay {
+        Some(_) => Vec::new(),
+        None => req.outputs.values().cloned().collect(),
+    };
 
     // When the hub restarts mid-build we reconnect and resubmit the
     // identical request; its build state is not kept across restarts.
     // Its dedupe key matches the build still running on the worker,
     // which resumes instead of building twice.
     let mut attempts = 0u32;
+    let mut written = HashSet::new();
     loop {
-        match attempt_build(&req, &tmp_dir_pack, &socket, &expected_outputs).await? {
-            Outcome::Done(code) => return Ok(code),
+        // Once the hub acknowledged it, every resubmission says so (DD8a).
+        req.relay_started = relay.as_ref().is_some_and(|r| r.gate.acked());
+        match attempt_build(
+            (&req, &tmp_dir_pack),
+            &socket,
+            &expected_outputs,
+            &mut written,
+            relay.as_mut(),
+        )
+        .await?
+        {
+            Outcome::Done(code) => {
+                if let Some(hint) = untold_hint(told) {
+                    eprintln!("tribuchet: {hint}");
+                }
+                return Ok(code);
+            }
             Outcome::Retry(e) => {
                 attempts += 1;
                 if attempts > RECONNECT_ATTEMPTS {
@@ -111,6 +127,60 @@ async fn run_async(build: BuildJson, socket: PathBuf) -> Result<i32> {
     }
 }
 
+/// What attach sends the hub for `build`, and whether it is told
+/// fixed-output (BuildJson::fixed_output).
+fn request(build: BuildJson) -> (BuildRequest, Option<bool>) {
+    let attrs = build.attrs();
+    let told = build.fixed_output(attrs.as_ref());
+    let fixed_output = told == Some(true);
+    let required_features = required_system_features(&build.env, attrs.as_ref());
+    let local_networking = flag(&build.env, attrs.as_ref(), "__darwinAllowLocalNetworking");
+    // Never hand back one declaring a hash, told or not: the client's Nix
+    // would build it in its host's network (DESIGN.md), whatever Nix wrote.
+    let can_local = told.map_or(build.can_build_locally, |_| Some(false));
+    // A producer's goal is this attach's: another never joins its run (DD9).
+    let attach_id = if producer(&required_features) {
+        relay::attach_id()
+    } else {
+        Vec::new()
+    };
+    tracing::info!(fixed_output, can_local, system = %build.system, "submitting build");
+    let req = BuildRequest {
+        system: build.system,
+        builder: build.builder,
+        args: build.args,
+        env: build.env.into_iter().collect(),
+        outputs: build.outputs.into_iter().collect(),
+        input_paths: build.input_paths,
+        tmp_dir_in_sandbox: build.tmp_dir_in_sandbox.to_string_lossy().into_owned(),
+        store_dir: build.store_dir,
+        fixed_output,
+        required_features,
+        local_networking,
+        timeout_secs: build.timeout,
+        max_silent_secs: build.max_silent_time,
+        can_local,
+        client: build.client.or_else(daemon_connection),
+        attach_id,
+        relay_started: false,
+        drv_path: build.drv_path,
+    };
+    (req, told)
+}
+
+/// The line for the log of a build that ended, as fixed_output `told` it:
+/// one declaring a hash it is not at gets no network (DESIGN.md, Known
+/// limitations), whether its builder ran or a worker failed first. Nix
+/// checks its output's hash only after attach exits, so whatever its exit
+/// code. None is declined: `request` sends it can_local false, and the hub
+/// passes a worker's decline code on as 1.
+fn untold_hint(told: Option<bool>) -> Option<&'static str> {
+    let hint = "tribuchet gives it no network: it found its output not at a path it derives \
+                from the outputHash it declares (as under --check, --rebuild or --repair); it \
+                derives none for git hashing or a hash it cannot read (DESIGN.md)";
+    (told == Some(false)).then_some(hint)
+}
+
 enum Outcome {
     Done(i32),
     /// Transport-level failure: hub restarting or briefly unreachable.
@@ -120,7 +190,7 @@ enum Outcome {
 
 /// gRPC channel over the hub's local unix socket; tonic only knows
 /// HTTP URIs, so the connector ignores the URI and dials the path.
-async fn connect(socket: &Path) -> Result<tonic::transport::Channel> {
+pub(crate) async fn connect(socket: &Path) -> Result<tonic::transport::Channel> {
     let socket = socket.to_owned();
     Endpoint::try_from("http://hub.invalid")?
         .initial_stream_window_size(Some(chunkio::H2_STREAM_WINDOW))
@@ -154,10 +224,11 @@ fn submission(req: &BuildRequest, tmp_dir_pack: &[u8]) -> Vec<BuildMessage> {
 }
 
 async fn attempt_build(
-    req: &BuildRequest,
-    tmp_dir_pack: &[u8],
+    (req, tmp_dir_pack): (&BuildRequest, &[u8]),
     socket: &Path,
     expected_outputs: &[String],
+    written: &mut HashSet<String>,
+    mut relay: Option<&mut relay::Relay>,
 ) -> Result<Outcome> {
     let channel = match connect(socket).await {
         Ok(c) => c,
@@ -172,10 +243,16 @@ async fn attempt_build(
     // not build failures.
     ready_marker()?;
 
-    let mut stream = match client
-        .build(tokio_stream::iter(submission(req, tmp_dir_pack)))
-        .await
-    {
+    // Kept open by a producer's attach, which sends RelayStarted on it
+    // later; any other's ends after the submission, as it always did.
+    let (tx, rx) = mpsc::channel(4);
+    let tx = relay.is_some().then_some(tx);
+    let sends = submission(req, tmp_dir_pack);
+    let requests = tokio_stream::StreamExt::chain(
+        tokio_stream::iter(sends),
+        tokio_stream::wrappers::ReceiverStream::new(rx),
+    );
+    let mut stream = match client.build(requests).await {
         Ok(s) => s.into_inner(),
         Err(e) if retryable(&e) => {
             return Ok(Outcome::Retry(err_ctx("submitting build")(e)));
@@ -184,9 +261,32 @@ async fn attempt_build(
     };
 
     let mut unpackers: HashMap<String, Unpacker> = HashMap::default();
+    let gate = relay.as_ref().map(|r| r.gate.clone());
+    let mut told_started = false;
 
     loop {
-        let ev = match stream.message().await {
+        let asked = async {
+            match &gate {
+                Some(g) if !told_started => g.asked().await,
+                _ => future::pending().await,
+            }
+        };
+        let message = tokio::select! {
+            m = stream.message() => m,
+            () = asked => {
+                told_started = true;
+                // Naming the run held, so the hub never takes a splice of
+                // a run gone for one of this run (DD8).
+                let token = relay.as_ref().and_then(|r| r.token());
+                if let (Some(tx), Some(handoff_token)) = (&tx, token) {
+                    let started = RelayStarted { handoff_token };
+                    let msg = Some(build_message::Msg::RelayStarted(started));
+                    let _ = tx.send(BuildMessage { msg }).await;
+                }
+                continue;
+            }
+        };
+        let ev = match message {
             Ok(Some(ev)) => ev,
             // Stream ended or broke without a result: the hub went
             // away; clean up partial output trees and resubmit.
@@ -210,7 +310,9 @@ async fn attempt_build(
                 io::stderr().write_all(&data)?;
             }
             Some(attach_event::Event::Output(out)) => {
+                let path = out.store_path.clone();
                 handle_output_chunk(&mut unpackers, expected_outputs, out).await?;
+                written.insert(path);
             }
             Some(attach_event::Event::Dispatched(worker)) => {
                 eprintln!("tribuchet: building on {worker}");
@@ -224,14 +326,48 @@ async fn attempt_build(
                 }
             }
             Some(attach_event::Event::ExitCode(code)) => {
+                // A worker's: every connection of the run has reached the
+                // client (DD7). The hub's decline: the run was lost, and
+                // may run still; none of it reaches the client after.
+                if let Some(relay) = relay.as_mut() {
+                    if code == DECLINE_EXIT_CODE {
+                        relay.close().await;
+                    } else {
+                        relay.drain().await;
+                    }
+                }
                 if !unpackers.is_empty() {
                     return Err(err_msg("hub closed build with unfinished output transfers"));
+                }
+                if code == DECLINE_EXIT_CODE {
+                    // Nix now builds it itself, without clearing the
+                    // output paths first: some of its builders write in
+                    // place. Leave nothing there of ours.
+                    for path in written.drain() {
+                        remove_tree(Path::new(&path));
+                    }
                 }
                 return Ok(Outcome::Done(code));
             }
             Some(attach_event::Event::Error(e)) => {
                 cleanup_unpackers(&mut unpackers).await;
                 return Err(err_msg(format!("remote build failed: {e}")));
+            }
+            Some(attach_event::Event::RelayReady(ready)) => {
+                if let Some(relay) = relay.as_mut() {
+                    // Not fetched, the run is lost (DD10): the hub settles
+                    // that once its worker reports it expired.
+                    if let Err(e) = relay.ready(ready).await {
+                        eprintln!("tribuchet: {}; the run is lost", chain(&e));
+                    }
+                    // A splice still waiting asks again, naming this run.
+                    told_started = false;
+                }
+            }
+            Some(attach_event::Event::RelayStartedAck(token)) => {
+                if let Some(relay) = relay.as_ref() {
+                    relay.acked(&token);
+                }
             }
             None => {}
         }
@@ -318,7 +454,8 @@ async fn handle_output_chunk(
 }
 
 /// Stop in-flight unpackers; partial trees stay at the output paths
-/// and are removed before the next unpack of the same path.
+/// and are removed before the next unpack of the same path, or by a
+/// decline.
 async fn cleanup_unpackers(unpackers: &mut HashMap<String, Unpacker>) {
     for (_, (tx, task)) in unpackers.drain() {
         drop(tx);
@@ -326,61 +463,7 @@ async fn cleanup_unpackers(unpackers: &mut HashMap<String, Unpacker>) {
     }
 }
 
+mod relay;
+
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// zstd-compressed NAR of a single regular file, as the hub streams it.
-    fn zstd_nar_of_file(dir: &Path, body: &[u8]) -> Vec<u8> {
-        let src = dir.join("src");
-        fs::write(&src, body).unwrap();
-        let nar = nar::pack::to_vec(&src).unwrap();
-        zstd::encode_all(&nar[..], 3).unwrap()
-    }
-
-    async fn deliver(
-        unpackers: &mut HashMap<String, Unpacker>,
-        out: &str,
-        chunk: Vec<u8>,
-    ) -> Result<()> {
-        let expected = vec![out.to_owned()];
-        handle_output_chunk(
-            unpackers,
-            &expected,
-            OutputNar {
-                store_path: out.to_owned(),
-                zstd_nar_chunk: chunk,
-                eof: false,
-            },
-        )
-        .await?;
-        handle_output_chunk(
-            unpackers,
-            &expected,
-            OutputNar {
-                store_path: out.to_owned(),
-                zstd_nar_chunk: Vec::new(),
-                eof: true,
-            },
-        )
-        .await
-    }
-
-    /// Regression: a leftover tree at the output path (earlier attempt in
-    /// this process) must be replaced, not fail with EEXIST.
-    #[tokio::test]
-    async fn replaces_existing_output_path() {
-        let dir = tempfile::tempdir().unwrap();
-        let out = dir.path().join("out");
-        let out_str = out.to_string_lossy().into_owned();
-        fs::create_dir(&out).unwrap();
-        fs::write(out.join("stale"), b"junk").unwrap();
-
-        let chunk = zstd_nar_of_file(dir.path(), b"fresh");
-        let mut unpackers = HashMap::default();
-        deliver(&mut unpackers, &out_str, chunk).await.unwrap();
-
-        assert!(unpackers.is_empty());
-        assert_eq!(fs::read(&out).unwrap(), b"fresh");
-    }
-}
+mod tests;

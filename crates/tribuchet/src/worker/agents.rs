@@ -7,13 +7,11 @@
 
 use std::fs;
 use std::io;
-use std::thread;
 use std::time::Duration;
 
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
 
 #[cfg(target_os = "macos")]
 use std::fmt::Write as _;
@@ -26,7 +24,6 @@ use sandbox_proto::agent::{
 };
 use sandbox_proto::framing;
 
-use super::resume::CANCELLED;
 use crate::errors::{Error, Result, chain, err_ctx, err_msg};
 use crate::sockpath;
 
@@ -116,120 +113,6 @@ pub(super) fn seatbelt_profile(
     Ok(profile)
 }
 
-/// The agent sockets. One build per agent, so the reachable ones bound
-/// the worker's concurrency.
-pub(super) struct AgentPool(Mutex<Pool>);
-
-struct Pool {
-    all: Vec<PathBuf>,
-    free: Vec<PathBuf>,
-    /// Agents nothing answered on, out of `free` until a probe reaches
-    /// them again.
-    down: Vec<PathBuf>,
-}
-
-impl AgentPool {
-    pub(super) fn new(sockets: Vec<PathBuf>) -> Self {
-        Self(Mutex::new(Pool {
-            all: sockets.clone(),
-            free: sockets,
-            down: Vec::new(),
-        }))
-    }
-
-    /// Lease a free agent and start the build on it. An agent nothing
-    /// answers on is marked down and the next one tried. With none
-    /// free the build waits, calling `waiting` once, until `cancelled`.
-    pub(super) fn start(
-        &self,
-        req: &StartRequest,
-        tmp_pack: &fs::File,
-        log: &fs::File,
-        cancelled: impl Fn() -> bool,
-        waiting: impl FnOnce(),
-    ) -> Result<(PathBuf, AgentBuild)> {
-        let mut waiting = Some(waiting);
-        loop {
-            let Some(socket) = self.0.lock().unwrap().free.pop() else {
-                if cancelled() {
-                    return Err(err_msg(CANCELLED));
-                }
-                if let Some(waiting) = waiting.take() {
-                    waiting();
-                }
-                thread::sleep(Duration::from_secs(1));
-                continue;
-            };
-            match AgentBuild::start(&socket, req, tmp_pack, log) {
-                Ok(build) => return Ok((socket, build)),
-                Err(e) if unreachable(&e) => {
-                    tracing::warn!(id = req.build_id, "{}; trying another agent", chain(&e));
-                    self.mark_down(&socket);
-                }
-                Err(e) => {
-                    self.release(socket);
-                    return Err(e);
-                }
-            }
-        }
-    }
-
-    /// Return an agent to the free list, also one that was down.
-    pub(super) fn release(&self, socket: PathBuf) {
-        let mut pool = self.0.lock().unwrap();
-        if pool.all.contains(&socket) && !pool.free.contains(&socket) {
-            pool.down.retain(|s| *s != socket);
-            pool.free.push(socket);
-        }
-    }
-
-    /// Take a specific agent out of the pool: an adopted build already
-    /// occupies it, so new builds must not be placed there.
-    pub(super) fn reserve(&self, socket: &Path) {
-        let mut pool = self.0.lock().unwrap();
-        pool.free.retain(|s| s != socket);
-        pool.down.retain(|s| s != socket);
-    }
-
-    /// Set an agent aside until a probe reaches it again. False if it
-    /// already was.
-    pub(super) fn mark_down(&self, socket: &Path) -> bool {
-        let mut pool = self.0.lock().unwrap();
-        pool.free.retain(|s| s != socket);
-        if pool.down.iter().any(|s| s == socket) {
-            return false;
-        }
-        pool.down.push(socket.to_path_buf());
-        true
-    }
-
-    /// Add sockets not seen before, down until a probe reaches them.
-    pub(super) fn discover(&self, sockets: Vec<PathBuf>) {
-        let mut pool = self.0.lock().unwrap();
-        for socket in sockets {
-            if !pool.all.contains(&socket) {
-                pool.all.push(socket.clone());
-                pool.down.push(socket);
-            }
-        }
-    }
-
-    /// Sockets not occupied by an adopted build.
-    pub(super) fn idle_sockets(&self) -> Vec<PathBuf> {
-        self.0.lock().unwrap().free.clone()
-    }
-
-    pub(super) fn down_sockets(&self) -> Vec<PathBuf> {
-        self.0.lock().unwrap().down.clone()
-    }
-
-    /// Agents that can run a build, leased or not.
-    pub(super) fn usable(&self) -> usize {
-        let pool = self.0.lock().unwrap();
-        pool.all.len() - pool.down.len()
-    }
-}
-
 /// Nothing listens on the agent socket, or the file is gone: a stopped
 /// socket unit leaves its file behind (RemoveOnStop=no). `connect` is
 /// the only step of an agent call that yields a context-wrapped
@@ -256,6 +139,8 @@ pub(super) struct AgentBuild {
     /// The build's cgroup.freeze, write-only, where it has a cgroup: the
     /// arbiter's to freeze and thaw it with while the lease lasts.
     pub(super) freeze: Option<fs::File>,
+    /// A producer's listener (StartReply.rpc_listener), the last fd.
+    pub(super) listener: Option<OwnedFd>,
 }
 
 impl AgentBuild {
@@ -277,11 +162,14 @@ impl AgentBuild {
         let reply::Reply::Start(reply) = reply else {
             return Err(err_msg(format!("unexpected agent reply {reply:?}")));
         };
+        let mut fds = fds;
+        let listener = if reply.rpc_listener { fds.pop() } else { None };
         Ok(Self {
             conn,
             pid: reply.pid,
             scratch_dir: PathBuf::from(reply.scratch_dir),
             freeze: fds.into_iter().next().map(fs::File::from),
+            listener,
         })
     }
 
@@ -309,6 +197,7 @@ impl AgentBuild {
             pid: reply.pid,
             scratch_dir: PathBuf::from(reply.scratch_dir),
             freeze: fds.into_iter().next().map(fs::File::from),
+            listener: None,
         };
         Ok((build, reply.exit_code))
     }
@@ -421,4 +310,164 @@ pub(super) fn shutdown(socket: &Path) -> Result<()> {
 }
 
 #[cfg(test)]
-pub(super) mod tests;
+pub(super) mod tests {
+    use super::*;
+    use std::collections::HashMap;
+    use std::os::fd::IntoRawFd;
+    use std::{env, thread};
+
+    use crate::tmpdir::pack_zstd_dir;
+    use crate::worker::agent;
+
+    pub(in crate::worker) mod pool;
+
+    /// A dev-mode agent: self-bound socket, same uid.
+    pub(in crate::worker) fn spawn_agent(socket: &Path, state_dir: PathBuf) -> Result<()> {
+        let listener = sockpath::bind(socket)?;
+        thread::spawn(move || {
+            let _ = agent::run(&agent::Options {
+                socket: None,
+                listen_fd: Some(listener.into_raw_fd()),
+                state_dir,
+                worker_uid: None,
+                uid_base: None,
+                dedicated_uid: false,
+            });
+        });
+        Ok(())
+    }
+
+    /// A dev-mode agent plus a staged tmp dir pack for it, shared by
+    /// the tests below.
+    pub(in crate::worker) fn spawn_test_agent(dir: &Path) -> Result<(PathBuf, PathBuf)> {
+        let socket = dir.join("agent.sock");
+        spawn_agent(&socket, dir.join("state"))?;
+        // build dir carrying .attrs.json, like the client pack
+        let build = dir.join("top/build");
+        fs::create_dir_all(&build)?;
+        fs::write(build.join(".attrs.json"), "{}")?;
+        let pack_path = dir.join("top.tmpdir.zst");
+        fs::write(&pack_path, pack_zstd_dir(&build)?)?;
+        Ok((socket, pack_path))
+    }
+
+    pub(in crate::worker) fn start_request(
+        build_id: &str,
+        script: String,
+        outputs: Vec<String>,
+    ) -> StartRequest {
+        StartRequest {
+            build_id: build_id.into(),
+            builder: "/bin/sh".into(),
+            args: vec!["-c".into(), script],
+            // A real assignment's env carries PATH; the scripts here
+            // need it for mkdir.
+            env: HashMap::from([
+                ("NIX_BUILD_TOP".into(), "/build".into()),
+                ("PATH".into(), env::var("PATH").unwrap_or_default()),
+            ]),
+            tmp_dir_in_sandbox: "/build".into(),
+            profile: String::new(),
+            sandbox_json: None,
+            outputs,
+            rpc_socket: None,
+            memory_max_bytes: None,
+        }
+    }
+
+    /// Full lifecycle against a real agent on the same uid, without a
+    /// seatbelt profile (not permitted inside the Nix build sandbox):
+    /// Start with a tmp dir tar, exit notice, Adopt of the finished
+    /// build, Finish, Cleanup.
+    #[test]
+    fn agent_runs_a_build_end_to_end() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (socket, pack_path) = spawn_test_agent(dir.path())?;
+        let build_id = "0123456789abcdef0123456789abcdef";
+        let output = dir.path().join("fake-output");
+        let req = start_request(
+            build_id,
+            format!(
+                "test -f .attrs.json || exit 2; \
+                 test \"$NIX_BUILD_TOP\" = \"$PWD\" || exit 3; \
+                 echo built; mkdir {out}; echo data > {out}/file",
+                out = output.display()
+            ),
+            vec![output.to_string_lossy().into_owned()],
+        );
+        let log_path = dir.path().join("build.log");
+        let log_w = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log_path)?;
+        let build = AgentBuild::start(&socket, &req, &fs::File::open(&pack_path)?, &log_w)?;
+        assert!(build.pid > 0);
+        let exit = build.wait_exit()?;
+        assert_eq!(exit.exit_code, 0);
+        assert!(exit.peak_memory_bytes > 0, "no memory reported");
+
+        let log = fs::read_to_string(&log_path)?;
+        assert!(log.contains("built"), "log: {log}");
+
+        let (_, exit) = AgentBuild::adopt(&socket, build_id)?;
+        assert_eq!(exit, Some(0));
+
+        finish(&socket, build_id)?;
+        assert_eq!(fs::read_to_string(output.join("file"))?, "data\n");
+
+        cleanup(&socket, build_id)?;
+        assert!(!output.exists());
+        assert!(!build.scratch_dir.exists());
+        Ok(())
+    }
+
+    /// The generated seatbelt profile, applied by a real agent: the
+    /// derivation env arrives, worker secrets are unreadable, writes
+    /// stay confined to the scratch dir and the declared output.
+    /// Skipped inside the Nix build sandbox (sandbox_init is not
+    /// permitted there); `nix develop -c cargo test` runs it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn seatbelt_profile_confines_the_builder() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (socket, pack_path) = spawn_test_agent(dir.path())?;
+        let build_id = "00000000000000000000000000000001";
+        // Canonical paths: the profile's path filters only match
+        // canonical paths and macOS temp dirs live under the /var
+        // symlink. Real outputs are /nix/store paths, already canonical.
+        let dir_path = dir.path().canonicalize()?;
+        let output = dir_path.join("fake-output");
+        let secret = dir_path.join("secret");
+        fs::write(&secret, "key-material")?;
+        let outside = dir_path.join("outside");
+        let outputs = vec![output.to_string_lossy().into_owned()];
+        let mut req = start_request(
+            build_id,
+            // Each escape attempt exits with its own code so a failure
+            // names the broken rule.
+            format!(
+                "test \"$NIX_BUILD_TOP\" = \"$PWD\" || exit 3; \
+                 cat {secret} 2>/dev/null && exit 4; \
+                 echo escaped > {outside} 2>/dev/null && exit 5; \
+                 echo scratch > scratch-file || exit 6; \
+                 mkdir {out} && echo data > {out}/file",
+                secret = secret.display(),
+                outside = outside.display(),
+                out = output.display()
+            ),
+            outputs.clone(),
+        );
+        req.profile = seatbelt_profile(&outputs, &[secret], false)?;
+        let log_w = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(dir_path.join("build.log"))?;
+        let build = AgentBuild::start(&socket, &req, &fs::File::open(&pack_path)?, &log_w)?;
+        assert_eq!(build.wait_exit()?.exit_code, 0);
+        assert!(!outside.exists());
+        finish(&socket, build_id)?;
+        assert_eq!(fs::read_to_string(output.join("file"))?, "data\n");
+        cleanup(&socket, build_id)?;
+        Ok(())
+    }
+}

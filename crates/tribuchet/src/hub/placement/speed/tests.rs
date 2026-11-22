@@ -10,6 +10,7 @@ fn build(name: &str) -> Build<'_> {
         system: "x86_64-linux",
         name: Some(name),
         declared: false,
+        sources: None,
     }
 }
 
@@ -23,6 +24,7 @@ fn usage(secs: f64) -> BuildUsage {
         peak_memory_bytes: 1 << 30,
         oom_killed: false,
         frozen_ms: 0,
+        profile: None,
     }
 }
 

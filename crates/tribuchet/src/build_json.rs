@@ -11,8 +11,8 @@ use harmonia_store_content_address::{
     ContentAddress, ContentAddressMethod, make_store_path_from_ca,
 };
 use harmonia_store_path::{StoreDir, StorePath};
-use harmonia_utils_hash::Hash;
 use harmonia_utils_hash::fmt::Any;
+use harmonia_utils_hash::{Algorithm, Hash};
 use serde::Deserialize;
 
 #[derive(Debug, thiserror::Error)]
@@ -53,6 +53,19 @@ pub struct BuildJson {
     pub timeout: u64,
     #[serde(default)]
     pub max_silent_time: u64,
+    /// Whether Nix builds the derivation itself if attach declines it,
+    /// by the rule it then applies; absent from a Nix that does not say.
+    #[serde(default)]
+    pub can_build_locally: Option<bool>,
+    /// Who asked for the build (BuildRequest's client), where the Nix
+    /// that wrote this knows; absent, attach names the nix-daemon
+    /// connection running it.
+    #[serde(default)]
+    pub client: Option<String>,
+    /// The derivation's store path, where Nix writes it: for logging and
+    /// the hub's record only (DESIGN.md, R1).
+    #[serde(default)]
+    pub drv_path: Option<String>,
 }
 
 impl BuildJson {
@@ -73,10 +86,11 @@ impl BuildJson {
         read_attrs(&self.top_tmp_dir.join("build"), has)
     }
 
-    /// Whether the build gets network: its derivation is fixed-output.
-    /// An `__impure` one gets none: Nix takes that attr at evaluation, so it
-    /// never reaches build.json, and one there was set by hand.
-    pub fn network_allowed(&self, attrs: Option<&serde_json::Value>) -> bool {
+    /// Whether the build is told fixed-output, and so gets network, if it
+    /// declares a content hash (fixed_output). An `__impure` one gets none: Nix
+    /// takes that attr at evaluation, so it never reaches build.json, and one
+    /// there was set by hand.
+    pub fn fixed_output(&self, attrs: Option<&serde_json::Value>) -> Option<bool> {
         let env = |name: &str| self.env.get(name).map(String::as_str);
         fixed_output(&self.store_dir, &self.outputs, env, attrs)
     }
@@ -91,46 +105,50 @@ pub fn read_attrs(build_dir: &Path, has: bool) -> Option<serde_json::Value> {
     serde_json::from_slice(&data).ok()
 }
 
-/// Whether a derivation is fixed-output, from what reaches its builder:
-/// its one output, `out`, is at the store path of the content hash it
-/// declares (outputHash, outputHashAlgo, outputHashMode, from `env` or
-/// structured attrs). No other derivation's output lands there, whatever
-/// its env says; one Nix builds at another path (--check of a valid
-/// output) or with git hashing is not told fixed-output.
+/// Whether a derivation that declares a content hash (outputHash, from
+/// `env` or structured attrs; None if none) is fixed-output, from what
+/// reaches its builder: its one output, `out`, is at that hash's store
+/// path (by outputHashAlgo, outputHashMode). No other derivation's output
+/// lands there, whatever its env says; one at another path, or hashed with
+/// git, is not told (Some(false)), and attach says so in its log.
 pub fn fixed_output<'a>(
     store_dir: &str,
     outputs: impl IntoIterator<Item = (&'a String, &'a String)>,
     env: impl Fn(&str) -> Option<&'a str>,
     attrs: Option<&serde_json::Value>,
-) -> bool {
-    let mut outputs = outputs.into_iter();
-    let (Some((name, out)), None) = (outputs.next(), outputs.next()) else {
-        return false;
-    };
+) -> Option<bool> {
     let attr = |name: &str| {
         let from_attrs = || attrs?.get(name)?.as_str().map(str::to_owned);
         env(name).map(str::to_owned).or_else(from_attrs)
     };
+    let hash = attr("outputHash")?;
+    let mut outputs = outputs.into_iter();
+    let (Some((name, out)), None) = (outputs.next(), outputs.next()) else {
+        return Some(false);
+    };
     let fixed = || -> Option<bool> {
         let store = StoreDir::new(store_dir).ok()?;
         let out: StorePath = store.parse(out).ok()?;
-        let (hash, algo) = (
-            attr("outputHash")?,
-            attr("outputHashAlgo").unwrap_or_default(),
-        );
-        let hash = hash
-            .parse::<Any<Hash>>()
-            .or_else(|_| format!("{algo}:{hash}").parse());
+        let algo = attr("outputHashAlgo").unwrap_or_default();
+        // An empty hash is the zero hash of outputHashAlgo, as Nix takes it
+        // (newHashAllowEmpty), as in buildGoModule's `vendorHash = ""`.
+        let hash = match hash.as_str() {
+            "" => Ok(Hash::new(algo.parse::<Algorithm>().ok()?, &[0; 64])),
+            _ => hash
+                .parse::<Any<Hash>>()
+                .or_else(|_| format!("{algo}:{hash}").parse())
+                .map(Any::into_hash),
+        };
         let method = match attr("outputHashMode").as_deref() {
             None | Some("" | "flat") => ContentAddressMethod::Flat,
             Some("recursive" | "nar") => ContentAddressMethod::NixArchive,
             Some("text") => ContentAddressMethod::Text,
             Some(_) => return None,
         };
-        let ca = ContentAddress::from_hash(method, hash.ok()?.into_hash()).ok()?;
+        let ca = ContentAddress::from_hash(method, hash.ok()?).ok()?;
         Some(make_store_path_from_ca(&store, out.name().clone(), ca) == out)
     };
-    name == "out" && fixed() == Some(true)
+    Some(name == "out" && fixed() == Some(true))
 }
 
 /// A boolean derivation attr from the env (`"1"`) or structured attrs.
@@ -188,8 +206,13 @@ pub(crate) mod tests {
         assert!(required_system_features(&BTreeMap::new(), None).is_empty());
     }
 
-    fn doc(env: &serde_json::Value) -> BuildJson {
-        serde_json::from_value(serde_json::json!({
+    pub(crate) fn doc(env: &serde_json::Value) -> BuildJson {
+        serde_json::from_value(written(env)).unwrap()
+    }
+
+    /// A build.json as Nix writes it, of a build with `env`.
+    fn written(env: &serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
             "version": 1,
             "builder": "/bin/sh",
             "args": [],
@@ -200,8 +223,7 @@ pub(crate) mod tests {
             "system": "x86_64-linux",
             "inputPaths": [],
             "outputs": {},
-        }))
-        .unwrap()
+        })
     }
 
     /// Nix's own output paths (`nix eval` of each derivation's outPath):
@@ -212,19 +234,24 @@ pub(crate) mod tests {
     const NAR: &str = "/nix/store/gsk17yzsgr98iadxvr4nq89nzyy81x8f-src";
     pub(crate) const INPUT_ADDRESSED: &str = "/nix/store/3am3whmm9lr7m3mi4w3ahdh4q12iyzk0-src";
     pub(crate) const HASH: &str = "sha256-2ex2y+NNuY7sNTn+LImdJrDIN8s+tGalsPEJyr9mWPc=";
+    /// An empty sha256 outputHash, flat for `x` and recursive for `e`.
+    const EMPTY_FLAT: &str = "/nix/store/yplc6kklcg6k8aln037jq8jxq5v92wln-x";
+    const EMPTY_NAR: &str = "/nix/store/lzvy3q0z642kia65iz3h8yzb10dqv03y-e";
+    /// HASH git-hashed, at the path Nix gives it, which this does not derive.
+    const GIT: &str = "/nix/store/j5vd9d8h1fdinlacxdi4i012b3gaybbv-src";
 
     /// Whether `env` gives a build whose output is `out` network.
-    fn network(env: &serde_json::Value, out: &str) -> bool {
+    fn network(env: &serde_json::Value, out: &str) -> Option<bool> {
         let mut doc = doc(env);
         doc.outputs = BTreeMap::from([("out".to_owned(), out.to_owned())]);
-        doc.network_allowed(None)
+        doc.fixed_output(None)
     }
 
     /// Network is the derivation's being fixed-output, which its output
     /// path proves; what its env says does not.
     #[test]
     fn a_build_has_network_iff_its_output_is_fixed_by_its_hash() {
-        let net = |env, out| network(&env, out);
+        let net = |env, out| network(&env, out) == Some(true);
         let flat = serde_json::json!({
             "outputHash": "d9ec76cbe34db98eec3539fe2c899d26b0c837cb3eb466a56b0f109cabf658f7",
             "outputHashAlgo": "sha256",
@@ -233,7 +260,17 @@ pub(crate) mod tests {
         assert!(net(serde_json::json!({"outputHash": HASH}), SRI));
         let nar = serde_json::json!({"outputHash": HASH, "outputHashMode": "recursive"});
         assert!(net(nar.clone(), NAR));
-        assert!(!net(nar, SRI), "flat path, recursive claim");
+        let empty = serde_json::json!({"outputHash": "", "outputHashAlgo": "sha256"});
+        assert!(net(empty.clone(), EMPTY_FLAT));
+        let mut empty_nar = empty;
+        empty_nar["outputHashMode"] = "recursive".into();
+        assert!(net(empty_nar, EMPTY_NAR));
+        // Not told: a hash at another path (a flat one for a recursive claim)
+        // or git hashing; none declared is not.
+        let git = serde_json::json!({"outputHash": HASH, "outputHashMode": "git"});
+        let told = [(nar, SRI), (git, GIT), (serde_json::json!({}), NAR)];
+        let want = [Some(false), Some(false), None];
+        assert_eq!(told.map(|(env, out)| network(&env, out)), want);
         // An input-addressed derivation that sets what Nix sets for a
         // fixed-output one, and a hash, gets none.
         let spoof = serde_json::json!({"NIX_OUTPUT_CHECKED": "1", "outputHash": HASH});
@@ -245,8 +282,8 @@ pub(crate) mod tests {
         let mut doc = doc(&serde_json::json!({}));
         doc.outputs = BTreeMap::from([("out".to_owned(), NAR.to_owned())]);
         let attrs = serde_json::json!({"outputHash": HASH, "outputHashMode": "nar"});
-        assert!(doc.network_allowed(Some(&attrs)));
+        assert_eq!(doc.fixed_output(Some(&attrs)), Some(true));
         doc.outputs = BTreeMap::from([("out".to_owned(), INPUT_ADDRESSED.to_owned())]);
-        assert!(!doc.network_allowed(Some(&serde_json::json!({"__impure": true}))));
+        assert!(doc.fixed_output(Some(&serde_json::json!({"__impure": true}))) != Some(true));
     }
 }
