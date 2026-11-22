@@ -512,3 +512,46 @@ fn a_worker_away_drifts_to_1_and_is_relearned() {
     let back = ratio(&h, "a", "b");
     assert!((back / 2.0 - 1.0).abs() < 0.05, "back: {back}");
 }
+
+/// A run that did not succeed, failed or OOM-killed, is censored: it
+/// teaches memory (history.rs), and no speed comparison, though its
+/// dispatch was quiet. a and b compared alike; then 200 runs of b's at
+/// 4x, failed or killed, leave every factor as it was, where the same
+/// runs succeeded read b slower (1.33x, each comparison clamped).
+#[test]
+fn a_censored_run_teaches_no_speed() {
+    let mut base = History::default();
+    alternate(
+        &mut base,
+        "k-1",
+        100.0,
+        ("a", 1.0, true),
+        ("b", 1.0, true),
+        500,
+    );
+    let before = base.speeds();
+    let slow = |h: &mut History, exit_code: i32, oom: bool| {
+        for _ in 0..200 {
+            let mut u = usage(400.0);
+            u.oom_killed = oom;
+            for (worker, u) in [("a", usage(100.0)), ("b", u)] {
+                let on = Some(On {
+                    worker,
+                    taught: true,
+                });
+                h.record(&build("k-1"), exit_code, &u, on);
+            }
+        }
+    };
+    for (exit_code, oom) in [(1, false), (0, true)] {
+        let mut h = base.clone();
+        slow(&mut h, exit_code, oom);
+        let after: Vec<_> = (h.speeds().into_iter()).map(|(w, f, _)| (w, f)).collect();
+        let was: Vec<_> = (before.iter()).map(|(w, f, _)| (w.clone(), *f)).collect();
+        assert_eq!(after, was, "exit {exit_code}, killed {oom}");
+    }
+    let mut h = base.clone();
+    slow(&mut h, 0, false);
+    let r = ratio(&h, "a", "b");
+    assert!(r > 1.2, "succeeded, b read {r}x slower");
+}
