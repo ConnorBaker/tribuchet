@@ -137,3 +137,30 @@ async fn a_given_up_build_asked_for_again_ends_its_old_dispatch() {
     assert!(!still, "the old dispatch is still supervised");
     assert_eq!(later, [], "cancels after the new dispatch");
 }
+
+/// A build whose client left, which its worker's heartbeat says leads
+/// its CPU arbiter keeping a build with a client frozen, is given up
+/// FLOOR on with no work waiting; the frozen one is not.
+#[tokio::test(start_paused = true)]
+async fn a_clientless_leader_keeping_a_client_frozen_is_given_up() {
+    let state = Arc::new(farm());
+    let mut clients = queue(&state, queued(2)).await;
+    let mut w = connect(&state, "w", 2, &[]);
+    w.to_hub.send(request_job(2, Some(0))).await.unwrap();
+    assert_eq!(assignments(&mut w.from_hub, QUIET).await.len(), 2);
+    drop(clients.remove(0));
+    let beat = Heartbeat {
+        frozen_keys: vec!["k1".into()],
+        leader_key: Some("k0".into()),
+        ..Default::default()
+    };
+    let beat = worker_message::Msg::Heartbeat(beat);
+    w.to_hub
+        .send(WorkerMessage { msg: Some(beat) })
+        .await
+        .unwrap();
+    tokio::time::sleep(FLOOR + Duration::from_secs(5)).await;
+    let cancels = sent(&mut w.from_hub).1;
+    w.hub.abort();
+    assert_eq!(cancels, [(format!("{:032x}", 0), "k0".to_owned())]);
+}

@@ -20,6 +20,9 @@ mod build;
 #[cfg(test)]
 pub(crate) use build::chunk_tests;
 mod caps;
+#[cfg(test)]
+mod held_tests;
+mod lease;
 mod logtail;
 mod pins;
 mod resume;
@@ -33,6 +36,7 @@ pub use userns::{USERNS_HOLD_ARG, hold_stage as userns_hold_stage};
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::io;
+use std::num::NonZeroU64;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process;
@@ -41,7 +45,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use harmonia_store_remote::DaemonClient;
-use tokio::sync::{Notify, mpsc};
+use tokio::sync::mpsc;
 
 use caps::host_system;
 use logtail::spawn_log_tail;
@@ -55,7 +59,7 @@ use crate::config::WorkerConfig;
 use crate::errors::{Result, err_ctx, err_msg};
 use crate::fsutil::io_ctx;
 use crate::netpolicy::NetPolicy;
-use crate::proto::{BuildAssignment, LogChunk, WorkerMessage, worker_message};
+use crate::proto::{BuildAssignment, HeldRun, LogChunk, RunId, WorkerMessage, worker_message};
 use crate::{fsutil, rt, sd};
 
 /// Connection to the local nix-daemon; one per active build so its
@@ -64,6 +68,9 @@ type DaemonConn = DaemonClient<tokio::net::unix::OwnedReadHalf, tokio::net::unix
 
 /// The numbers of waits for an agent and their takeovers, none given twice.
 static WAITS: AtomicU64 = AtomicU64::new(1);
+
+/// Adoptions so far; numbered from it: none twice, none 0 (registration).
+static ADOPTIONS: AtomicU64 = AtomicU64::new(0);
 
 /// Per-process context threaded through builds.
 struct WorkerCtx {
@@ -75,16 +82,12 @@ struct WorkerCtx {
     secret_paths: Vec<PathBuf>,
     #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     sandbox: bool,
-    /// Slots taken (Slot), at most `jobs()` as read when each was.
-    held: Mutex<usize>,
-    /// The max-jobs setting.
-    max_jobs: usize,
-    /// A `Slot` dropped or an agent joined. The session loop
-    /// re-declares capacity.
-    slot_freed: Notify,
     /// dedupe_key -> build past staging; survives session loss so a
     /// replacement hub can resume instead of rebuilding.
     resumable: Mutex<HashMap<String, ResumableBuild>>,
+    /// Runs it found gone as it started, which their agents no longer had
+    /// though no hub told it to drop them: told to the hub at each report.
+    lost: Mutex<Vec<RunId>>,
     /// system -> static emulator binary, from the emulate setting.
     emulators: HashMap<String, PathBuf>,
     /// A build with network can get a network of its own, a private
@@ -98,8 +101,8 @@ struct WorkerCtx {
     max_log_size: u64,
     /// memory.max for each build's cgroup.
     build_memory_max_bytes: Option<u64>,
-    /// The per-uid build agents, one leased per build.
-    agents: agents::AgentPool,
+    /// The per-uid build agents, one leased per build with its slot.
+    agents: Arc<lease::Pool>,
     /// Freezes and thaws the running builds and counts their frozen time.
     arbiter: Arc<arbiter::Arbiter>,
     /// Dedupe keys of builds the hub cancelled; the supervising loops
@@ -110,6 +113,8 @@ struct WorkerCtx {
     claims: build::Claims,
     /// Parallel daemon connections importing input NARs per build.
     import_jobs: usize,
+    /// The daemon socket negotiation connects to: None, the default one.
+    daemon_socket: Option<PathBuf>,
     chunks: Arc<ChunkStore>,
 }
 
@@ -147,37 +152,52 @@ impl WorkerCtx {
         self.resumable.lock().unwrap().keys().cloned().collect()
     }
 
+    /// The runs it holds that no hub told it to drop: neither cancelled
+    /// while running nor ended for a cancel. Unnumbered ones are left out.
+    fn held(&self) -> Vec<HeldRun> {
+        let map = self.resumable.lock().unwrap();
+        let held = map.iter().filter_map(|(key, e)| {
+            let exit_code = e.finished.as_ref().map(|f| f.exit_code);
+            let dropped = match &e.finished {
+                Some(f) => f.error.ends_with(CANCELLED),
+                None => e.cancelled,
+            };
+            (!dropped).then_some(HeldRun {
+                run: Some(e.run?),
+                dedupe_key: key.clone(),
+                started: true,
+                exit_code,
+            })
+        });
+        held.collect()
+    }
+
     /// Re-point an already-held build (same dedupe key) at the
-    /// assignment's new build_id and session; true if one existed. A
+    /// assignment's build_id and session: its adoption number if held. A
     /// tailer streams the log to the new session from the persisted
     /// offset on. The assignment voids a cancel of the one before while
     /// its run goes on (not yet taken, or held for its agent); a run killed
-    /// or failed for it is no result: false, and it starts anew. Runs in a
+    /// or failed for it is no result: None, and it starts anew. Runs in a
     /// tokio runtime: telling a waiting build's session spawns a task.
     fn adopt_assignment(
         self: &Arc<Self>,
         a: &BuildAssignment,
         out_tx: &mpsc::Sender<WorkerMessage>,
-    ) -> bool {
+    ) -> Option<u64> {
         let mut map = self.resumable.lock().unwrap();
-        let Some(e) = map.get_mut(&a.dedupe_key) else {
-            return false;
-        };
+        let e = map.get_mut(&a.dedupe_key)?;
         let voided = self.cancelled.lock().unwrap().remove(&a.dedupe_key);
         match &e.finished {
-            Some(f) if f.error.ends_with(CANCELLED) => {
-                let dir = e.dir.clone();
-                map.remove(&a.dedupe_key);
-                drop(map);
-                remove_build_dir(&dir);
-                return false;
-            }
-            None if e.cancelled && !voided && !e.adopting => return false,
+            Some(f) if f.error.ends_with(CANCELLED) => return None,
+            None if e.cancelled && !voided && !e.adopting => return None,
             _ => {}
         }
         e.cancelled = false;
+        // No result goes to the new session before it is told it resumed.
+        let n = NonZeroU64::MIN.saturating_add(ADOPTIONS.fetch_add(1, Ordering::Relaxed));
+        (e.adoption, e.resuming) = (n.get(), true);
         e.build_id.clone_from(&a.build_id);
-        e.out_tx = Some(out_tx.clone());
+        (e.out_tx, e.released) = (Some(out_tx.clone()), None);
         e.worker_name.clone_from(&a.worker_name);
         if let Some(t) = e.log_tail.take() {
             // An earlier resume's tailer feeds a dead session.
@@ -198,7 +218,7 @@ impl WorkerCtx {
             e.wait = WAITS.fetch_add(1, Ordering::Relaxed);
             self.tell_wait(&a.dedupe_key, e.wait, out_tx);
         }
-        true
+        Some(e.adoption)
     }
 
     /// Mark the build keyed `key` as waiting for a build agent, or not,
@@ -322,59 +342,6 @@ fn msg(m: worker_message::Msg) -> WorkerMessage {
     WorkerMessage { msg: Some(m) }
 }
 
-/// A build slot. Dropping it frees the slot, then wakes the session
-/// loop to hand it to a staged build.
-pub(crate) struct Slot {
-    ctx: Arc<WorkerCtx>,
-}
-
-impl Drop for Slot {
-    fn drop(&mut self) {
-        // Free first: a loop woken before would find no free slot and
-        // wait for a wake that does not come.
-        *self.ctx.held.lock().unwrap() -= 1;
-        self.ctx.slot_freed.notify_one();
-    }
-}
-
-impl WorkerCtx {
-    /// Builds that can run at once: one per reachable agent, at most
-    /// max-jobs.
-    fn jobs(&self) -> usize {
-        self.max_jobs.min(self.agents.usable())
-    }
-
-    /// Slots a build can take now.
-    fn free_slots(&self) -> usize {
-        let held = *self.held.lock().unwrap();
-        self.jobs().saturating_sub(held)
-    }
-
-    /// A free slot, checked and taken under `held`'s lock: two callers
-    /// never take the same one.
-    fn try_slot(self: &Arc<Self>) -> Option<Slot> {
-        self.slot_after(|| {})
-    }
-
-    /// Take agent `socket`, which runs a build already, out of the pool
-    /// with a slot, in one step: no caller takes the slot an agent back
-    /// from down frees before this one does.
-    fn reserve(self: &Arc<Self>, socket: &Path) -> Option<Slot> {
-        self.slot_after(|| self.agents.reserve(socket))
-    }
-
-    /// `first`, then a free slot, under `held`'s lock.
-    fn slot_after(self: &Arc<Self>, first: impl FnOnce()) -> Option<Slot> {
-        let mut held = self.held.lock().unwrap();
-        first();
-        if *held >= self.jobs() {
-            return None;
-        }
-        *held += 1;
-        Some(Slot { ctx: self.clone() })
-    }
-}
-
 pub fn run(opts: WorkerConfig) -> Result<()> {
     let rt = rt::runtime("trib-worker").map_err(err_ctx("creating the tokio runtime"))?;
     rt.block_on(run_async(opts))
@@ -453,7 +420,7 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         opts.agent_sockets.extend(found);
     }
     // Every build runs on one agent, so the reachable agents bound
-    // concurrency (WorkerCtx::jobs).
+    // concurrency (lease::Pool::capacity).
     if opts.agent_sockets.is_empty() {
         return Err(err_msg("agent-sockets must list at least one build agent"));
     }
@@ -471,22 +438,21 @@ async fn run_async(opts: WorkerConfig) -> Result<()> {
         sandbox_bin_sh: opts.sandbox_bin_sh.clone(),
         secret_paths: vec![opts.key.clone()],
         sandbox: opts.sandbox,
-        held: Mutex::new(0),
-        max_jobs: opts.max_jobs.max(1) as usize,
-        slot_freed: Notify::new(),
         import_jobs: opts.import_jobs.max(1) as usize,
         chunks: open_chunk_store(&opts)?,
         cancelled: Mutex::new(HashSet::new()),
         claims: build::Claims::default(),
         resumable: Mutex::new(HashMap::new()),
+        lost: Mutex::default(),
         emulators,
         fod_isolation,
         fod_network: opts.fod_network.clone(),
         max_silent_time: Duration::from_secs(opts.max_silent_time_secs),
         max_log_size: opts.max_log_size,
         build_memory_max_bytes: opts.build_memory_max_bytes,
-        agents: agents::AgentPool::new(opts.agent_sockets.clone()),
+        agents: lease::Pool::new(opts.agent_sockets.clone(), opts.max_jobs.max(1) as usize),
         arbiter: arbiter::Arbiter::new(),
+        daemon_socket: None,
     });
 
     // Ready once local setup is done, not once the hub answers: the
@@ -561,21 +527,20 @@ mod tests {
                 sandbox_bin_sh: None,
                 secret_paths: vec![],
                 sandbox: false,
-                held: Mutex::new(0),
-                max_jobs,
-                slot_freed: Notify::new(),
                 resumable: Mutex::new(HashMap::new()),
+                lost: Mutex::default(),
                 emulators: HashMap::new(),
                 fod_isolation: false,
                 fod_network: NetPolicy::default(),
                 max_silent_time: Duration::ZERO,
                 max_log_size: 0,
                 build_memory_max_bytes: None,
-                agents: agents::AgentPool::new(agents),
+                agents: lease::Pool::new(agents, max_jobs),
                 arbiter: arbiter::Arbiter::off(),
                 cancelled: Mutex::new(HashSet::new()),
                 claims: build::Claims::default(),
                 import_jobs: 1,
+                daemon_socket: None,
                 chunks: Arc::new(chunks),
             }))
         }

@@ -13,6 +13,8 @@ mod netpolicy;
 mod proto;
 mod rt;
 mod sd;
+#[cfg(test)]
+mod slowlink;
 mod sockpath;
 #[cfg(test)]
 mod stalltest;
@@ -52,6 +54,16 @@ enum Command {
     Attach {
         /// Path to the build.json written by Nix.
         build_json: PathBuf,
+        /// Hub unix socket.
+        #[arg(long, default_value = "/run/tribuchet/hub.sock")]
+        socket: PathBuf,
+    },
+    /// Retire a worker that is not connected: the hub no longer knows it,
+    /// and refuses a build only it served to a client whose Nix cannot
+    /// build it.
+    Decommission {
+        /// The worker's registered name.
+        worker: String,
         /// Hub unix socket.
         #[arg(long, default_value = "/run/tribuchet/hub.sock")]
         socket: PathBuf,
@@ -155,6 +167,7 @@ fn run() -> Result<(), Error> {
     let cli = Cli::parse();
     match cli.command {
         Command::Attach { build_json, socket } => attach::run(&build_json, &socket),
+        Command::Decommission { worker, socket } => hub::decommission(&socket, &worker),
         Command::Hub { config } => {
             let cfg: config::HubConfig = config::load(&config)?;
             hub::run(cfg)

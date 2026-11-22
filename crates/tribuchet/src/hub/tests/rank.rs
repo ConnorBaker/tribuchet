@@ -8,8 +8,10 @@ use std::pin::{Pin, pin};
 
 use tokio::sync::futures::Notified;
 
-use crate::proto::{BuildResult, Resumed};
+use crate::proto::BuildResult;
 use placement::{Demand, Expected, GRACE, Level, Room, Rooms, Size};
+
+mod clientless;
 
 const GIB: f64 = 1_073_741_824.0;
 
@@ -26,10 +28,11 @@ pub(super) fn sized_worker(state: &Arc<HubState>, name: &str, cores: u32, gib: u
         max_jobs: 2,
         cores: Some(cores),
         build_memory: Some(gib << 30),
+        ..Register::default()
     };
     let (out_tx, from_hub) = mpsc::channel(256);
     let (to_hub, in_rx) = mpsc::channel(64);
-    let hub = tokio::spawn(worker_loop(state.clone(), register, out_tx, in_rx));
+    let hub = spawn_session(state.clone(), register, out_tx, in_rx);
     Worker {
         to_hub,
         from_hub,
@@ -133,12 +136,10 @@ fn a_size_is_the_registered_cores_and_memory() {
         idle: 1,
         size,
         load: Demand::default(),
+        clientless: Demand::default(),
     };
     let rooms = [(1, size(Some(4), 2, None)), (2, size(None, 0, None))].map(room);
-    let mut rooms = Rooms {
-        asker: 1,
-        rooms: rooms.to_vec(),
-    };
+    let mut rooms = Rooms::new(1, rooms.to_vec());
     let got = rooms.passes(Demand::default(), &mut None, |_| true, Instant::now());
     assert_eq!(got, None, "an idle build passed to the worker of no cores");
 }
@@ -155,8 +156,7 @@ async fn a_resumed_build_counts_until_its_supervision_ends() {
     state.queue.lock().await.push_back(j);
     let mut w = connect(&state, "w", 1, &["k0"]);
     let build_id = w.assignment().await.expect("not assigned").build_id;
-    let resumed = Resumed { build_id };
-    w.send(worker_message::Msg::Resumed(resumed)).await;
+    w.send(resumed(&build_id, false)).await;
     assert_eq!(committed_cores(&state), 3.0, "resumed");
     for keys in [vec!["k0".to_owned()], vec![]] {
         let listing = Heartbeat {
@@ -356,6 +356,7 @@ fn a_build_is_passed_over_within_grace_to_the_least_full_room() {
         idle,
         size: SMALL,
         load: Demand { cores, memory: 0.0 },
+        clientless: Demand::default(),
     };
     let build = Demand {
         cores: 2.0,
@@ -432,10 +433,7 @@ fn a_build_is_passed_over_within_grace_to_the_least_full_room() {
         ),
     ];
     for (row, first, at, mine, others, passes) in rows {
-        let mut rooms = Rooms {
-            asker: 1,
-            rooms: [vec![mine], others].concat(),
-        };
+        let mut rooms = Rooms::new(1, [vec![mine], others].concat());
         for (n, want) in passes.into_iter().enumerate() {
             let mut since = first;
             let got = rooms.passes(build, &mut since, |_| true, t0 + at);
@@ -462,6 +460,7 @@ fn fullness_weighs_size_and_memory_where_every_room_reported_it() {
             cores: used,
             memory: gib * GIB,
         },
+        clientless: Demand::default(),
     };
     let build = Demand {
         cores: 0.5,
@@ -489,10 +488,7 @@ fn fullness_weighs_size_and_memory_where_every_room_reported_it() {
         ("this one's memory counted", a_half, b_busy, Some(2)),
     ];
     for (row, mine, other, want) in rows {
-        let mut rooms = Rooms {
-            asker: 1,
-            rooms: vec![mine, other],
-        };
+        let mut rooms = Rooms::new(1, vec![mine, other]);
         let got = rooms.passes(build, &mut None, |_| true, Instant::now());
         assert_eq!(got, want, "{row}");
     }

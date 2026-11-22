@@ -9,6 +9,7 @@ use std::sync::Arc;
 
 use super::*;
 use crate::chunkstore::io_hook;
+use crate::hub::Router;
 
 #[tokio::test]
 async fn a_cached_output_chunk_is_read_off_the_runtime() {
@@ -18,7 +19,7 @@ async fn a_cached_output_chunk_is_read_off_the_runtime() {
     let hash = *blake3::hash(&data).as_bytes();
     let zstd = zstd::bulk::compress(&data, 3).unwrap();
     io_hook::off_runtime(|| cache.admit(hash, &zstd)).unwrap();
-    let (_to_hub, mut in_rx) = mpsc::channel(1);
+    let mut in_rx = Router::default().register("b");
     let mut src = ChunkSource {
         cache: &cache,
         needed: HashSet::new(),

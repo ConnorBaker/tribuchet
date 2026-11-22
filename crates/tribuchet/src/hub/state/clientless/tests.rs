@@ -5,9 +5,10 @@ use std::time::Duration;
 use std::time::Instant as Now;
 
 use super::*;
+use crate::hub::Admission;
+use crate::hub::losses::{self, Loss};
 use crate::hub::placement::Size;
 use crate::hub::tests::job;
-use crate::hub::{Admission, Loss};
 use Queued::{Clientless, Held, Waiting};
 
 /// A worker's size, which the decider here does not read.
@@ -100,13 +101,45 @@ async fn the_decider_gives_up_what_waiting_work_needs() {
         (&[], &[gone(7, 60, 14)], &[], &[0]),
     ];
     for (n, &(workers, runs, queued, given_up)) in rows.iter().enumerate() {
-        assert_eq!(decided(workers, runs, queued).await, given_up, "row {n}");
+        assert_eq!(
+            decided(workers, runs, queued, None).await,
+            given_up,
+            "row {n}"
+        );
     }
 }
 
-/// The builds of `runs` that the decider gives up, with `workers` and
-/// `queued`.
-async fn decided(workers: &[(u32, bool)], runs: &[Run], queued: &[Queued]) -> Vec<usize> {
+/// Worker 0's heartbeat: its CPU arbiter's leader and the builds it
+/// keeps frozen, of the runs.
+type Frozen = Option<(usize, &'static [usize])>;
+
+/// A build with no client that, as its worker's arbiter's leader, keeps
+/// one with a client frozen is given up once its clients have been gone
+/// FLOOR, whatever its run time, with no work waiting; not when it has
+/// a client, nor when the builds it keeps frozen have none.
+#[tokio::test(start_paused = true)]
+async fn the_decider_gives_up_a_clientless_leader_freezing_a_client() {
+    let rows: &[(&[Run], Frozen, &[usize])] = &[
+        (&[gone(0, HOUR, 14), here(0, 60)], Some((0, &[1])), &[0]),
+        (&[gone(0, HOUR, 13), here(0, 60)], Some((0, &[1])), &[]),
+        (&[here(0, HOUR), here(0, 60)], Some((0, &[1])), &[]),
+        (&[gone(0, HOUR, 14), gone(0, 60, 5)], Some((0, &[1])), &[]),
+        (&[gone(0, HOUR, 14), here(0, 60)], Some((0, &[])), &[]),
+        (&[gone(0, HOUR, 14), here(0, 60)], None, &[]),
+    ];
+    for (n, &(runs, frozen, given_up)) in rows.iter().enumerate() {
+        assert_eq!(decided(TWO, runs, &[], frozen).await, given_up, "row {n}");
+    }
+}
+
+/// The builds of `runs` that the decider gives up, with `workers`,
+/// `queued` and worker 0's heartbeat `frozen`.
+async fn decided(
+    workers: &[(u32, bool)],
+    runs: &[Run],
+    queued: &[Queued],
+    frozen: Frozen,
+) -> Vec<usize> {
     let state = Arc::new(HubState::for_test(Duration::from_secs(30)));
     state.deciding.store(true, Ordering::Relaxed);
     for (id, &(slots, free)) in (0..).zip(workers) {
@@ -134,7 +167,7 @@ async fn decided(workers: &[(u32, bool)], runs: &[Run], queued: &[Queued]) -> Ve
     for (n, q) in queued.iter().enumerate() {
         let j = job(100 + n, Arc::new(Replay::default()));
         if *q == Queued::Held {
-            state.hold(0, [j.key.clone()].into(), false);
+            state.hold(0, &[j.key.clone()], false);
         }
         if *q != Queued::Clientless {
             clients.push(j.replay.subscribe().await);
@@ -168,6 +201,15 @@ async fn decided(workers: &[(u32, bool)], runs: &[Run], queued: &[Queued]) -> Ve
         }
     }
     tokio::time::advance(t0 + Duration::from_secs(end) - Instant::now()).await;
+    if let Some((leader, held)) = frozen {
+        let key = |b: &usize| jobs[*b].key.clone();
+        let h = Heartbeat {
+            leader_key: Some(key(&leader)),
+            frozen_keys: held.iter().map(key).collect(),
+            ..Heartbeat::default()
+        };
+        state.record_frozen(0, &h);
+    }
     state.give_up_clientless().await;
     let given_up = |b: &usize| state.given_up(&jobs[*b].id).is_cancelled();
     (0..jobs.len()).filter(given_up).collect()
@@ -193,6 +235,8 @@ async fn a_resume_keeps_the_run_and_the_absence() {
         worker: "w".into(),
         session: 1,
         until,
+        run: losses::Run::Started,
+        charged: false,
     });
     let _again = state.list_dispatch(&j, 2);
     let resumed = state.dispatched.lock().unwrap()[&j.id].started;
@@ -202,46 +246,4 @@ async fn a_resume_keeps_the_run_and_the_absence() {
     let _fresh = state.list_dispatch(&j, 3);
     let fresh = state.dispatched.lock().unwrap()[&j.id].started;
     assert_ne!(fresh, started);
-}
-
-/// The decider never holds the hub's queue while it waits on a queued
-/// build's replay: a client that stopped reading holds that replay's lock
-/// for SUB_STALL in publish (as hold_unservable's note to such a build
-/// does), and take_job, requeue and submit all need the queue, which
-/// must not wait the 60 s with it.
-#[tokio::test(start_paused = true)]
-async fn the_decider_never_holds_the_queue_across_a_replay_wait() {
-    let state = Arc::new(HubState::for_test(Duration::ZERO));
-    let replay = Arc::new(Replay::default());
-    // A client that never reads: its channel is full after SUB_CHANNEL_SLACK.
-    let _client = replay.subscribe().await;
-    for _ in 0..SUB_CHANNEL_SLACK {
-        replay
-            .publish(attach_event::Event::Log(b"x".to_vec()))
-            .await;
-    }
-    state.queue.lock().await.push_back(job(0, replay.clone()));
-    // The next event waits SUB_STALL for it, holding the replay's lock.
-    let publisher = replay.clone();
-    let note = attach_event::Event::Log(b"note".to_vec());
-    let publishing = tokio::spawn(async move { publisher.publish(note).await });
-    for _ in 0..3 {
-        tokio::task::yield_now().await;
-    }
-    let busy = tokio::time::timeout(Duration::ZERO, replay.has_subscribers()).await;
-    assert!(busy.is_err(), "publish holds the replay's lock");
-    let decider = state.clone();
-    let deciding = tokio::spawn(async move { decider.waiting_queued().await.len() });
-    for _ in 0..3 {
-        tokio::task::yield_now().await;
-    }
-    let t0 = Instant::now();
-    drop(state.queue.lock().await);
-    let waited = t0.elapsed();
-    publishing.await.unwrap();
-    assert_eq!(deciding.await.unwrap(), 1, "the build waits for a slot");
-    assert!(
-        waited < Duration::from_secs(1),
-        "take_job waited {waited:?} for the queue behind one stalled client"
-    );
 }

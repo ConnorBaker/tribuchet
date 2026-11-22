@@ -15,25 +15,28 @@ use std::time::Duration;
 use tokio::sync::mpsc;
 use tonic::Status;
 
-use super::cancel;
-use super::losses::Dispatch;
+use super::losses::{Dispatch, Run};
 use super::metrics::Metrics;
 use super::naming::drv_name;
 use super::record::Rest;
 use super::state::{HubState, Job, Replay};
+use super::{SILENCE_TIMEOUT, cancel};
 use crate::errors::{Error, Result, err_msg};
 use crate::proto::{
     BuildAssignment, BuildResult, HubMessage, ResultAck, attach_event, hub_message, worker_message,
 };
 
+/// Send `msg` on a stream of the worker's session: bounded, as the
+/// worker's silence is (chunkio::SILENCE_TIMEOUT).
 pub(super) async fn send(
     out_tx: &mpsc::Sender<Result<HubMessage, Status>>,
     msg: hub_message::Msg,
 ) -> Result<()> {
-    out_tx
-        .send(Ok(HubMessage { msg: Some(msg) }))
-        .await
-        .map_err(|_| err_msg("worker connection lost"))
+    let sent = out_tx.send(Ok(HubMessage { msg: Some(msg) }));
+    match tokio::time::timeout(SILENCE_TIMEOUT, sent).await {
+        Ok(sent) => sent.map_err(|_| err_msg("worker connection lost")),
+        Err(_) => Err(Error::Silent),
+    }
 }
 
 /// Drive one dispatched build to its verdict on the worker the hub
@@ -43,13 +46,17 @@ pub(super) async fn run_job(
     state: &HubState,
     job: &Job,
     (out_tx, worker, session): (&mpsc::Sender<Result<HubMessage, Status>>, &str, u64),
-    mut in_rx: mpsc::Receiver<worker_message::Msg>,
+    mut in_rx: Inbox,
     sess: Arc<WorkerSession>,
     dispatch: &mut Dispatch,
 ) -> Result<()> {
     let req = &job.req;
     let mut staging = Staging::new(state, job, &sess);
     let inputs = staging.assignment_inputs().await?;
+    let run = state.runs.next();
+    tracing::debug!(id = job.id, %run, "assigning a run");
+    state.shadow.assigned(&run, &job.key, worker);
+    dispatch.run = Some(run.clone());
     send(
         out_tx,
         hub_message::Msg::Assignment(BuildAssignment {
@@ -69,12 +76,11 @@ pub(super) async fn run_job(
             worker_name: worker.to_owned(),
             timeout_secs: req.timeout_secs,
             max_silent_secs: req.max_silent_secs,
+            run: Some(run),
         }),
     )
     .await?;
     dispatch.sent = true;
-
-    stream_tmp_dir(&job.id, &job.tmp_dir_pack, out_tx).await?;
 
     let mut cancel_sent = false;
     let given_up = state.given_up(&job.id);
@@ -87,12 +93,13 @@ pub(super) async fn run_job(
 
     loop {
         let m = tokio::select! {
-            r = staging.progress(out_tx), if staging.busy() => {
+            r = staging.progress(&sess.bulk), if staging.busy() => {
                 r?;
                 continue;
             }
             () = given_up.cancelled(), if !cancel_sent => {
                 tracing::info!(id = job.id, "no attach client left; cancelling build");
+                state.shadow.abort("clientless give-up", dispatch.run.as_ref());
                 cancel(out_tx, job).await?;
                 cancel_sent = true;
                 continue;
@@ -100,6 +107,7 @@ pub(super) async fn run_job(
             _ = abandon_check.tick() => {
                 if resumed_after.is_some_and(|n| state.unlisted(session, &job.key, n)) {
                     tracing::warn!(id = job.id, "the worker no longer lists the build it resumed");
+                    state.shadow.gone("unlisted", dispatch.run.as_ref());
                     return Err(Error::Unlisted);
                 }
                 if cancel_sent && state.superseded(&job.id) {
@@ -112,17 +120,41 @@ pub(super) async fn run_job(
         match m {
             // The worker already holds this build (it survived a hub
             // restart). Its result arrives like any other.
-            worker_message::Msg::Resumed(_) => {
-                dispatch.resumed = true;
+            worker_message::Msg::Resumed(r) => {
+                let run = if r.finished {
+                    Run::Finished
+                } else {
+                    Run::Started
+                };
+                (dispatch.reached, dispatch.resumed) = (dispatch.reached.max(run), true);
                 resumed_after = Some(state.heartbeats(session));
-                tracing::info!(id = job.id, "worker resumed an in-flight build");
+                let held = r.run.as_ref().map(ToString::to_string);
+                tracing::info!(id = job.id, held, "worker resumed an in-flight build");
+                state
+                    .shadow
+                    .resumed(dispatch.run.as_ref(), r.run.as_ref(), &job.key);
+            }
+            worker_message::Msg::Started(s) => {
+                dispatch.reached = dispatch.reached.max(Run::Started);
+                state.shadow.started(s.run.as_ref());
+            }
+            worker_message::Msg::ResultGone(g) => {
+                state.shadow.gone("result gone", g.run.as_ref());
+                return Err(Error::ResultGone);
             }
             worker_message::Msg::Log(l) => {
                 job.replay.publish(attach_event::Event::Log(l.data)).await;
             }
             worker_message::Msg::Need(n) => {
+                // The build's bulk goes on the session's other connection,
+                // once the worker has answered its assignment: none of it
+                // can overtake the assignment then.
+                if !dispatch.staged {
+                    state.shadow.need(dispatch.run.as_ref());
+                    stream_tmp_dir(&job.id, &job.tmp_dir_pack, &sess.bulk).await?;
+                }
                 dispatch.staged = true;
-                staging.handle_need(n, out_tx).await?;
+                staging.handle_need(n, &sess.bulk).await?;
             }
             worker_message::Msg::Result(res) => {
                 if let Some(u) = &res.usage {
@@ -150,11 +182,14 @@ pub(super) async fn run_job(
                         "build usage"
                     );
                 }
+                state.shadow.result(job, res.run.as_ref(), res.exit_code);
                 if res.exit_code != 0 {
                     return publish_worker_failure(state, out_tx, job, &res).await;
                 }
+                dispatch.reached = Run::Finished;
                 let outputs = verify_set(res.outputs, &job.req.outputs)?;
                 deliver_outputs(state, job, out_tx, &mut in_rx, outputs).await?;
+                state.shadow.fetched(job, res.run.as_ref());
                 finish_relay(state, out_tx, &job.replay, job).await;
                 return Ok(());
             }
@@ -171,7 +206,7 @@ pub(super) async fn run_job(
 /// Log/error-safe name of a worker message variant. The messages embed
 /// peer-controlled bytes (NAR chunks, log data); Debug-formatting them
 /// into error strings would balloon logs and replay buffers.
-pub(super) fn msg_name(msg: &worker_message::Msg) -> &'static str {
+pub(crate) fn msg_name(msg: &worker_message::Msg) -> &'static str {
     match msg {
         worker_message::Msg::Register(_) => "Register",
         worker_message::Msg::Heartbeat(_) => "Heartbeat",
@@ -181,18 +216,27 @@ pub(super) fn msg_name(msg: &worker_message::Msg) -> &'static str {
         worker_message::Msg::Chunk(_) => "ChunkFrame",
         worker_message::Msg::RequestJob(_) => "RequestJob",
         worker_message::Msg::Resumed(_) => "Resumed",
+        worker_message::Msg::Started(_) => "Started",
+        worker_message::Msg::ResultGone(_) => "ResultGone",
     }
 }
 
-/// The channel carries only this build's messages (route_loop filters);
-/// it closes when the worker disconnects or goes silent.
-pub(super) async fn recv(
-    in_rx: &mut mpsc::Receiver<worker_message::Msg>,
-) -> Result<worker_message::Msg> {
-    in_rx
-        .recv()
-        .await
-        .ok_or_else(|| err_msg("worker disconnected or went silent"))
+/// One build's messages from its worker (Router::route): its output
+/// chunks apart, so that none of its control waits behind them.
+pub(in crate::hub) struct Inbox {
+    pub(in crate::hub) ctl: mpsc::UnboundedReceiver<worker_message::Msg>,
+    pub(in crate::hub) bulk: mpsc::Receiver<worker_message::Msg>,
+}
+
+/// The build's next message, control first; an error once the worker
+/// disconnects or goes silent.
+pub(super) async fn recv(in_rx: &mut Inbox) -> Result<worker_message::Msg> {
+    tokio::select! {
+        biased;
+        Some(m) = in_rx.ctl.recv() => Ok(m),
+        Some(m) = in_rx.bulk.recv() => Ok(m),
+        else => Err(err_msg("worker disconnected or went silent")),
+    }
 }
 
 async fn finish_relay(

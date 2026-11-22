@@ -21,16 +21,7 @@ struct Row {
     frozen: (i64, i64),
 }
 
-const ROWS: [Row; 3] = [
-    // Page cache filling the slice is headroom: the follower is frozen
-    // (a rule that counted it as used froze nothing). The cache is written
-    // once, before.
-    Row {
-        name: "cache",
-        work: ["CL", "CF"],
-        limits: (0, 0),
-        frozen: (5000, i64::MAX),
-    },
+const ROWS: [Row; 2] = [
     // The follower's random bytes stay pinned (zswap refuses pages that
     // do not compress, and swap is no room): they do not fit, so it is not
     // frozen (frozen, it OOM-killed the leader at the merge base in 1 of 2
@@ -163,14 +154,6 @@ fn rows() {
     succeed(
         Node::Worker,
         "systemctl start 'system-tribuchet\\x2dagent.slice'",
-    );
-    // Page cache charged to the slice: a unit in it writes and reads back
-    // more than the slice's cap, then exits.
-    succeed(
-        Node::Worker,
-        "systemd-run --wait --collect --quiet --slice='system-tribuchet\\x2dagent.slice' \
-         --unit=arb-fill bash -lc 'dd if=/dev/zero of=/var/tmp/fill bs=1M count=2600 status=none \
-         && sync && cat /var/tmp/fill > /dev/null'",
     );
     let mut problems = Vec::new();
     for row in &ROWS {

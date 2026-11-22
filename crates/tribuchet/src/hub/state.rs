@@ -3,39 +3,44 @@
 use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fmt::Write as _;
 use std::fs;
-use std::io::{self, Write};
-use std::path::Path;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::sync::atomic;
 use std::time::{Duration, Instant};
 
-use tokio::sync::{Mutex, Notify, mpsc};
+use tokio::sync::{Mutex, Notify, mpsc, watch};
 use tonic::Status;
 
-use super::Loss;
 use super::chunkcache::ChunkCache;
-use super::losses;
+use super::known::Known;
+use super::losses::{self, Loss};
 use super::metrics::Metrics;
 use super::placement::{Expected, Placement};
 use super::relay::{DAEMON_ANSWER, DaemonEvidence};
+use super::runs::Runs;
+use super::shadow::Shadow;
 use crate::config::NixConfig;
-use crate::fsutil::io_ctx;
+use crate::fsutil::write_atomic;
 
 use crate::proto::{AttachEvent, BuildRequest, attach_event};
 
 #[path = "state/clientless.rs"]
 mod clientless;
+#[path = "state/hold.rs"]
+mod hold;
 #[path = "state/inflight.rs"]
 mod inflight;
 #[path = "state/replay.rs"]
 mod replay;
+#[path = "state/take.rs"]
+mod take;
 
 pub(super) use clientless::Dispatched;
 #[cfg(test)]
 pub(super) use clientless::FLOOR;
 pub(super) use inflight::{Inflight, Listing};
 pub(super) use replay::{KeptOutputs, Replay, Wait};
+pub(super) use take::Holding;
 
 type EventTx = mpsc::Sender<Result<AttachEvent, Status>>;
 
@@ -43,10 +48,8 @@ type EventTx = mpsc::Sender<Result<AttachEvent, Status>>;
 /// streams chunks forever grows root-hub memory without bound.
 const MAX_REPLAY_BYTES: usize = 256 * 1024 * 1024;
 
-/// Per-subscriber channel headroom beyond the buffered backlog. An
-/// attach client that falls this far behind gets no live events until
-/// it has room again, or catches up once its build ends (replay.rs),
-/// instead of the hub buffering the whole build a second time for it.
+/// Events read from the replay for an attach client that it has not
+/// taken yet; its reader waits there, not the build (replay.rs).
 const SUB_CHANNEL_SLACK: usize = 1024;
 
 pub(super) struct Job {
@@ -66,17 +69,15 @@ pub(super) struct Job {
     /// Genuine losses (hub/losses.rs): capped so a crash-looping
     /// build cannot bounce forever.
     pub(super) attempts: u32,
-    /// Losses on a resume (hub/losses.rs): capped so a worker that
-    /// loses every resume cannot keep the build forever.
-    pub(super) resumed_losses: u32,
+    /// Losses in transport (hub/losses.rs): capped so a build the farm
+    /// cannot move goes back to its clients.
+    pub(super) transport_losses: u32,
     /// When the job last entered the queue, for the queue-wait histogram.
     pub(super) queued_at: Instant,
     /// The loss of the build with its worker's session, which the next
-    /// dispatch settles: a resume by that worker clears it; a
-    /// start-over, or an assignment the hub could not hand over, counts
-    /// it as genuine; that worker's session dying before either counts
-    /// it as a loss on a resume. Until the loss's grace ends, or the
-    /// worker is back, the build is kept for that worker (Loss::awaited).
+    /// dispatch settles (hub/losses.rs), with how far its run got. Until
+    /// the loss's grace ends, or the worker is back, the build is kept
+    /// for that worker (Loss::awaited).
     pub(super) loss: Option<Loss>,
     /// When it was first passed over for another worker (placement::
     /// Rooms): none since it last entered the queue.
@@ -91,6 +92,16 @@ impl Job {
     /// Stop deduping new submissions onto this job.
     pub(super) fn unlist(&self) {
         drop(self.listing.lock().unwrap().take());
+    }
+
+    /// Tell its clients to drop any half-streamed output NARs: the next
+    /// attempt, or their own build, writes them from the start.
+    pub(super) async fn restart_outputs(&self) {
+        for path in self.req.outputs.values() {
+            let restart = attach_event::Event::OutputRestart(path.clone());
+            self.replay.publish(restart).await;
+        }
+        self.replay.unpin_outputs().await;
     }
 
     /// Whether no fresh take may have it: a worker's key holds it, or its
@@ -139,39 +150,26 @@ pub(super) struct HubState {
     pub(super) departed: StdMutex<Vec<(WorkerCaps, Instant)>>,
     /// worker id -> the builds it holds from before (Holding).
     pub(super) holding: StdMutex<HashMap<u64, Holding>>,
+    /// Worker name -> build id -> key, of the builds dispatched to it,
+    /// until no build wants the key and the worker lists it no more (strays).
+    ran: StdMutex<HashMap<String, HashMap<String, String>>>,
     /// Woken when worker capabilities change so waiting submissions
     /// re-check servability without polling.
     pub(super) caps_changed: Notify,
     /// Build lifecycle counters scraped by the metrics endpoint.
     pub(super) metrics: Metrics,
     /// When set, the connected-worker set is mirrored to this nix.conf
-    /// fragment on every register/deregister.
-    pub(super) nix_config: Option<NixConfig>,
-    /// The fragment's renderings, numbered in worker_caps order, and the
-    /// newest written (write_newest).
-    nix_rendered: atomic::AtomicU64,
-    nix_written: Arc<StdMutex<u64>>,
+    /// fragment on every register/deregister, through its one writer.
+    pub(super) nix_config: Option<(NixConfig, watch::Sender<String>)>,
     pub(super) chunks: Arc<ChunkCache>,
     /// Each worker session's admission (placement.rs).
     pub(super) placement: StdMutex<Placement>,
-}
-
-/// The builds a worker session holds from before, by dedupe key: the
-/// keys it listed last (Register's, then each Heartbeat's
-/// resumable_keys), after `beats` heartbeats, less those a dispatch took
-/// since: each is honoured once. A key a later heartbeat leaves out is
-/// no longer held, which `unlisted` tells a resumed build.
-#[derive(Default)]
-pub(super) struct Holding {
-    beats: u64,
-    keys: HashSet<String>,
-    taken: HashSet<String>,
-}
-
-impl Holding {
-    pub(super) fn holds(&self, key: &str) -> bool {
-        self.keys.contains(key) && !self.taken.contains(key)
-    }
+    /// Numbers each dispatch's run.
+    pub(super) runs: Runs,
+    /// The semantic core beside the hub, logging where they differ.
+    pub(super) shadow: Arc<Shadow>,
+    /// Every worker that registered, across restarts (L11).
+    pub(super) known: Known,
 }
 
 #[derive(Clone)]
@@ -209,23 +207,6 @@ fn render_nix_config(caps: &HashMap<u64, WorkerCaps>, cfg: &NixConfig) -> String
         let _ = writeln!(out, "max-jobs = {jobs}");
     }
     out
-}
-
-/// Write `content` to `path` through a temporary file, `path` and ".tmp",
-/// made anew (one left there is removed: a symlink is never followed),
-/// renamed into place, and removed where the write failed. A path's
-/// writers are serialised by write_newest.
-pub(super) fn write_atomic(path: &Path, content: &str) -> io::Result<()> {
-    let tmp = path.with_added_extension("tmp");
-    let _ = fs::remove_file(&tmp);
-    let written = fs::File::create_new(&tmp)
-        .map_err(io_ctx("creating", &tmp))
-        .and_then(|mut f| f.write_all(content.as_bytes()).and_then(|()| f.sync_all()))
-        .and_then(|()| fs::rename(&tmp, path).map_err(io_ctx("renaming into", path)));
-    if written.is_err() {
-        let _ = fs::remove_file(&tmp);
-    }
-    written
 }
 
 impl WorkerCaps {
@@ -270,94 +251,62 @@ impl HubState {
             started_at: Instant::now(),
             departed: StdMutex::default(),
             holding: StdMutex::default(),
+            ran: StdMutex::default(),
             caps_changed: Notify::default(),
             metrics: Metrics::default(),
-            nix_config,
-            nix_rendered: atomic::AtomicU64::default(),
-            nix_written: Arc::default(),
+            nix_config: nix_config.map(Self::nix_config_writer),
             chunks,
             placement: StdMutex::default(),
+            runs: Runs::default(),
+            shadow: Arc::default(),
+            known: Known::default(),
         }
     }
 
     /// Mirror the connected-worker set to the nix.conf fragment. Called
-    /// after a register/deregister mutates `worker_caps`. The fragment is
-    /// rendered and numbered under that lock, so concurrent register/
-    /// deregister number their renderings in the order they changed it,
-    /// and written on a blocking thread, outside it: no file I/O on the
-    /// runtime or under a lock.
+    /// after a register/deregister mutates `worker_caps`.
     pub(super) fn regen_nix_config(&self) {
-        let Some(cfg) = &self.nix_config else {
+        let Some((cfg, tx)) = &self.nix_config else {
             return;
         };
-        let (generation, content) = {
-            let caps = self.worker_caps.lock().unwrap();
-            let generation = self.nix_rendered.fetch_add(1, atomic::Ordering::Relaxed) + 1;
-            (generation, render_nix_config(&caps, cfg))
-        };
-        let (written, path) = (self.nix_written.clone(), cfg.path.clone());
-        tokio::task::spawn_blocking(move || {
-            write_newest(&written, generation, &path, &content, "nix.conf fragment");
-        });
+        // Render and send under the lock: the last sent is the newest.
+        let caps = self.worker_caps.lock().unwrap();
+        tx.send_replace(render_nix_config(&caps, cfg));
     }
-}
 
-/// Write `content`, rendering number `generation`, to `path` unless a
-/// newer rendering was written: whatever order the writes run in, the
-/// newest rendering is the one left, never stale content. `what` names
-/// the file in a warning.
-pub(super) fn write_newest(
-    written: &StdMutex<u64>,
-    generation: u64,
-    path: &Path,
-    content: &str,
-    what: &str,
-) {
-    let mut newest = written.lock().unwrap();
-    if *newest > generation {
-        return;
+    /// The fragment's one writer: each time it wakes it writes the newest
+    /// rendering (the watch keeps no other), off the runtime.
+    pub(super) fn nix_config_writer(cfg: NixConfig) -> (NixConfig, watch::Sender<String>) {
+        let (tx, mut rx) = watch::channel(String::new());
+        let writer = cfg.clone();
+        tokio::spawn(async move {
+            while rx.changed().await.is_ok() {
+                let (cfg, content) = (writer.clone(), rx.borrow_and_update().clone());
+                let write = move || Self::write_nix_config(&cfg, &content);
+                drop(tokio::task::spawn_blocking(write).await);
+            }
+        });
+        (cfg, tx)
     }
-    *newest = generation;
-    // Skip the write, and the daemon restart the watching path unit
-    // would trigger, when nothing changed (e.g. a worker reconnects
-    // with the same capabilities).
-    if fs::read_to_string(path).is_ok_and(|cur| cur == content) {
-        return;
-    }
-    if let Err(e) = write_atomic(path, content) {
-        tracing::warn!(error = %e, path = %path.display(), "failed to write the {what}");
+
+    fn write_nix_config(cfg: &NixConfig, content: &str) {
+        // Skip the write, and the daemon restart the watching path unit
+        // would trigger, when nothing changed (e.g. a worker reconnects
+        // with the same capabilities).
+        if fs::read_to_string(&cfg.path).is_ok_and(|cur| cur == content) {
+            return;
+        }
+        if let Err(e) = write_atomic(&cfg.path, content) {
+            tracing::warn!(
+                error = %e,
+                path = %cfg.path.display(),
+                "failed to write nix.conf fragment"
+            );
+        }
     }
 }
 
 impl HubState {
-    /// Worker session `worker` lists `keys` as held: at registration,
-    /// or in a heartbeat (`beat`), which also counts it.
-    pub(super) fn hold(&self, worker: u64, keys: HashSet<String>, beat: bool) {
-        let mut holding = self.holding.lock().unwrap();
-        let h = holding.entry(worker).or_default();
-        (h.beats, h.keys) = (h.beats + u64::from(beat), keys);
-        h.taken.clear();
-    }
-
-    /// The heartbeats worker session `worker` has sent so far.
-    pub(super) fn heartbeats(&self, worker: u64) -> u64 {
-        self.holding
-            .lock()
-            .unwrap()
-            .get(&worker)
-            .map_or(0, |h| h.beats)
-    }
-
-    /// Whether a heartbeat of worker session `worker` after its first
-    /// `after` left `key` out: the worker no longer holds that build.
-    pub(super) fn unlisted(&self, worker: u64, key: &str, after: u64) -> bool {
-        self.holding
-            .lock()
-            .unwrap()
-            .get(&worker)
-            .is_some_and(|h| h.beats > after && !h.keys.contains(key))
-    }
-
     /// Remember a departed worker's capabilities so a build for the
     /// platform it served waits for it to reconnect rather than
     /// declining at once.
@@ -405,195 +354,173 @@ impl HubState {
             .max()
     }
 
-    /// The first queued job `caps`'s worker can take, as worker session
-    /// `asker`, if any: a build it passes over to a less full worker
-    /// (placement::Rooms) stays queued, the session it is left to woken.
-    pub(super) async fn take_job(&self, caps: &WorkerCaps, asker: Option<u64>) -> Option<Job> {
-        loop {
-            // Read before the queue lock, so that nothing more is taken
-            // under it; afresh on a rescan, which passes over again.
-            let mut rooms = asker.map(|id| self.placement.lock().unwrap().rooms_for(id));
-            let (taken, left) = {
-                let mut queue = self.queue.lock().await;
-                let holding = self.holding.lock().unwrap();
-                // A held key goes to its holder by take_job_by_key, this
-                // worker included: a fresh take would count the loss its
-                // Resumed is about to clear.
-                let workers = self.worker_caps.lock().unwrap();
-                let (now, mut left) = (Instant::now(), Vec::new());
-                let pos = queue.iter_mut().position(|j| {
-                    if !caps.serves(&j.req.system, &j.features) || j.kept(&workers, &holding) {
-                        return false;
-                    }
-                    let (system, features, first) =
-                        (&j.req.system, &j.features, j.deferred.is_none());
-                    let serves = |id| workers.get(&id).is_some_and(|c| c.serves(system, features));
-                    let demand = j.expected.demand;
-                    let to = (rooms.as_mut())
-                        .and_then(|r| r.passes(demand, &mut j.deferred, serves, now));
-                    if let Some(to) = to.filter(|_| first) {
-                        left.push((j.id.clone(), workers.get(&to).map(|c| c.name.clone())));
-                    }
-                    to.is_none()
-                });
-                (pos.and_then(|p| queue.remove(p)), left)
-            };
-            for (id, to) in &left {
-                tracing::info!(
-                    id,
-                    to,
-                    "leaving a build to a less full worker with an idle agent"
-                );
-            }
-            if !left.is_empty() {
-                self.notify.notify_waiters();
-            }
-            let mut job = taken?;
-            // Abandoned while queued (every attach client gone): drop it
-            // here, at the moment it would have occupied a build slot.
-            if !job.replay.has_subscribers().await {
-                tracing::info!(id = job.id, "dropping queued build: no client attached");
-                self.finish(&job).await;
-                continue;
-            }
-            // Its last worker did not resume it: this starts it over.
-            if job.loss.take().is_some() {
-                let Some(j) = losses::count(self, job, true).await else {
-                    continue;
-                };
-                job = j;
-            }
-            return Some(job);
-        }
-    }
-
-    /// Take a queued job `worker` can resume, regardless of its
-    /// capacity. Each held key is honoured once.
-    pub(super) async fn take_job_by_key(&self, worker: u64) -> Option<Job> {
-        let mut job = {
-            let mut queue = self.queue.lock().await;
-            let mut holding = self.holding.lock().unwrap();
-            let held = holding.get_mut(&worker)?;
-            let pos = queue.iter().position(|j| held.holds(&j.key))?;
-            let job = queue.remove(pos)?;
-            held.taken.insert(job.key.clone());
-            job
-        };
-        // Held by a worker other than the one that lost it: that loss
-        // stands. The same worker's resume is settled by run_job.
-        let name = self
-            .worker_caps
-            .lock()
-            .unwrap()
-            .get(&worker)
-            .map(|c| c.name.clone());
-        if job
-            .loss
-            .as_ref()
-            .is_some_and(|r| Some(&r.worker) != name.as_ref())
-        {
-            job.loss = None;
-            job = losses::count(self, job, true).await?;
-        }
-        Some(job)
-    }
-
     /// Put a job back in the queue after its worker session died,
     /// telling attach clients to drop any half-streamed output NARs
     /// (the next attempt re-streams them from the start), and leaving
     /// their chunks to the cache while it waits, held or not.
     pub(super) async fn requeue(self: &Arc<Self>, mut job: Job) {
         (job.queued_at, job.deferred) = (Instant::now(), None);
-        for path in job.req.outputs.values() {
-            job.replay
-                .publish(attach_event::Event::OutputRestart(path.clone()))
-                .await;
-        }
-        job.replay.unpin_outputs().await;
+        job.restart_outputs().await;
         self.queue.lock().await.push_back(job);
         self.notify.notify_waiters();
         self.hold_unservable().await;
-    }
-
-    /// Hold queued jobs no connected worker serves, telling their
-    /// clients, and re-run when the latest expected worker is due.
-    pub(super) async fn hold_unservable(self: &Arc<Self>) {
-        let Some(mut due) = self.hold_unservable_now().await else {
-            return;
-        };
-        let state = self.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep_until((due + Duration::from_secs(1)).into()).await;
-                match state.hold_unservable_now().await {
-                    Some(next) => due = next,
-                    None => break,
-                }
-            }
-        });
     }
 
     pub(super) async fn finish(&self, job: &Job) {
         job.unlist();
         job.replay.finish().await;
     }
-
-    /// Returns the latest deadline a queued job is still waiting for.
-    /// A job no worker is expected for stays queued until one
-    /// registers: its build is not the failure. Its client leaving
-    /// drops it, as at any other point in the queue.
-    async fn hold_unservable_now(&self) -> Option<Instant> {
-        let mut due: Option<Instant> = None;
-        let mut unservable = Vec::new();
-        for j in self.queue.lock().await.iter() {
-            match self.servability(&j.req.system, &j.features) {
-                Servability::Now => {}
-                Servability::ExpectedBy(at) => due = Some(due.map_or(at, |d| d.max(at))),
-                Servability::Never => unservable.push((
-                    j.id.clone(),
-                    j.replay.clone(),
-                    j.req.system.clone(),
-                    j.features.join(","),
-                )),
-            }
-        }
-        // Outside the queue lock: both wait on the job's replay.
-        let mut abandoned = HashSet::new();
-        for (id, replay, system, features) in unservable {
-            if !replay.has_subscribers().await {
-                abandoned.insert(id);
-                continue;
-            }
-            let note = format!(
-                "tribuchet: no connected worker builds {system} [{features}]; waiting for one\n"
-            );
-            if replay.tell_waiting(Wait::Worker, note).await {
-                tracing::warn!(
-                    id,
-                    system,
-                    features,
-                    "holding queued build: no capable worker"
-                );
-            }
-        }
-        if !abandoned.is_empty() {
-            let gone: Vec<Job> = {
-                let mut queue = self.queue.lock().await;
-                let (gone, kept) = queue
-                    .drain(..)
-                    .partition::<VecDeque<Job>, _>(|j| abandoned.contains(&j.id));
-                *queue = kept;
-                gone.into()
-            };
-            for job in gone {
-                tracing::info!(id = job.id, "dropping queued build: no client attached");
-                self.finish(&job).await;
-            }
-        }
-        due
-    }
 }
 
 #[cfg(test)]
 #[path = "state/tests.rs"]
-mod tests;
+mod queue_tests;
+
+#[cfg(test)]
+mod tests {
+    use super::queue_tests::queued;
+    use super::*;
+
+    #[tokio::test]
+    async fn queued_job_survives_worker_restart_within_grace() {
+        let mut state = Arc::new(HubState::for_test(Duration::from_secs(30)));
+        Arc::get_mut(&mut state).unwrap().started_at =
+            Instant::now().checked_sub(Duration::from_mins(1)).unwrap();
+        let replay = Arc::new(Replay::default());
+        let _rx = replay.subscribe().await;
+        state
+            .queue
+            .lock()
+            .await
+            .push_back(queued("x86_64-linux", replay));
+        state.record_departed(caps("x86_64-linux", &[]));
+        state.hold_unservable().await;
+        assert_eq!(state.queue.lock().await.len(), 1);
+    }
+
+    fn caps(system: &str, features: &[&str]) -> WorkerCaps {
+        WorkerCaps {
+            name: "w".into(),
+            connected_at: Instant::now(),
+            systems: [(
+                system.to_owned(),
+                features.iter().map(|f| (*f).to_owned()).collect(),
+            )]
+            .into(),
+            max_jobs: 1,
+        }
+    }
+
+    #[test]
+    fn startup_window_awaits_then_unseen_platform_declines() {
+        // Within the startup window any platform is awaited (workers
+        // have not re-registered yet); once it lapses a never-seen
+        // platform with no departed worker declines at once.
+        let within = HubState::for_test(Duration::from_secs(30));
+        assert!(within.expected_deadline("aarch64-linux", &[]).is_some());
+        let lapsed = HubState::for_test(Duration::ZERO);
+        assert!(lapsed.expected_deadline("aarch64-linux", &[]).is_none());
+    }
+
+    #[test]
+    fn departed_worker_keeps_its_platform_expected() {
+        // Past the startup window but inside the reconnect window.
+        let mut state = HubState::for_test(Duration::from_secs(30));
+        state.started_at = Instant::now().checked_sub(Duration::from_mins(1)).unwrap();
+        state.record_departed(caps("x86_64-linux", &["kvm"]));
+        let kvm = vec!["kvm".to_owned()];
+        let kvm_bp = vec!["kvm".to_owned(), "big-parallel".to_owned()];
+        // The exact platform it served is still awaited.
+        assert!(state.expected_deadline("x86_64-linux", &kvm).is_some());
+        // A feature it never offered, or another system, is not.
+        assert!(state.expected_deadline("x86_64-linux", &kvm_bp).is_none());
+        assert!(state.expected_deadline("aarch64-linux", &[]).is_none());
+    }
+
+    #[test]
+    fn nix_config_union_systems_and_capped_oversubscribed_jobs() {
+        let cfg = NixConfig {
+            path: "/run/x".into(),
+            attach_program: "/nix/store/attach".into(),
+            oversubscribe_percent: 200,
+            max_jobs_cap: 256,
+        };
+        let mut workers = HashMap::new();
+        workers.insert(1, {
+            let mut c = caps("x86_64-linux", &[]);
+            c.max_jobs = 100;
+            c
+        });
+        workers.insert(2, {
+            let mut c = caps("aarch64-linux", &[]);
+            c.max_jobs = 50;
+            c
+        });
+        let out = render_nix_config(&workers, &cfg);
+        assert!(
+            out.contains(r#""systems":["aarch64-linux","x86_64-linux"]"#),
+            "{out}"
+        );
+        assert!(out.contains(r#""program":"/nix/store/attach""#), "{out}");
+        // (100 + 50) * 2 = 300, clamped to the cap.
+        assert!(out.contains("max-jobs = 256\n"), "{out}");
+    }
+
+    #[test]
+    fn nix_config_json_escapes_peer_supplied_systems() {
+        let cfg = NixConfig {
+            path: "/run/x".into(),
+            attach_program: r"/nix/store/at\tach".into(),
+            oversubscribe_percent: 100,
+            max_jobs_cap: 1,
+        };
+        let mut workers = HashMap::new();
+        workers.insert(1, caps("x86_64-linux\u{2028}\"", &[]));
+        let out = render_nix_config(&workers, &cfg);
+        let json = out
+            .strip_prefix("external-builders = ")
+            .and_then(|s| s.lines().next())
+            .unwrap();
+        // Nix parses this as JSON; must be valid regardless of what a
+        // worker registered or how the attach path is spelled.
+        let v: serde_json::Value = serde_json::from_str(json).unwrap();
+        assert_eq!(v[0]["systems"][0], "x86_64-linux\u{2028}\"");
+        assert_eq!(v[0]["program"], r"/nix/store/at\tach");
+    }
+
+    #[test]
+    fn nix_config_without_workers_omits_max_jobs() {
+        let cfg = NixConfig {
+            path: "/run/x".into(),
+            attach_program: "/nix/store/attach".into(),
+            oversubscribe_percent: 200,
+            max_jobs_cap: 256,
+        };
+        let out = render_nix_config(&HashMap::new(), &cfg);
+        assert!(out.contains(r#""systems":[]"#), "{out}");
+        // No worker -> leave max-jobs to the base nix.conf default so a
+        // local fallback build is not run at the offload capacity.
+        assert!(!out.contains("max-jobs"), "{out}");
+    }
+
+    #[test]
+    fn worker_caps_feature_matching() {
+        let caps = WorkerCaps {
+            name: "w1".into(),
+            connected_at: Instant::now(),
+            systems: [
+                ("x86_64-linux".to_owned(), ["kvm".to_owned()].into()),
+                ("aarch64-linux".to_owned(), [].into()),
+            ]
+            .into(),
+            max_jobs: 1,
+        };
+        assert!(caps.serves("x86_64-linux", &[]));
+        assert!(caps.serves("x86_64-linux", &["kvm".into()]));
+        assert!(!caps.serves("x86_64-linux", &["kvm".into(), "uid-range".into()]));
+        assert!(caps.serves("aarch64-linux", &[]));
+        // emulated system must not inherit the host's kvm
+        assert!(!caps.serves("aarch64-linux", &["kvm".into()]));
+        assert!(!caps.serves("i686-linux", &[]));
+    }
+}
