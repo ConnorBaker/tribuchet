@@ -396,15 +396,27 @@ The history is the fold of the hub's build record (`hub/record.rs`), a
 SQLite database at [placement] `record`, by default
 `$XDG_STATE_HOME/tribuchet/record.sqlite` (`/var/lib/tribuchet` under
 the NixOS module, its StateDirectory): state, not cache, as it is the
-only copy. It has two tables, appended to and never changed: `result`,
-a row per worker result that carries usage (the "build usage" line's
-fields, and whether the build declares `big-parallel`), and `dispatch`,
-a row per dispatch (the "dispatching build" line's values, unrounded).
-A record gains tables as a hub that writes them opens it: `profile`, a
-row per result whose usage had a profile, and `source`, a row per result
-of a build with sources, its digest, both by the result's `at_ms` and
-`id` (the fold reads a result's sources from it), and `drv_path`
-(below).
+only copy. Its tables are appended to and never changed: `result`, a
+row per worker result that carries usage (the "build usage" line's
+fields, and whether the build declares `big-parallel`), `dispatch`, a
+row per dispatch (the "dispatching build" line's values, unrounded),
+and `taught`, a row per result by its rowid, whether its run teaches
+worker speed (Worker speed), committed with the result. A record gains
+tables as a hub that writes them opens it: `profile`, a row per result
+whose usage had a profile, and `source`, a row per result of a build
+with sources, its digest, both by the result's `at_ms` and `id` (the
+fold reads a result's sources from it), and `drv_path` (below). A
+result with no `taught` row, in a record from before it or written by
+a hub that predates it (a rollback), gains one from the dispatches as a
+hub that writes the record takes it (below); a hub that only reads such
+a record folds those results untaught, and a hub that predates `taught`
+ignores it. The rowids `taught` names stay their results': the record
+refuses a delete or update of a `result` row (triggers), and VACUUM
+renumbers a table without an INTEGER PRIMARY KEY only past a deleted
+row. That is the bundled SQLite's behaviour, not its documentation's
+promise (rowids "may change"); a test VACUUMs a record and pins it. An
+INTEGER PRIMARY KEY on `result` would change the column count every
+hub inserts by.
 Other processes may query it while the hub runs (`sqlite3 -readonly`):
 it is in WAL mode, where readers and the one writer do not wait for each
 other. As the hub starts, before it serves, it folds every `result`
@@ -415,8 +427,9 @@ so the history is the fold of the record's rows and those queued to it.
 A result row with no system (an imported build queued before its
 journal began) teaches nothing.
 
-One thread writes the record, all the rows waiting in one transaction;
-handing a row to it never waits, so no runtime thread does the record's
+One thread writes the record, all the rows waiting in one transaction,
+the rows of one result handed over as one, so committed together;
+handing rows to it never waits, so no runtime thread does the record's
 file I/O. Each commit is durable (`synchronous=FULL`): a crash loses the
 rows handed over and not yet committed, never a committed row nor part
 of one. A commit that fails (a full disk, an I/O error) is logged as an
@@ -443,7 +456,41 @@ ran 38.5 billion user-space instructions and peaked at 68 MB, against
 22.6 billion and 27 MB without the table and 21.5 billion and 25 MB by
 the commit before them (perf, one CPU, two runs each, 2026-11-21, on
 the tree before memory admission); an index on `source (at_ms, id)`
-took 5.7 billion off it, and is not kept.
+took 5.7 billion off it, and is not kept. Speed added
+about 30 % to the fold before the stem and `source` table (they were
+not measured together): on
+a record of 1,559,881 results and 1,561,097 dispatch rows (706 MB, 13
+workers), the fold, reading each result's `taught` row by its rowid,
+ran 27.8 billion user-space instructions, against 21.5 billion without
+speed; peak RSS 29 MB. On synthetic records of 1,500,000 results it ran
+34.7 billion with 20 workers and 53.3 billion with 60, the fit costing
+O(workers^2) a taught run (speed.rs). Renewing the fit after every
+taught run instead ran 39.4 billion on the record (42 % more) and 100.5
+and 775.3 billion on the synthetic ones (2.9x and 14.5x). The fold runs
+before the hub tells systemd it is ready, within the unit's default
+90 s start timeout: 27.8 billion instructions fit in it at 0.31 billion
+a second, and each result adds about 18,000. (Release build, perf on
+one core, two runs each, 2026-11-22.) Giving each result of that record
+its `taught` row, as a hub first takes it, ran 105.0 billion with the
+fold of the day before, wrote 292 MB and grew the file 14 MB (83.0 and
+93.7 billion on the synthetic ones); a take of a record with every row
+ran 32.5 billion (one run, 2026-11-20). While it opens the record, the
+hub asks systemd, at once and then every 10 s, to extend its start
+timeout by 30 s (EXTEND_TIMEOUT_USEC), the later asks only if the open
+has progressed since the last: a count its SQL advances (SQLite's
+progress handler on its connections, every 1,000 VM steps, the fold's
+reading of the rows included). A long migration or fold is not killed;
+an open that hangs (a stuck filesystem, a syscall that never returns)
+stops being extended and is killed at the start timeout, or 30 to 40 s
+after its last progress (its last ask is at the first 10 s tick after
+it) if later. In that first take of the snapshot, the longest stretch
+without a progress callback is the migration's commit and checkpoint:
+30 MB read and written and 3 fsyncs (strace); between callbacks the
+hub ran at most 145 million user-space instructions (perf_event_open).
+A migration that fails, as space for its sort runs out (SQLite's
+temporary files, under `SQLITE_TMPDIR`, `TMPDIR` or `/var/tmp`), is
+logged as an error and changes nothing: the hub folds and records as
+it would, those results untaught until a hub takes the record again.
 
 The record replaces `placement-history.json` ([placement] `history`),
 which nothing reads now: a hub.toml that still sets `history` fails to
@@ -773,6 +820,198 @@ of every output name, not by the input's name.
 The replays and synthetic runs behind this order, by models kept outside
 this repository, are recorded in the message of the commit that added it.
 
+### Worker speed
+
+Workers differ in how fast they run the same build, and a worker can
+change. The history models them as uniformly related machines
+(`hub/placement/speed.rs`): build b takes p_b / s_w on worker w, a time
+of its own over a speed factor of the worker's, the same for every
+build; 1 is the farm's typical worker. A speed per build and worker
+(unrelated machines) would need runs of one key on every pair of
+workers, which the record has for too few keys.
+
+The factors are learned from runs whose dispatch was quiet. A run
+teaches speed if it succeeded with running time and its dispatch was
+quiet and not resumed. Quiet is tested once, when the build is
+dispatched, on what the hub knows then: the expected cores of the other
+builds committed to the worker at most a quarter of its cores, not what
+they used. Builds dispatched to the worker later, while the run goes
+on, are not seen: a busy worker's runs teach under load the test
+missed, and it reads slower than it is. A dispatch is resumed when the
+hub hands a worker a build it still holds, or when the worker answers
+an assignment that it already holds the build (`Resumed`): its run may
+have ended before the dispatch, under a load it did not see, and its
+result arrives as if the run had started after it. On the record, 51
+of the 611 results of resumed dispatches would otherwise have taught.
+Taught from every run, contention reads as speed: on the replay below
+the compared workers' factors spread from 0.37 to 2.43, against 0.90 to
+1.18 taught from quiet runs. The rule assumes a decider that adds a
+worker's load to its speed, which none does yet: until one does,
+factors taught from every run predict running times better (1.79 % per
+run on the replay below), as those times include the load the dispatch
+did not see. The rule stays for what the factors are to be, a worker's
+speed; whether it still costs prediction once a decider reads load is
+an open question (Known limitations).
+
+Each run that teaches is compared with each other worker's latest such
+run of its key that came since this worker's previous run of it (ln t_a
+- ln t_b = ln s_b - ln s_a, the build's own time cancelling): each pair
+of runs is compared once, so one run counts in at most two comparisons
+per other worker, with its latest run before and its next after. On
+the record 5 of the 13 workers it names are compared; the others keep
+factor 1: 7 ran only before dispatch rows recorded load, so none of
+their runs is quiet, and one aarch64 worker shares no key with the
+rest. The factors fit the comparisons by least squares,
+with two departures, each chosen by a replay of the record (below):
+
+- A comparison is clamped to within 0.5 in ln of the fit when it is made
+  (`BOUND`). One comparison's deviation from the fit has a standard
+  deviation of 2.0 but a median of 0.17: runs timed at a millisecond,
+  and pnames that pool unlike inputs. The clamp is not a Huber
+  M-estimate: a comparison is not revisited as the fit moves, so the
+  factors depend on the order runs arrive in, which the fold keeps.
+- Each pair of workers' comparisons decay with a window of 1,000
+  (`WINDOW`), counted in comparisons of either of its workers: each
+  comparison either takes part in weighs the pair's earlier ones by
+  (1 - 1/1000)^(1/2), so a pair compared only with itself decays by
+  1 - 1/1000 a comparison. A pair no longer compared, as of a worker
+  retired, fades as its other worker is compared with others: decayed
+  only when compared, it kept its weight, and in a cycle of pairs held
+  a worker that changed at its old ratio (a retired worker's two pairs
+  held one that doubled at 1.59x after 30,000 comparisons). A worker
+  that is not compared, as when it is offline, or online with runs
+  never quiet, ages none of its pairs itself, but the others'
+  comparisons age them: it loses its factor, and relearns it when it is
+  compared again. On the replay below, the worker that halves has no
+  result between 34.05 h (its last before) and 41.46 h (its first
+  after); the trace, sampled every 5,000 runs, reads it 2.05x at
+  34.1 h, then 1.91, 1.68, 1.23 and 1.00x, and 0.95x at 37.0 h (0.94x
+  at a window of 300; decayed only when compared, it kept 1.95x); back,
+  1.54x at 43.6 h, 1.37 to 1.77x until 50.0 h, and 2.06x at 50.7 h,
+  1,546 of its taught runs after it returned. A test pins it: a worker
+  at 2x, away while two others are compared 15,000 rounds, reads within
+  2 % of 1, and within 5 % of 2x again after 20 rounds with each. A
+  pair ages by its own workers' comparisons, not the farm's: c and d,
+  compared with each other once per 1,000 comparisons of others, keep
+  their comparisons (aged by every comparison, c at 2x d read 1.73x).
+
+A prior pulls each ln s toward 0 with the weight of 1.17 comparisons
+(`PRIOR`): one comparison's variance over the prior's, a prior of 0.25
+covering the compared workers' ln factors (0.90 to 1.18x: all within
+0.17 of 0).
+Clamped at `BOUND`, one comparison deviates from the fit with a standard
+deviation of 0.281 on the replay below; 1.17 is (0.27 / 0.25)^2 =
+1.1664, rounded, from 0.27, an earlier fit's deviation truncated; 1.22
+and 1.32 replay alike. A worker never compared has factor 1,
+and one compared a few times lies between 1 and what its comparisons
+say. Factor 1 is the mean, in ln, of each group of workers connected
+by comparisons, directly or through others, those no longer serving
+included: their factors stay in the fit. Factors are relative within
+a group only; a worker never compared is a group of one. The
+tests pin what the prior and the window do: few comparisons read
+between 1 and what they say, more the more there are, and one of 1.2x,
+too small to be clamped, reads 1.12x (without a prior 1.2x); a worker that
+doubles is relearned within 10 % after 3,000 comparisons, which a
+window of 3,000 fails; and an unchanged worker through noisy runs stays
+within e^0.03 of another, which a window of 300 fails (e^0.045). The
+square root in the decay is the window's unit, a pair's own comparison
+counting twice: without it a self-compared pair decays as at a window
+of 500, which the steadiness test also fails. Only the replays chose
+the values; `PRIOR`'s value is not pinned, as the replays read it alike
+from 1.17 to 1.32.
+
+The fit is renewed once per as many taught runs as there are workers:
+between, comparisons are clamped around, and factors read from, the
+last fit. Solving costs O(workers^3), so renewing it so costs
+O(workers^2) a taught run; renewing it every run costs 42 % more on the
+record and 14.5x on the 60-worker one (above).
+
+A build's expectation keeps its median running seconds as they ran
+(`Expected::secs`, the dispatch row's `expect_secs`), and adds those of
+a worker of factor 1 (`Expected::unit_secs`): the median over its
+level's succeeded runs of each one's running time times its worker's
+factor. On worker w it is expected to run them over w's factor:
+
+- `History::speed(worker) -> f64`: worker's factor, 1 if never compared;
+- `Expected::secs_on(speed) -> Option<f64>`: the build's seconds on a
+  worker of that factor, where a run of its level succeeded;
+- `Placement::secs_on(job, worker) -> Option<f64>`: the two composed,
+  for a decider weighing when a build would finish on each worker.
+
+No decider reads them yet: the dispatch log line adds the worker's
+`speed` and `expect_secs_on`, and "build record folded" lists every
+worker's factor and comparisons, for the placement solver to come.
+Contention is not in these figures: they are a quiet worker's, and a
+decider that counts a worker's queue or load adds it.
+
+Both are folded from the record. A result row's run is on the worker it
+names, and teaches as its `taught` row says: the hub commits that row
+with the result's own as it learns the run, so the fold reads the
+decision the hub made, with no join. The decision is the build's, kept
+from its latest dispatch (`Job::placed`) and cleared by a `Resumed`
+answer. A result with no `taught` row gets one as a hub takes the
+record: it is taught if its id's last `dispatch` row by `at_ms` at or
+before it (a dispatch first at a tie) was quiet by its `load_cores`,
+`expect_cores` and `cores`, and not `resumed`; `Resumed` answers were
+not recorded then. On the record the migration teaches the same runs
+the fold of the earlier join did: the replays below are figure for
+figure alike.
+
+The replays are of a snapshot of the farm hub's record (its last
+result 2026-11-20 01:53 UTC, taken by a hub so that every result has
+its `taught` row: the tool refuses a record that has not been), not
+committed, by the replay tool
+`hub/record/replay.rs`: an ignored test that predicts each run by the
+fold before it is learned, with speed and without (its settings and
+command in its header). Those marked (knobs) ran it with `PRIOR`,
+`WINDOW` and `BOUND` read from the environment by a patch to
+`speed.rs` and the tool, not committed (`knobs9.patch`, kept with this
+change's review evidence, sha256
+92d46ed1e554cacbb7342a299075024c36436392cec3e9a8dd4b69859de4df33),
+which turns each into a `LazyLock` of `SPEED_PRIOR`, `SPEED_WINDOW` or
+`SPEED_BOUND`; at the committed values it replays the same, figure for
+figure. Some ran on the record before its migration,
+folded by a join to the dispatches: the eleven rerun on the migrated
+record replayed the same. From 2026-10-28 to 2026-11-20 less 2026-11-17
+to 19 (a KVM queueing anomaly), 1,328,851 succeeded runs:
+
+- Mean |ln error| per run falls 3.91 % (3.74 % on the whole record);
+  runs within 2x of their prediction are 88.16 % against 88.12 %.
+  Hour-weighted it rises 0.27 %: the factors fit the farm's many short
+  builds, and one worker's hour-weighted error rises 1.40 %.
+- With three workers' times divided by 1, 1.5 and 2, the fitted ratios
+  to the first are 1.45 and 2.05, against 1.44 and 2.04 expected from
+  their factors on the record, and the cut per run is 19.05 %.
+- A worker whose times halve from 2026-11-10: relative to the workers
+  that did not change, its factor reaches 1.92x in 0.3 h (1,526 of its
+  taught runs) and 1.97x in 1.0 h; sampled every 5,000 runs after, it
+  lies between 1.37x and 2.15x while it ran, and 0.95x to 2.05x at the
+  samples from 34.1 to 43.6 h, around its results' gap from 34.05 to
+  41.46 h, to the record's end, at 241.8 h, where it is 1.76x. The cut
+  per run is 11.41 %.
+- (knobs) Windows of 30, 100, 300, 1,000, 3,000 and 10,000, and none,
+  cut 3.13, 3.72, 3.87, 3.91, 3.83, 3.71 and 3.24 % on the record, and
+  10.59, 11.24, 11.39, 11.41, 11.28, 10.99 and 6.36 % with the worker
+  that halves (with no window it is 1.46x at 241.8 h). Its readings
+  while it ran, from 1 h on, spread with a standard deviation in ln of
+  0.221, 0.159, 0.087, 0.065, 0.054 and 0.079, the lowest 0.63, 0.70,
+  1.24, 1.37, 1.50 and 1.21x; at 3,000 and more it reads 1.49 and
+  1.16x at 0.3 h. 1,000 cuts most, and of the windows that relearn in
+  under an hour spreads least.
+- (knobs) Plain least squares, no clamp and no window, cuts 3.29 %; a
+  clamp of 1 instead of 0.5 cuts 3.80 %. A `PRIOR` of 1.22 or 1.32
+  replays as 1.17 does: the same figures and factors to four places.
+- Factors taught from every run, against quiet runs' only: scored on
+  the quiet runs, every run's predict them 0.98 % better per run and
+  within 2x 91.76 % against 91.37 %, and hour-weighted 0.07 % worse;
+  on all runs 1.79 % better per run, within 2x 88.83 % against 88.16 %,
+  and hour-weighted 0.79 % better. They read load as speed: they spread
+  from 0.37 to 2.43, against 0.90 to 1.18 (`a_loaded_worker_is_not_read_as_slow`
+  is the mechanism). The rule stays for the factors' meaning, at that
+  cost in prediction while no decider adds load. (With this round's
+  window the comparison turned: with pairs decayed only when compared,
+  at 300, the quiet rule's predicted quiet runs 3.47 % better.)
+
 ## CPU arbitration
 
 The worker's CPU arbiter (`worker/arbiter.rs`) is always on; nothing
@@ -980,6 +1219,15 @@ deadline), DT16 (DD10's fresh), DT17 and DT20 (DD8a), DT19 (R1).
 
 ## Known limitations (MVP)
 
+* Speed's quiet test reads the load at dispatch only: builds dispatched
+  to the worker later, while the run goes on, are not seen (Worker
+  speed). An open question for a later change: test the load over the
+  run's whole lifetime, as the result arrives.
+* Speed's quiet rule assumes a decider that adds a worker's load to its
+  factor; until one does, factors taught from every run predict running
+  times better on the replay (Worker speed). An open question for when a
+  decider reads load: rerun that comparison with the decider's
+  prediction, load included, and keep the rule only if it still wins.
 * Workers run up to `max-jobs` concurrent builds over one session.
 * The hub's tmp-dir tar and the worker's unpack walk their trees
   through directory fds with O_NOFOLLOW, but output packing (our NAR

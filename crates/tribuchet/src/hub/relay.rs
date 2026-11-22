@@ -35,6 +35,7 @@ use tonic::Status;
 use super::losses::{Dispatch, Run};
 use super::metrics::Metrics;
 use super::naming::drv_name;
+use super::placement;
 use super::producer;
 use super::record::Rest;
 use super::state::{HubState, Job, Replay};
@@ -106,6 +107,8 @@ pub(super) async fn run_job(
     dispatch.sent = true;
 
     let mut cancel_sent = false;
+    // Whether its run teaches speed: not if the worker says it resumed it.
+    let mut placed = job.placed;
     let given_up = state.given_up(&job.id);
     // The worker's heartbeats when it said it holds the build already.
     let mut resumed_after = None;
@@ -153,6 +156,7 @@ pub(super) async fn run_job(
                     Run::Started
                 };
                 (dispatch.reached, dispatch.resumed) = (dispatch.reached.max(run), true);
+                placed = placement::Teaching::default();
                 resumed_after = Some(state.heartbeats(session));
                 let held = r.run.as_ref().map(ToString::to_string);
                 tracing::info!(id = job.id, held, "worker resumed an in-flight build");
@@ -192,7 +196,10 @@ pub(super) async fn run_job(
             worker_message::Msg::Result(res) => {
                 if let Some(u) = &res.usage {
                     state.metrics.observe_usage(&job.req.system, u);
-                    let rest = Rest::of(job, worker);
+                    let rest = Rest {
+                        placed,
+                        ..Rest::of(job, worker)
+                    };
                     let out_path = rest.out_path.clone();
                     state
                         .placement

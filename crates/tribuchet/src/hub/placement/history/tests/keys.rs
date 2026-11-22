@@ -49,12 +49,13 @@ fn the_stem_of_a_name_ending_in_its_version_is_the_cut() {
 #[test]
 fn a_wrapper_and_its_compiler_are_two_keys() {
     let mut h = History::default();
-    h.record(&build("ghc-9.14.1", false), 0, &usage(2, 5000, 4));
+    h.record(&build("ghc-9.14.1", false), 0, &usage(2, 5000, 4), None);
     for _ in 0..5 {
         h.record(
             &build("ghc-9.14.1-with-packages", false),
             0,
             &usage(1, 2, 1),
+            None,
         );
     }
     let e = h.expect(&build("ghc-9.14.1", false));
@@ -79,9 +80,9 @@ fn the_runs_of_its_sources_come_first() {
         sources,
         ..build("program-observation.json", false)
     };
-    h.record(&of(Some("big")), 0, &usage(2, 1000, 9));
+    h.record(&of(Some("big")), 0, &usage(2, 1000, 9), None);
     for _ in 0..4 {
-        h.record(&of(Some("small")), 0, &usage(1, 1, 1));
+        h.record(&of(Some("small")), 0, &usage(1, 1, 1), None);
     }
     let e = h.expect(&of(Some("big")));
     assert_eq!(
@@ -118,19 +119,19 @@ fn sources_without_a_succeeded_run_fall_through_every_level() {
         sources,
         ..build(name, false)
     };
-    h.record(&build("other-1", false), 0, &usage(1, 7, 1));
+    h.record(&build("other-1", false), 0, &usage(1, 7, 1), None);
     let e = h.expect(&of("tool-run-1", Some("d")));
     assert_eq!((e.level, e.secs), (Level::Class, Some(7.0)));
-    h.record(&build("tool-check-1", false), 0, &usage(1, 5, 1));
+    h.record(&build("tool-check-1", false), 0, &usage(1, 5, 1), None);
     let e = h.expect(&of("tool-run-1", Some("d")));
     assert_eq!((e.level, e.secs), (Level::Prefix, Some(5.0)));
-    h.record(&build("tool-run-1", false), 0, &usage(1, 3, 1));
+    h.record(&build("tool-run-1", false), 0, &usage(1, 3, 1), None);
     let mut oom = usage(1, 1, 9);
     oom.oom_killed = true;
-    h.record(&of("tool-run-2", Some("d")), 0, &oom);
+    h.record(&of("tool-run-2", Some("d")), 0, &oom, None);
     let e = h.expect(&of("tool-run-3", Some("d")));
     assert_eq!((e.level, e.secs, gib(e)), (Level::Key, Some(3.0), 9.0));
-    h.record(&of("tool-run-4", Some("d")), 0, &usage(1, 40, 2));
+    h.record(&of("tool-run-4", Some("d")), 0, &usage(1, 40, 2), None);
     let e = h.expect(&of("tool-run-5", Some("d")));
     assert_eq!((e.level, e.secs, gib(e)), (Level::Source, Some(40.0), 9.0));
 }
@@ -148,14 +149,14 @@ fn an_oom_killed_source_keeps_its_lower_bound() {
     };
     let mut oom = usage(1, 1, 9);
     oom.oom_killed = true;
-    h.record(&of(Some("big")), 0, &oom);
+    h.record(&of(Some("big")), 0, &oom, None);
     for n in 0..WINDOW {
         let small = format!("small{n}");
         let b = Build {
             sources: Some(&small),
             ..build("program-observation.json", false)
         };
-        h.record(&b, 0, &usage(1, 1, 1));
+        h.record(&b, 0, &usage(1, 1, 1), None);
     }
     let e = h.expect(&of(Some("big")));
     assert_eq!((e.level, e.secs, gib(e)), (Level::Key, Some(1.0), 9.0));

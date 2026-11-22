@@ -63,6 +63,7 @@ fn expecting(cores: f64, gib: f64) -> Expected {
             memory: gib * GIB,
         },
         secs: None,
+        unit_secs: None,
         level: Level::Key,
         oom: 0,
         below: 0.0,
@@ -83,7 +84,7 @@ fn taught(state: &HubState, j: &mut Job, name: &str, e: Expected) {
             ..Default::default()
         };
         let mut p = state.placement.lock().unwrap();
-        p.history.record(&placement::build_of(j), 0, &usage);
+        p.history.record(&placement::build_of(j), 0, &usage, None);
     }
     j.expected = e;
 }

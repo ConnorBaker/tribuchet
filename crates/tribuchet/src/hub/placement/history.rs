@@ -50,12 +50,23 @@
 //! Placement ranks by memory and cores only; the running seconds, the
 //! OOM kills and the level are logged at dispatch, and no replay has yet
 //! shown a ranking that weighs them doing better.
+//!
+//! A build's running seconds on a worker of speed factor 1 (speed.rs)
+//! are the median of each run's times its worker's factor; it is
+//! expected to run them over a worker's factor there (Expected::secs_on).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::iter;
 
+use super::speed::Speed;
 use crate::proto::BuildUsage;
+#[cfg(test)]
+use runs::quantile;
+use runs::{Run, Runs};
+
+#[path = "history/runs.rs"]
+mod runs;
 
 /// Runs kept per key and prefix (a class keeps CLASS_WINDOW).
 pub(super) const WINDOW: usize = 8;
@@ -104,19 +115,28 @@ impl Level {
 }
 
 /// A build's expected demand, its running seconds where a run of its
-/// level succeeded, the level, the OOM kills among the runs of the entry
-/// it came from (its sources', its key's, a prefix's or its class's), and
-/// the running seconds learned to follow it (placement/downstream.rs).
+/// level succeeded (the median as they ran, which the dispatch row
+/// records, and on a worker of speed factor 1), the level, the OOM kills
+/// among the runs of the entry it came from (its sources', its key's, a
+/// prefix's or its class's), and the running seconds learned to follow it
+/// (placement/downstream.rs).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::hub) struct Expected {
     pub(in crate::hub) demand: Demand,
     pub(in crate::hub) secs: Option<f64>,
+    pub(in crate::hub) unit_secs: Option<f64>,
     pub(in crate::hub) level: Level,
     pub(in crate::hub) oom: u32,
     pub(in crate::hub) below: f64,
 }
 
 impl Expected {
+    /// Its running seconds on a worker of speed factor `speed`
+    /// (History::speed), where a run of its level succeeded.
+    pub(in crate::hub) fn secs_on(&self, speed: f64) -> Option<f64> {
+        self.unit_secs.map(|s| s / speed)
+    }
+
     /// The guess with nothing learned: one core and 1 GiB, or for a
     /// build that declares big-parallel the median of the 33 such builds
     /// the hub ran on 2026-10-15..25, 17.8 cores and 38.5 GiB.
@@ -128,162 +148,12 @@ impl Expected {
                 memory: gib * GIB,
             },
             secs: None,
+            unit_secs: None,
             level: Level::Prior,
             oom: 0,
             below: 0.0,
         }
     }
-}
-
-/// One run as the worker measured it: peak bytes, CPU and running
-/// milliseconds, and whether it succeeded.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Run(u64, u64, u64, bool);
-
-impl Run {
-    /// None where the worker measured nothing (it reports 0 then).
-    fn of(u: &BuildUsage, ok: bool) -> Option<Self> {
-        let running = u.wall_ms.saturating_sub(u.frozen_ms);
-        (u.peak_memory_bytes > 0).then_some(Self(
-            u.peak_memory_bytes,
-            u.cpu_usec / 1000,
-            running,
-            ok,
-        ))
-    }
-
-    /// Cores while it ran, and running seconds: succeeded runs with
-    /// running time only. A worker can report no wall time (one failed run did on
-    /// 2026-11-04); such a run would count as infinitely many cores, or
-    /// with no CPU time as NaN, negative on x86 and least full in a rank.
-    #[allow(clippy::cast_precision_loss)]
-    fn timed(self) -> Option<(f64, f64)> {
-        let Self(_, cpu, running, ok) = self;
-        (ok && running > 0).then(|| (cpu as f64 / running as f64, running as f64 / 1000.0))
-    }
-}
-
-/// The runs of a key, prefix or class, newest last.
-#[derive(Clone, Default)]
-struct Runs {
-    runs: VecDeque<Run>,
-    /// OOM-killed runs ever recorded for the entry.
-    oom: u32,
-}
-
-#[allow(clippy::cast_precision_loss)]
-fn median(mut xs: Vec<f64>) -> Option<f64> {
-    xs.sort_by(f64::total_cmp);
-    let n = xs.len();
-    (n > 0).then(|| {
-        if n % 2 == 1 {
-            xs[n / 2]
-        } else {
-            f64::midpoint(xs[n / 2 - 1], xs[n / 2])
-        }
-    })
-}
-
-impl Runs {
-    /// Add `run`, keeping the last `keep`.
-    fn push(&mut self, run: Run, oom: bool, keep: usize) {
-        if self.runs.len() >= keep {
-            self.runs.pop_front();
-        }
-        self.runs.push_back(run);
-        self.oom = self.oom.saturating_add(u32::from(oom));
-    }
-
-    /// Add `run` to a key's or a prefix's last WINDOW, whose memory is a
-    /// largest peak. A censored run peaking no higher than a success there
-    /// is not added, which would push measured runs out; the smallest such
-    /// success moves to the newest place instead, so a peak no lower than
-    /// the censored one stays as long as that run would have.
-    fn learn(&mut self, run: Run, oom: bool) {
-        let covers = |r: &&Run| r.3 && r.0 >= run.0;
-        let cover = (self.runs.iter().enumerate())
-            .filter(|(_, r)| !run.3 && covers(r))
-            .min_by_key(|(_, r)| r.0)
-            .map(|(i, _)| i);
-        match cover.and_then(|i| self.runs.remove(i)) {
-            Some(r) => {
-                self.runs.push_back(r);
-                self.oom = self.oom.saturating_add(u32::from(oom));
-            }
-            None => self.push(run, oom, WINDOW),
-        }
-    }
-
-    /// Medians of cores and running seconds over the runs that
-    /// succeeded, if one did.
-    fn timing(&self) -> Option<(f64, f64)> {
-        let timed: Vec<(f64, f64)> = self.runs.iter().filter_map(|r| r.timed()).collect();
-        let cores = median(timed.iter().map(|t| t.0).collect())?;
-        Some((cores, median(timed.iter().map(|t| t.1).collect())?))
-    }
-
-    /// The peak `level` takes, cores and seconds; a level without a
-    /// succeeded run takes `fallback`'s cores and no seconds. Sources and
-    /// a key take their largest peak, censored or not (their own runs: a
-    /// bound); a prefix, the largest of the peaks that succeeded, with
-    /// none, its largest (a stem's peak censored above its siblings' is
-    /// its own bound, no other stem's guess, as a runaway's); a class, its
-    /// 90th percentile (quantile).
-    #[allow(clippy::cast_precision_loss)]
-    fn expected(&self, level: Level, fallback: f64) -> Option<Expected> {
-        let largest = |succeeded: bool| {
-            (self.runs.iter().filter(|r| r.3 || !succeeded))
-                .map(|r| r.0)
-                .max()
-        };
-        let peak = match level {
-            Level::Source | Level::Key => largest(false),
-            Level::Prefix => largest(true).or_else(|| largest(false)),
-            Level::Class | Level::Prior => quantile(&self.runs, 0.9),
-        }?;
-        let (cores, secs) = self
-            .timing()
-            .map_or((fallback, None), |(c, s)| (c, Some(s)));
-        Some(Expected {
-            demand: Demand {
-                cores,
-                memory: peak as f64,
-            },
-            secs,
-            level,
-            oom: self.oom,
-            below: 0.0,
-        })
-    }
-}
-
-/// The `q`-quantile of peaks by Kaplan-Meier (JASA 53, 1958), a run that
-/// did not succeed right-censored at its peak, a success first at a tie.
-/// Where censoring leaves it short of `q`, the `q`-quantile of all peaks,
-/// a lower bound, as each build needs at least its peak, and no lower
-/// than the last success: the quantile is above it. Uncensored, the
-/// k-th smallest peak for the least k with k/n above `q`.
-#[allow(
-    clippy::cast_precision_loss,
-    clippy::cast_possible_truncation,
-    clippy::cast_sign_loss
-)]
-fn quantile(runs: &VecDeque<Run>, q: f64) -> Option<u64> {
-    let mut obs: Vec<(u64, bool)> = runs.iter().map(|r| (r.0, r.3)).collect();
-    obs.sort_by_key(|&(peak, ok)| (peak, !ok));
-    let (n, mut survives) = (obs.len(), 1.0);
-    for (i, &(peak, ok)) in obs.iter().enumerate() {
-        if ok {
-            survives *= 1.0 - 1.0 / (n - i) as f64;
-            if survives <= 0.0 || 1.0 - survives > q + 1e-9 {
-                return Some(peak);
-            }
-        }
-    }
-    let k = ((q + 1e-9) * n as f64).floor() as usize;
-    let last = obs.iter().filter(|o| o.1).map(|o| o.0).max();
-    obs.get(k.min(n.saturating_sub(1)))
-        .map(|o| o.0.max(last.unwrap_or(0)))
 }
 
 /// The stem: the name less every dash-part, but the first, that does not
@@ -329,6 +199,11 @@ pub(in crate::hub) fn key(system: &str, name: &str) -> String {
     format!("{system}/{}", stem(name))
 }
 
+/// A run as a comparison of two histories reads it: peak, CPU ms,
+/// running ms, succeeded, its worker's name; or a speed factor, last.
+#[cfg(test)]
+pub(in crate::hub) type Entry = (u64, u64, u64, bool, Option<String>, f64);
+
 /// Entries are never dropped: the fold of the build record (record.rs).
 #[derive(Clone, Default)]
 pub(in crate::hub) struct History {
@@ -347,6 +222,8 @@ pub(in crate::hub) struct History {
     /// Each entry's name (entry), to the count of runs learned when a run
     /// last changed it: what an expectation read of it (Read) still holds.
     touched: HashMap<u64, u64>,
+    /// The workers' speed factors, from the keys' runs that teach it.
+    speed: Speed,
 }
 
 /// What an expectation was read from: the runs learned then, and the
@@ -367,6 +244,14 @@ fn entry(kind: u8, name: &str) -> u64 {
     h.finish()
 }
 
+/// Where a run ran, as the record names it: its worker, and whether it
+/// teaches speed (speed::taught).
+#[derive(Clone, Copy)]
+pub(in crate::hub) struct On<'a> {
+    pub(in crate::hub) worker: &'a str,
+    pub(in crate::hub) taught: bool,
+}
+
 impl History {
     /// Its sources' runs if one succeeded with running time, else its
     /// key's. A key, or sources, none of whose runs succeeded takes the
@@ -377,13 +262,14 @@ impl History {
     pub(in crate::hub) fn expect(&self, b: &Build) -> Expected {
         let class = self.classes.get(&format!("{}/{}", b.system, b.declared));
         let prior = Expected::prior(b.declared);
+        let speed = &self.speed;
         let fallback = class
-            .and_then(Runs::timing)
+            .and_then(|c| c.timing(speed))
             .map_or(prior.demand.cores, |t| t.0);
         let sources = Self::sources_of(b).and_then(|s| self.sources.get(&s));
         if let Some(e) = sources
-            .filter(|r| r.timing().is_some())
-            .and_then(|r| r.expected(Level::Source, fallback))
+            .filter(|r| r.timing(speed).is_some())
+            .and_then(|r| r.expected(Level::Source, fallback, speed))
         {
             return e;
         }
@@ -400,9 +286,13 @@ impl History {
             })
         };
         let e = succeeded
-            .and_then(|r| r.expected(Level::Key, fallback))
-            .or_else(|| by_prefix()?.expected(Level::Prefix, fallback))
-            .or_else(|| class.filter(measured)?.expected(Level::Class, fallback))
+            .and_then(|r| r.expected(Level::Key, fallback, speed))
+            .or_else(|| by_prefix()?.expected(Level::Prefix, fallback, speed))
+            .or_else(|| {
+                class
+                    .filter(measured)?
+                    .expected(Level::Class, fallback, speed)
+            })
             .unwrap_or(prior);
         let e = match failed.and_then(|r| Some((r.runs.iter().map(|r| r.0).max()?, r.oom))) {
             Some((peak, oom)) => Expected {
@@ -438,13 +328,14 @@ impl History {
         let sources = Self::sources_of(b);
         let mut entries: Vec<u64> = sources.iter().map(|s| entry(3, s)).collect();
         let runs = sources.as_ref().and_then(|s| self.sources.get(s));
-        if runs.is_some_and(|r| r.timing().is_some()) {
+        if runs.is_some_and(|r| r.timing(&self.speed).is_some()) {
             return (e, Read { at, entries });
         }
         let stem = b.name.map(stem);
         let key = Self::key_of(b);
         let runs = key.as_ref().and_then(|k| self.keys.get(k));
-        let own = runs.is_some_and(|r| r.runs.iter().any(|r| r.3) && r.timing().is_some());
+        let own = (runs.filter(|r| r.runs.iter().any(|r| r.3)))
+            .is_some_and(|r| r.timing(&self.speed).is_some());
         entries.extend(key.iter().map(|k| entry(0, k)));
         if !own {
             let pres = stem.as_deref().into_iter().flat_map(prefixes);
@@ -460,15 +351,39 @@ impl History {
         (r.entries.iter()).all(|h| self.touched.get(h).is_none_or(|at| *at <= r.at))
     }
 
+    /// Worker `name`'s speed factor (speed.rs): 1 for one never compared.
+    /// Read by the dispatch log line only, so far.
+    pub(in crate::hub) fn speed(&self, name: &str) -> f64 {
+        self.speed.factor(name)
+    }
+
+    /// Every worker's name, speed factor and comparisons' decayed weight.
+    pub(in crate::hub) fn speeds(&self) -> Vec<(String, f64, f64)> {
+        self.speed.factors()
+    }
+
     /// Learn from a build's run: its sources, its key, its stem's prefixes
     /// and its class. One that failed or was OOM-killed is right-censored at its
     /// own peak (Runs::expected, quantile): it teaches memory only, no
-    /// timing. A run the worker measured nothing of teaches nothing.
-    pub(in crate::hub) fn record(&mut self, b: &Build, exit_code: i32, u: &BuildUsage) {
+    /// timing. A run the worker measured nothing of teaches nothing. A run
+    /// `on` a named worker keeps it; a succeeded one taught teaches speed,
+    /// compared with the other workers' runs of its key (key_of).
+    pub(in crate::hub) fn record(
+        &mut self,
+        b: &Build,
+        exit_code: i32,
+        u: &BuildUsage,
+        on: Option<On>,
+    ) {
         self.learned += 1;
         let (ok, oom) = (exit_code == 0 && !u.oom_killed, u.oom_killed);
-        let run = Run::of(u, ok);
+        let worker = on.map(|on| self.speed.worker(on.worker));
+        let run = Run::of(u, ok, worker);
         if let (Some(key), Some(r)) = (Self::key_of(b), run) {
+            let taught = (on.zip(worker)).filter(|(on, _)| on.taught);
+            if let (Some((_, w)), Some((_, secs))) = (taught, r.timed()) {
+                self.speed.learn(&key, w, secs);
+            }
             self.touched.insert(entry(0, &key), self.learned);
             self.keys.entry(key).or_default().learn(r, oom);
         }
@@ -517,28 +432,36 @@ impl History {
     }
 
     /// Every entry's runs, oldest first, as (peak, CPU ms, running ms,
-    /// succeeded), and its OOM kills, by "sources/", "keys/", "prefixes/"
-    /// or "classes/" and its name: what a comparison of two histories
-    /// reads.
+    /// succeeded, worker), and its OOM kills, by "sources/", "keys/",
+    /// "prefixes/" or "classes/" and its name, and every worker's speed
+    /// factor and comparisons as "speed/" and its name: what a comparison
+    /// of two histories reads.
     #[cfg(test)]
-    pub(in crate::hub) fn entries(&self) -> HashMap<String, (Vec<(u64, u64, u64, bool)>, u32)> {
+    pub(in crate::hub) fn entries(&self) -> HashMap<String, (Vec<Entry>, u32)> {
         let tables = [
             ("sources", &self.sources),
             ("keys", &self.keys),
             ("prefixes", &self.prefixes),
             ("classes", &self.classes),
         ];
+        let name = |w: Option<u16>| w.map(|w| self.speed.name(w).to_owned());
         let runs = |r: &Runs| {
             r.runs
                 .iter()
-                .map(|&Run(p, c, t, ok)| (p, c, t, ok))
+                .map(|&Run(p, c, t, ok, w)| (p, c, t, ok, name(w), 0.0))
                 .collect()
         };
+        let speeds = self.speed.factors().into_iter().map(|(n, f, c)| {
+            let entry = (0, 0, 0, true, None, f);
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            (format!("speed/{n}"), (vec![entry], c as u32))
+        });
         (tables.into_iter())
             .flat_map(|(t, m)| {
                 m.iter()
                     .map(move |(k, r)| (format!("{t}/{k}"), (runs(r), r.oom)))
             })
+            .chain(speeds)
             .collect()
     }
 }

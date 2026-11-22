@@ -17,7 +17,7 @@ use super::losses::{self, Loss};
 use super::lost::Lost;
 use super::metrics::Metrics;
 use super::placement::objective::enqueue;
-use super::placement::{Expected, Placement, Read};
+use super::placement::{Expected, Placement, Read, Teaching};
 use super::relay::{DAEMON_ANSWER, DaemonEvidence};
 use super::runs::Runs;
 use super::shadow::Shadow;
@@ -85,9 +85,8 @@ pub(super) struct Job {
     /// When it was first passed over for another worker (placement::
     /// Rooms): none since it last entered the queue.
     pub(super) deferred: Option<Instant>,
-    /// What it is expected to use, from the history as it was submitted:
-    /// take_job's scan reads it under the queue lock, where it takes no
-    /// placement lock.
+    /// What it is expected to use, from the history as it was submitted
+    /// (take_job's scan reads it under the queue lock, not placement's).
     pub(super) expected: Expected,
     /// What `expected` was read from (History::read): while none of it has
     /// learned a run since, a scan reads `expected` instead of asking the
@@ -97,6 +96,8 @@ pub(super) struct Job {
     /// hub's daemon said when it was submitted (sources.rs): history keys
     /// its runs by them.
     pub(super) sources: Option<String>,
+    /// Its latest dispatch, as its run's speed reads it (placement::dispatch).
+    pub(super) placed: Teaching,
 }
 
 impl Job {

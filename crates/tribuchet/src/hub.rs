@@ -376,7 +376,7 @@ async fn worker_loop(state: Arc<HubState>, register: Register, ctl: Half, bulk: 
     let mut listed = None;
 
     'outer: loop {
-        let (job, resumed) = loop {
+        let (mut job, resumed) = loop {
             if out_tx.is_closed() || route.is_finished() || bulk.is_finished() {
                 break 'outer;
             }
@@ -411,7 +411,7 @@ async fn worker_loop(state: Arc<HubState>, register: Register, ctl: Half, bulk: 
             }
         };
         let to = (worker_id, register.worker_name.as_str());
-        placement::dispatch(&state, to, &job, resumed, &admission);
+        job.placed = placement::dispatch(&state, to, &job, resumed, &admission);
         // Tell the attach client where its build runs.
         job.replay
             .publish(attach_event::Event::Dispatched(

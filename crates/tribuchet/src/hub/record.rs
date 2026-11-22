@@ -1,8 +1,9 @@
 //! The hub's build record: a SQLite database of every build result
 //! with usage and every dispatch, appended to and never changed, which
 //! other processes may query while the hub runs. The placement history
-//! is its fold: built from the `result` rows in rowid order as the hub
-//! starts, and kept equal to it after, each result recorded into the
+//! is its fold: built from the `result` rows in rowid order, each with
+//! its build's last `dispatch` row (whether it teaches speed), as the
+//! hub starts, and kept equal to it after, each result recorded into the
 //! history and handed to the record in one step under the placement
 //! lock (Placement::learn). One writer thread commits the rows; a send
 //! to it never waits, so no runtime thread does the record's file I/O.
@@ -18,22 +19,50 @@ use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::types::Value;
-use rusqlite::{Connection, OpenFlags, params_from_iter};
+use rusqlite::{Connection, OpenFlags, TransactionBehavior, params_from_iter};
 
 use super::naming::named_output;
-use super::placement::{Build, History};
+#[cfg(test)]
+use super::placement::On;
+use super::placement::{Build, History, QUIET, Teaching};
 use super::state::{HubState, Job};
 use crate::errors::{Result, err_msg};
 use crate::proto::{BuildProfile, BuildUsage};
+#[cfg(test)]
+pub(in crate::hub) use fold::each_run;
+pub(in crate::hub) use fold::fold;
 
+#[path = "record/fold.rs"]
+mod fold;
+#[cfg(test)]
+#[path = "record/replay.rs"]
+mod replay;
 #[cfg(test)]
 #[path = "record/tests.rs"]
 mod tests;
 
+/// How far the record's open (take or read) has got, by SQLite's
+/// progress handler on its connections: the fold's own reading of the
+/// rows advances it too. What the hub's start reads to tell a long open
+/// from a stalled one (sd::extending_start).
+pub(in crate::hub) static PROGRESS: AtomicU64 = AtomicU64::new(0);
+
+/// Count SQLite's work on `conn` in PROGRESS, every 1,000 VM steps.
+fn counted(conn: Connection) -> rusqlite::Result<Connection> {
+    conn.progress_handler(
+        1000,
+        Some(|| {
+            PROGRESS.fetch_add(1, Ordering::Relaxed);
+            false
+        }),
+    )?;
+    Ok(conn)
+}
+
 /// The schema `user_version` 1 names. A column takes NULL where its value
 /// is not known: a field a journal line predates, or a result's system
 /// where its build was queued before the imported journal begins.
-const SCHEMA: &str = "
+pub(in crate::hub) const SCHEMA: &str = "
 CREATE TABLE result (at_ms INTEGER NOT NULL, id TEXT NOT NULL, key TEXT, system TEXT,
   drv TEXT, declared INTEGER NOT NULL, out_path TEXT, worker TEXT, exit_code INTEGER NOT NULL,
   wall_ms INTEGER NOT NULL, cpu_usec INTEGER NOT NULL, peak_memory_bytes INTEGER NOT NULL,
@@ -65,6 +94,21 @@ const DRV_PATH: &str = "CREATE TABLE IF NOT EXISTS drv_path (at_ms INTEGER NOT N
 /// id, with their digest.
 const SOURCE: &str = "CREATE TABLE IF NOT EXISTS source (at_ms INTEGER NOT NULL, \
   id TEXT NOT NULL, sources TEXT NOT NULL);";
+
+/// Whether each `result` row's run teaches speed (speed::Teaching), by
+/// rowid, committed with it; a hub that predates the table ignores it,
+/// and a result it wrote gains its row at the next take (migration).
+/// VACUUM renumbers rowids, `result` having no INTEGER PRIMARY KEY (one
+/// would change the column count every hub inserts by), only past a
+/// deleted row (bundled SQLite's behaviour, pinned by a test): the
+/// triggers refuse deletes and updates.
+pub(in crate::hub) const TAUGHT: &str = "
+CREATE TABLE IF NOT EXISTS taught (result INTEGER PRIMARY KEY, quiet INTEGER NOT NULL);
+CREATE TRIGGER IF NOT EXISTS result_kept BEFORE DELETE ON result
+  BEGIN SELECT RAISE(ABORT, 'the build record is appended to, never changed'); END;
+CREATE TRIGGER IF NOT EXISTS result_unchanged BEFORE UPDATE ON result
+  BEGIN SELECT RAISE(ABORT, 'the build record is appended to, never changed'); END;
+";
 
 /// A row for table `table`: its values, in the schema's column order.
 pub(in crate::hub) struct Row {
@@ -122,8 +166,10 @@ pub(in crate::hub) fn source_row(at_ms: i64, id: &str, sources: &str) -> Row {
     }
 }
 
-/// What a `result` row holds beyond what history learns from.
+/// What a `result` row holds beyond what history learns from, and
+/// whether its run teaches speed (a `taught` row).
 pub(in crate::hub) struct Rest {
+    pub(in crate::hub) placed: Teaching,
     pub(in crate::hub) at_ms: i64,
     pub(in crate::hub) id: String,
     pub(in crate::hub) key: Option<String>,
@@ -136,6 +182,7 @@ impl Rest {
     /// `worker`: the build's id, dedupe key and named output path.
     pub(in crate::hub) fn of(job: &Job, worker: &str) -> Self {
         Self {
+            placed: job.placed,
             at_ms: now_ms(),
             id: job.id.clone(),
             key: Some(job.key.clone()),
@@ -170,7 +217,22 @@ pub(in crate::hub) fn result_row(b: &Build, exit_code: i32, u: &BuildUsage, rest
     }
 }
 
+/// The `taught` row of the `result` row inserted just before it, in the
+/// same unit (Recorder::send_all): whether its run teaches speed.
+pub(in crate::hub) fn taught_row(quiet: bool) -> Row {
+    Row {
+        table: "taught",
+        values: vec![quiet.into()],
+    }
+}
+
 fn insert(conn: &Connection, row: &Row) -> rusqlite::Result<usize> {
+    if row.table == "taught" {
+        let sql = "INSERT INTO taught VALUES (last_insert_rowid(), ?)";
+        return conn
+            .prepare_cached(sql)?
+            .execute(params_from_iter(&row.values));
+    }
     let marks = vec!["?"; row.values.len()].join(",");
     let sql = format!("INSERT INTO {} VALUES ({marks})", row.table);
     conn.prepare_cached(&sql)?
@@ -189,13 +251,13 @@ pub(in crate::hub) struct Tally {
 /// never takes, it being gone, stays uncommitted.
 #[derive(Clone)]
 pub(in crate::hub) struct Recorder {
-    rows: mpsc::Sender<Row>,
+    rows: mpsc::Sender<Vec<Row>>,
     pub(in crate::hub) tally: Arc<Tally>,
 }
 
 impl Recorder {
     /// A recorder whose rows go to `rows`.
-    pub(in crate::hub) fn new(rows: mpsc::Sender<Row>) -> Self {
+    pub(in crate::hub) fn new(rows: mpsc::Sender<Vec<Row>>) -> Self {
         Self {
             rows,
             tally: Arc::default(),
@@ -204,9 +266,16 @@ impl Recorder {
 
     /// Hand `row` to the writer. Never waits: the channel is unbounded.
     pub(in crate::hub) fn send(&self, row: Row) {
-        self.tally.uncommitted.fetch_add(1, Ordering::Relaxed);
-        if self.rows.send(row).is_err() {
-            tracing::error!("build record's writer is gone: a row not recorded");
+        self.send_all(vec![row]);
+    }
+
+    /// Hand `rows` to the writer as one: they are committed in the same
+    /// transaction. Never waits.
+    pub(in crate::hub) fn send_all(&self, rows: Vec<Row>) {
+        let n = u64::try_from(rows.len()).unwrap_or(u64::MAX);
+        self.tally.uncommitted.fetch_add(n, Ordering::Relaxed);
+        if self.rows.send(rows).is_err() {
+            tracing::error!("build record's writer is gone: rows not recorded");
         }
     }
 }
@@ -247,7 +316,11 @@ pub(in crate::hub) fn open(path: &Path) -> Opened {
             writer: None,
         };
     };
-    tracing::info!(path = %shown, rows, keys, entries, "build record folded");
+    let speeds: Vec<String> = (history.speeds().into_iter())
+        .map(|(w, f, n)| format!("{w}={f:.3}/{n:.0}"))
+        .collect();
+    let speeds = speeds.join(",");
+    tracing::info!(path = %shown, rows, keys, entries, speeds, "build record folded");
     let (tx, rx) = mpsc::channel();
     let record = Recorder::new(tx);
     let (tally, at) = (record.tally.clone(), shown.to_string());
@@ -328,9 +401,25 @@ fn take(path: &Path) -> Result<Option<(Connection, File, (History, u64))>> {
         Err(e) if e.kind() == io::ErrorKind::NotFound => true,
         _ => !known(&reader(path)?)?,
     };
-    let conn = Connection::open(path)?;
-    if fresh {
-        conn.execute_batch(&format!("BEGIN EXCLUSIVE;{SCHEMA}COMMIT;"))?;
+    let mut conn = counted(Connection::open(path)?)?;
+    // The `taught` table, where the record has the columns the migration
+    // reads (it compiles); the migration after, which may fail, as space
+    // for its sort runs out, with the record still written (migration).
+    let migration = migration();
+    let tx = conn.transaction_with_behavior(TransactionBehavior::Exclusive)?;
+    tx.execute_batch(if fresh { SCHEMA } else { "" })?;
+    tx.execute_batch(TAUGHT)?;
+    tx.prepare(&migration)?;
+    tx.commit()?;
+    match conn.execute(&migration, []) {
+        Ok(0) => {}
+        Ok(rows) => {
+            tracing::info!(path = %path.display(), rows, "build record: results given taught rows");
+        }
+        Err(e) => tracing::error!(
+            path = %path.display(),
+            "build record: results not given taught rows, so folded untaught until a hub takes it again: {e}"
+        ),
     }
     let folded = fold(&conn)?;
     conn.execute_batch(PROFILE)?;
@@ -345,9 +434,27 @@ fn take(path: &Path) -> Result<Option<(Connection, File, (History, u64))>> {
     Ok(Some((conn, lock, folded)))
 }
 
+/// The statement giving each `result` row with no `taught` row one, as the hub would
+/// have: quiet if the dispatch it answered, its id's last by at_ms at or
+/// before it, was quiet and not resumed (speed::quiet).
+/// One statement: all or none. A hub that predates the table wrote
+/// these, or a hub before it; each take gives only the rows missing.
+fn migration() -> String {
+    let rule = format!("d.resumed = 0 AND d.load_cores - d.expect_cores <= {QUIET:?} * d.cores");
+    format!(
+        "WITH m AS (SELECT rowid AS rrow, id, at_ms FROM result r \
+             WHERE NOT EXISTS (SELECT 1 FROM taught t WHERE t.result = r.rowid)) \
+             INSERT INTO taught SELECT h.rrow, coalesce({rule}, 0) FROM (SELECT rrow, max(drow) \
+             OVER (PARTITION BY id ORDER BY at_ms, kind ROWS UNBOUNDED PRECEDING) AS drow FROM \
+             (SELECT id, at_ms, 0 AS kind, rowid AS drow, NULL AS rrow FROM dispatch \
+             WHERE id IN (SELECT id FROM m) UNION ALL SELECT id, at_ms, 1, NULL, rrow FROM m)) h \
+         LEFT JOIN dispatch d ON d.rowid = h.drow WHERE h.rrow IS NOT NULL ORDER BY h.rrow"
+    )
+}
+
 /// A read-only connection to `path`.
 fn reader(path: &Path) -> rusqlite::Result<Connection> {
-    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)
+    Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY).and_then(counted)
 }
 
 /// The fold of the record at `path` as another process writes it.
@@ -359,73 +466,22 @@ fn read(path: &Path) -> Result<(History, u64)> {
     Ok(fold(&conn)?)
 }
 
-/// The history the `result` rows teach, in rowid order, each with the
-/// sources its `source` row gives (none in a record without the table),
-/// and how many rows it read. A row with no system (its build queued
-/// before the journal it was imported from begins) teaches nothing:
-/// history keys every run by its system.
-pub(in crate::hub) fn fold(conn: &Connection) -> rusqlite::Result<(History, u64)> {
-    let (mut history, mut read) = (History::default(), 0);
-    let with_table: bool = conn.query_row(
-        "SELECT count(*) > 0 FROM sqlite_schema WHERE type = 'table' AND name = 'source'",
-        [],
-        |r| r.get(0),
-    )?;
-    let (sources, joined) = if with_table {
-        (
-            "s.sources",
-            "LEFT JOIN source s ON s.at_ms = r.at_ms AND s.id = r.id",
-        )
-    } else {
-        ("NULL", "")
-    };
-    let mut stmt = conn.prepare(&format!(
-        "SELECT r.system, r.drv, r.declared, r.exit_code, r.wall_ms, r.cpu_usec, \
-         r.peak_memory_bytes, r.oom_killed, r.frozen_ms, {sources} FROM result r {joined} \
-         ORDER BY r.rowid"
-    ))?;
-    let mut rows = stmt.query([])?;
-    while let Some(r) = rows.next()? {
-        read += 1;
-        let (system, drv): (Option<String>, Option<String>) = (r.get(0)?, r.get(1)?);
-        let Some(system) = system else { continue };
-        let n = |i| r.get::<_, i64>(i).map(|v| u64::try_from(v).unwrap_or(0));
-        let usage = BuildUsage {
-            wall_ms: n(4)?,
-            cpu_usec: n(5)?,
-            peak_memory_bytes: n(6)?,
-            oom_killed: r.get(7)?,
-            frozen_ms: n(8)?,
-            profile: None,
-        };
-        let sources: Option<String> = r.get(9)?;
-        let build = Build {
-            system: &system,
-            name: drv.as_deref(),
-            declared: r.get(2)?,
-            sources: sources.as_deref(),
-        };
-        history.record(&build, r.get(3)?, &usage);
-    }
-    Ok((history, read))
-}
-
 /// Commit the rows `rx` brings, all those waiting in one transaction,
 /// until every sender is gone (the hub stopping): then the last are in.
 /// A batch whose commit fails is kept, and tried again with the next
 /// rows, as the history learned it; what is still not committed as the
 /// hub stops is lost, and said so.
-fn write(conn: &Connection, rx: &mpsc::Receiver<Row>, tally: &Tally, at: &str) {
+fn write(conn: &Connection, rx: &mpsc::Receiver<Vec<Row>>, tally: &Tally, at: &str) {
     let mut pending = Vec::new();
     loop {
         let stopping = match rx.recv() {
-            Ok(row) => {
-                pending.push(row);
+            Ok(rows) => {
+                pending.extend(rows);
                 false
             }
             Err(_) => true,
         };
-        pending.extend(rx.try_iter());
+        pending.extend(rx.try_iter().flatten());
         if pending.is_empty() {
             return;
         }

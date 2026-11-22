@@ -44,6 +44,7 @@ pub(super) fn queued(system: &str, replay: Arc<Replay>) -> Job {
         expected: Expected::prior(false),
         expected_at: None,
         sources: None,
+        placed: Default::default(),
     }
 }
 

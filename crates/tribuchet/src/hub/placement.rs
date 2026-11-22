@@ -13,7 +13,9 @@ use rusqlite::types::Value;
 
 use super::Admission;
 use super::naming::drv_name;
-use super::record::{Recorder, Rest, Row, int, now_ms, profile_row, result_row, source_row, val};
+use super::record::{
+    Recorder, Rest, Row, int, now_ms, profile_row, result_row, source_row, taught_row, val,
+};
 use super::state::{HubState, Job, Replay};
 use crate::proto::{BuildUsage, Register};
 
@@ -27,16 +29,23 @@ pub(super) mod objective;
 mod rank;
 #[path = "placement/reserve.rs"]
 mod reserve;
+#[path = "placement/speed.rs"]
+mod speed;
 pub(super) use downstream::Downstream;
 #[cfg(test)]
 pub(super) use history::Level;
-pub(super) use history::{Build, Demand, Expected, History, Read};
+pub(super) use history::{Build, Demand, Expected, History, On, Read};
+#[cfg(test)]
+pub(super) use history::{Entry, key};
 use objective::{Charges, Priority};
 #[cfg(test)]
 pub(super) use rank::GRACE;
 pub(super) use rank::{Room, Rooms, Size};
 #[cfg(test)]
 pub(super) use reserve::AGE;
+#[cfg(test)]
+pub(super) use speed::BOUND;
+pub(super) use speed::{QUIET, Teaching, quiet};
 
 /// The history key of `job`, if its name could be read.
 fn key_of(job: &Job) -> Option<String> {
@@ -244,12 +253,24 @@ impl Placement {
         }
     }
 
+    /// `job`'s expected running seconds on worker `worker` (by name):
+    /// its expectation's, on a worker of speed factor 1, over the
+    /// worker's factor (speed.rs). For a decider weighing finish times;
+    /// none reads it yet, but the dispatch log line.
+    pub(super) fn secs_on(&self, job: &Job, worker: &str) -> Option<f64> {
+        job.expected.secs_on(self.history.speed(worker))
+    }
+
     /// Learn from a finished run of `job`, and append it to the record,
     /// in one step: the history stays the record's fold. The send never
-    /// waits.
+    /// waits. The run teaches speed as its dispatch decided (Teaching),
+    /// which the record keeps beside its row; its result, taught and
+    /// profile rows are committed together (record::taught_row).
     pub(super) fn learn(&mut self, job: &Job, exit_code: i32, u: &BuildUsage, rest: Rest) {
         let build = build_of(job);
-        self.history.record(&build, exit_code, u);
+        let taught = rest.placed.quiet;
+        let on = (rest.worker.as_deref()).map(|worker| On { worker, taught });
+        self.history.record(&build, exit_code, u, on);
         if let Some(key) = key_of(job).filter(|_| exit_code == 0 && !u.oom_killed) {
             let secs = self.history.expect(&build).secs.unwrap_or(0.0);
             let outputs = job.req.outputs.values().cloned();
@@ -257,16 +278,15 @@ impl Placement {
         }
         let profile = (u.profile.as_ref()).map(|p| profile_row(rest.at_ms, &rest.id, p));
         let source = (build.sources).map(|s| source_row(rest.at_ms, &rest.id, s));
-        self.append(result_row(&build, exit_code, u, rest));
-        for row in profile.into_iter().chain(source) {
-            self.append(row);
-        }
+        let mut rows = vec![result_row(&build, exit_code, u, rest), taught_row(taught)];
+        rows.extend(profile.into_iter().chain(source));
+        self.append(rows);
     }
 
-    /// Hand `row` to the record's writer, if there is one.
-    pub(super) fn append(&self, row: Row) {
+    /// Hand `rows` to the record's writer as one, if there is one.
+    pub(super) fn append(&self, rows: Vec<Row>) {
         if let Some(record) = &self.record {
-            record.send(row);
+            record.send_all(rows);
         }
     }
 
@@ -363,25 +383,25 @@ fn room(id: u64, s: &Session) -> Room {
 }
 
 /// Count `job`'s expected demand against worker session `to` (id and
-/// name); log the dispatch, and append its record row, with the
-/// declaration that admitted it, its features, how many other workers
-/// that serve it have an idle agent, what it is expected to use, and the
-/// worker's size and expected load with it. Over-memory is logged: a
-/// build larger than every worker serving it goes to the largest once it
-/// is empty (Room::admits).
+/// name); log the dispatch and append its record row: the declaration,
+/// features, other serving workers with an idle agent, expected use, and
+/// the worker's size and load with it (the line adds the worker's speed
+/// and the build's seconds there). Over-memory is logged: a build larger
+/// than every worker serving it goes to the largest once it is empty
+/// (Room::admits). Returns whether its run teaches speed (Teaching).
 pub(super) fn dispatch(
     state: &HubState,
     to: (u64, &str),
     job: &Job,
     resumed: bool,
     admission: &Mutex<Admission>,
-) {
+) -> Teaching {
     let (capacity, assignments, free, sent) = {
         let a = admission.lock().unwrap();
         (a.capacity, a.assignments, a.free, a.sent)
     };
     let e = job.expected;
-    let (idle_elsewhere, room, record, p) = {
+    let (idle_elsewhere, room, record, p, secs_on, speed) = {
         let workers = state.worker_caps.lock().unwrap();
         let mut placement = state.placement.lock().unwrap();
         let p = Priority::of(job, placement.share(job), Instant::now());
@@ -391,15 +411,16 @@ pub(super) fn dispatch(
         };
         let rooms = placement.rooms();
         let idle = rooms.iter().filter(|r| r.id != to.0 && r.idle > 0);
-        (
-            idle.filter(serves).count(),
-            room,
-            placement.record.clone(),
-            p,
-        )
+        let idle = idle.filter(serves).count();
+        let (secs_on, speed) = (placement.secs_on(job, to.1), placement.history.speed(to.1));
+        (idle, room, placement.record.clone(), p, secs_on, speed)
     };
     let load = room.as_ref().map(|r| r.load);
     let memory = room.as_ref().and_then(|r| r.size.memory);
+    let placed = Teaching {
+        quiet: !resumed
+            && (room.as_ref()).is_some_and(|r| quiet(r.load.cores, e.demand.cores, r.size.cores)),
+    };
     if let Some(record) = record {
         let values = vec![
             Value::Integer(now_ms()),
@@ -448,6 +469,8 @@ pub(super) fn dispatch(
         share = round3(p.share),
         path = round3(p.path),
         waited = round3(p.wait),
+        speed = round3(speed),
+        expect_secs_on = secs_on.map(round3),
         oom_runs = e.oom,
         load_mem = load.map(|l| bytes(l.memory)),
         load_cores = load.map(|l| round3(l.cores)),
@@ -466,6 +489,7 @@ pub(super) fn dispatch(
             "placed over predicted memory"
         );
     }
+    placed
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]

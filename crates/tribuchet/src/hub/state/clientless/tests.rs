@@ -312,6 +312,7 @@ async fn a_build_waits_for_a_slot_only_where_one_lets_it_in() {
                     memory: gib * GIB,
                 },
                 secs: None,
+                unit_secs: None,
                 level: Level::Key,
                 oom: 0,
                 below: 0.0,
@@ -326,7 +327,7 @@ async fn a_build_waits_for_a_slot_only_where_one_lets_it_in() {
                 peak_memory_bytes: gib << 30,
                 ..Default::default()
             };
-            (state.placement.lock().unwrap().history).record(&build_of(&q), 0, &u);
+            (state.placement.lock().unwrap().history).record(&build_of(&q), 0, &u, None);
         } else {
             let twin = named(101, "q-1", 1.0);
             state.placement.lock().unwrap().dispatched(0, &twin, false);

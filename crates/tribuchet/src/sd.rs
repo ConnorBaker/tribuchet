@@ -9,6 +9,8 @@ use std::io;
 use std::net::TcpListener;
 use std::os::fd::{BorrowedFd, FromRawFd as _, RawFd};
 use std::os::unix::net::UnixListener;
+use std::pin::pin;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 use std::{env, future, process};
 #[cfg(target_os = "macos")]
@@ -232,4 +234,114 @@ pub(crate) fn feed(timeout: Duration, ping: impl Fn() + Send + 'static) {
             ping();
         }
     });
+}
+
+/// Await `work`, a startup step that may outlast systemd's start timeout,
+/// asking every `period` for three more (EXTEND_TIMEOUT_USEC) while
+/// `progress`, a count the step advances, has moved since the last ask:
+/// a step working is not killed; one stalled (a hung syscall) is, at the
+/// timeout or 3 to 4 periods after its last progress, whichever is later.
+pub async fn extending_start<T>(
+    work: impl Future<Output = T>,
+    progress: &AtomicU64,
+    period: Duration,
+) -> T {
+    extend_while(work, progress, period, |usec| {
+        let _ = sd_notify::notify(&[sd_notify::NotifyState::ExtendTimeoutUsec(usec)]);
+    })
+    .await
+}
+
+/// Await `work`, calling `extend` with three `period`s in microseconds at
+/// once, and then every `period` that `progress` moved in, until done.
+pub(crate) async fn extend_while<T>(
+    work: impl Future<Output = T>,
+    progress: &AtomicU64,
+    period: Duration,
+    extend: impl Fn(u32),
+) -> T {
+    let usec = u32::try_from((3 * period).as_micros()).unwrap_or(u32::MAX);
+    // At once, before the step can finish: an interval's first tick is
+    // a timer, which a step done in under a millisecond would beat.
+    extend(usec);
+    let mut seen = progress.load(Ordering::Relaxed);
+    let mut work = pin!(work);
+    let start = tokio::time::Instant::now() + period;
+    let mut tick = tokio::time::interval_at(start, period);
+    loop {
+        tokio::select! {
+            _ = tick.tick() => {
+                let now = progress.load(Ordering::Relaxed);
+                if now != seen {
+                    extend(usec);
+                }
+                seen = now;
+            }
+            done = &mut work => return done,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::AtomicU32;
+
+    use super::*;
+
+    /// A startup step of 95 s, past systemd's default 90 s, that makes
+    /// progress every second is extended from its start and every 10 s
+    /// while it works, and no longer once it is done.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_startup_step_making_progress_is_extended() {
+        let (ticks, progress) = (AtomicU32::new(0), AtomicU64::new(0));
+        let extend = |usec| {
+            assert_eq!(usec, 30_000_000);
+            ticks.fetch_add(1, Ordering::Relaxed);
+        };
+        let work = async {
+            for _ in 0..95 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                progress.fetch_add(1, Ordering::Relaxed);
+            }
+        };
+        extend_while(work, &progress, Duration::from_secs(10), extend).await;
+        assert_eq!(ticks.load(Ordering::Relaxed), 10);
+        tokio::time::sleep(Duration::from_secs(60)).await;
+        assert_eq!(ticks.load(Ordering::Relaxed), 10);
+    }
+
+    /// A step that stops making progress is extended at once and while
+    /// it moves, never after: here progress for 25 s of a 95 s step, so
+    /// four asks (0, 10, 20 and 30 s, the last reaching to 60 s), and
+    /// systemd's own 90 s timeout kills it.
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_startup_step_is_not_extended() {
+        let (ticks, progress) = (AtomicU32::new(0), AtomicU64::new(0));
+        let extend = |_| {
+            ticks.fetch_add(1, Ordering::Relaxed);
+        };
+        let work = async {
+            for _ in 0..25 {
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                progress.fetch_add(1, Ordering::Relaxed);
+            }
+            tokio::time::sleep(Duration::from_secs(70)).await;
+        };
+        extend_while(work, &progress, Duration::from_secs(10), extend).await;
+        assert_eq!(ticks.load(Ordering::Relaxed), 4);
+    }
+
+    /// A step already done when first polled is still extended, once:
+    /// a hub that opens its record at once still says so. On the real
+    /// clock, where an interval's first tick, a timer, is not yet due.
+    #[tokio::test]
+    async fn a_step_done_at_once_is_extended_once() {
+        let (ticks, progress) = (AtomicU32::new(0), AtomicU64::new(0));
+        let extend = |_| {
+            ticks.fetch_add(1, Ordering::Relaxed);
+        };
+        let period = Duration::from_secs(10);
+        extend_while(future::ready(()), &progress, period, extend).await;
+        assert_eq!(ticks.load(Ordering::Relaxed), 1);
+    }
 }

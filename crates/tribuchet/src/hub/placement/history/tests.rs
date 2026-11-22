@@ -1,6 +1,8 @@
 //! Every value compared is exact: sums and medians of small integers.
 #![allow(clippy::float_cmp)]
 
+use std::collections::VecDeque;
+
 use super::*;
 
 fn build(name: &str, declared: bool) -> Build<'_> {
@@ -39,7 +41,7 @@ fn a_key_expects_its_largest_recent_peak_and_median_timing() {
     let mut h = History::default();
     let (v1, v2) = (build("foo-1.0", false), build("foo-1.1", false));
     for (cores, secs, peak) in [(2, 10, 3), (4, 30, 9), (8, 20, 1)] {
-        h.record(&v1, 0, &usage(cores, secs, peak));
+        h.record(&v1, 0, &usage(cores, secs, peak), None);
     }
     let e = h.expect(&v2);
     assert_eq!(e.level, Level::Key);
@@ -47,10 +49,10 @@ fn a_key_expects_its_largest_recent_peak_and_median_timing() {
     // The window is 8 runs: the 9 GiB run, second, is in it after 6 more
     // and out of it after a seventh.
     for _ in 0..6 {
-        h.record(&v1, 0, &usage(1, 1, 2));
+        h.record(&v1, 0, &usage(1, 1, 2), None);
     }
     assert_eq!(gib(h.expect(&v1)), 9.0, "the second of 8 runs");
-    h.record(&v1, 0, &usage(1, 1, 2));
+    h.record(&v1, 0, &usage(1, 1, 2), None);
     assert_eq!(gib(h.expect(&v1)), 2.0, "after the window");
 }
 
@@ -59,11 +61,11 @@ fn a_key_expects_its_largest_recent_peak_and_median_timing() {
 #[test]
 fn a_key_without_a_succeeded_run_takes_its_class_cores() {
     let mut h = History::default();
-    h.record(&build("other-1", false), 0, &usage(4, 10, 1));
+    h.record(&build("other-1", false), 0, &usage(4, 10, 1), None);
     let b = build("foo-1", false);
     let mut oom = usage(30, 1, 12);
     oom.oom_killed = true;
-    h.record(&b, 0, &oom);
+    h.record(&b, 0, &oom, None);
     let e = h.expect(&b);
     assert_eq!(
         (e.level, gib(e), e.demand.cores, e.secs),
@@ -82,7 +84,7 @@ fn a_key_without_a_succeeded_run_takes_its_class_cores() {
 fn a_run_that_did_not_succeed_is_censored_at_every_level() {
     let mut h = History::default();
     let b = build("foo-1", false);
-    h.record(&b, 0, &usage(2, 10, 1));
+    h.record(&b, 0, &usage(2, 10, 1), None);
     let rows: [(&str, &str, i32, u64, bool, f64); 5] = [
         ("failed, over", "foo-1", 1, 20, false, 20.0),
         ("failed, under", "foo-1", 1, 0, false, 20.0),
@@ -100,7 +102,7 @@ fn a_run_that_did_not_succeed_is_censored_at_every_level() {
     for (row, name, exit_code, peak, oom, want) in rows {
         let mut u = usage(30, 1, peak);
         u.oom_killed = oom;
-        h.record(&build(name, false), exit_code, &u);
+        h.record(&build(name, false), exit_code, &u, None);
         let e = h.expect(&build(name, false));
         assert_eq!((e.level, gib(e)), (Level::Key, want), "{row}");
     }
@@ -109,7 +111,7 @@ fn a_run_that_did_not_succeed_is_censored_at_every_level() {
     let e = h.expect(&b);
     assert_eq!((e.demand.cores, e.secs, e.oom), (2.0, Some(10.0), 1));
     let empty = build("qux-1", false);
-    h.record(&empty, 1, &BuildUsage::default());
+    h.record(&empty, 1, &BuildUsage::default(), None);
     let e = h.expect(&empty);
     assert!(
         !h.ran(&empty) && e.level != Level::Key,
@@ -121,7 +123,7 @@ fn a_run_that_did_not_succeed_is_censored_at_every_level() {
         (Level::Prefix, 96.0),
         "no success under tar"
     );
-    h.record(&build("tar-other-1", false), 0, &usage(1, 1, 2));
+    h.record(&build("tar-other-1", false), 0, &usage(1, 1, 2), None);
     let e = h.expect(&build("tar-plugin-1", false));
     assert_eq!(
         (e.level, gib(e)),
@@ -134,10 +136,10 @@ fn a_run_that_did_not_succeed_is_censored_at_every_level() {
         (Level::Prefix, 96.0),
         "none under tar-crash"
     );
-    h.record(&b, 0, &BuildUsage::default());
+    h.record(&b, 0, &BuildUsage::default(), None);
     assert_eq!(gib(h.expect(&b)), 20.0, "an unmeasured success taught");
     let blind = build("blind-1", false);
-    h.record(&blind, 0, &BuildUsage::default());
+    h.record(&blind, 0, &BuildUsage::default(), None);
     assert!(!h.ran(&blind), "an unmeasured run counted as run");
     assert_eq!(h.expect(&blind).level, Level::Class, "it taught memory");
 }
@@ -151,14 +153,14 @@ fn a_killed_peak_floors_its_siblings_and_successes_above_it_lead() {
     let mut h = History::default();
     let mut killed = usage(30, 1, 30);
     killed.oom_killed = true;
-    h.record(&build("tar-crash-1", false), 0, &killed);
+    h.record(&build("tar-crash-1", false), 0, &killed, None);
     let sibling = build("tar-plugin-1", false);
     assert_eq!(gib(h.expect(&sibling)), 30.0, "under the killed peak");
-    h.record(&build("tar-other-1", false), 0, &usage(4, 10, 40));
+    h.record(&build("tar-other-1", false), 0, &usage(4, 10, 40), None);
     let e = h.expect(&sibling);
     assert_eq!((gib(e), e.demand.cores), (40.0, 4.0), "the success");
     for i in 0..20 {
-        h.record(&build(&format!("x{i}-1"), false), 0, &usage(1, 10, 1));
+        h.record(&build(&format!("x{i}-1"), false), 0, &usage(1, 10, 1), None);
     }
     assert_eq!(gib(h.expect(&build("zz-1", false))), 1.0, "the class");
 }
@@ -171,7 +173,7 @@ fn a_killed_peak_floors_its_siblings_and_successes_above_it_lead() {
 #[test]
 fn a_censored_peak_counts_as_at_least_itself() {
     let runs = |rs: &[(u64, bool)]| -> VecDeque<Run> {
-        rs.iter().map(|&(p, ok)| Run(p, 0, 0, ok)).collect()
+        rs.iter().map(|&(p, ok)| Run(p, 0, 0, ok, None)).collect()
     };
     let km = runs(&[(1, true), (2, false), (3, false), (4, true), (5, true)]);
     assert_eq!(quantile(&km, 0.5), Some(4));
@@ -201,13 +203,13 @@ fn a_censored_peak_counts_as_at_least_itself() {
 fn a_runaways_bound_leaves_its_key_with_its_window() {
     let mut h = History::default();
     for n in 0..20 {
-        h.record(&build(&format!("x{n}-1"), false), 0, &usage(1, 1, 1));
+        h.record(&build(&format!("x{n}-1"), false), 0, &usage(1, 1, 1), None);
     }
     let b = build("tar-crash-1", false);
-    h.record(&b, 1, &usage(30, 1, 96));
+    h.record(&b, 1, &usage(30, 1, 96), None);
     assert_eq!(gib(h.expect(&b)), 96.0, "under its own peak");
     for _ in 0..WINDOW {
-        h.record(&b, 1, &usage(30, 1, 1));
+        h.record(&b, 1, &usage(30, 1, 1), None);
     }
     assert_eq!(gib(h.expect(&b)), 1.0);
 }
@@ -218,12 +220,12 @@ fn a_runaways_bound_leaves_its_key_with_its_window() {
 fn failures_below_a_measured_peak_keep_it() {
     let mut h = History::default();
     let b = build("foo-1", false);
-    h.record(&b, 0, &usage(4, 100, 40));
+    h.record(&b, 0, &usage(4, 100, 40), None);
     let mut killed = usage(1, 1, 1);
     killed.oom_killed = true;
-    h.record(&b, 0, &killed);
+    h.record(&b, 0, &killed, None);
     for _ in 0..WINDOW {
-        h.record(&b, 1, &usage(1, 1, 1));
+        h.record(&b, 1, &usage(1, 1, 1), None);
     }
     let e = h.expect(&b);
     assert_eq!((gib(e), e.secs, e.oom), (40.0, Some(100.0), 1));
@@ -239,15 +241,15 @@ fn failures_below_a_measured_peak_keep_it() {
 fn a_skipped_kill_outlives_the_success_that_hid_it() {
     let mut h = History::default();
     let b = build("foo-1", false);
-    h.record(&b, 0, &usage(1, 1, 10));
+    h.record(&b, 0, &usage(1, 1, 10), None);
     for _ in 0..6 {
-        h.record(&b, 0, &usage(1, 1, 1));
+        h.record(&b, 0, &usage(1, 1, 1), None);
     }
     let mut killed = usage(1, 1, 9);
     killed.oom_killed = true;
-    h.record(&b, 0, &killed);
+    h.record(&b, 0, &killed, None);
     for _ in 0..2 {
-        h.record(&b, 0, &usage(1, 1, 1));
+        h.record(&b, 0, &usage(1, 1, 1), None);
     }
     assert_eq!(gib(h.expect(&b)), 10.0, "under the kill's lower bound");
 }
@@ -259,13 +261,13 @@ fn a_skipped_kill_outlives_the_success_that_hid_it() {
 fn a_kill_at_a_successs_peak_is_covered_by_it() {
     let mut h = History::default();
     let b = build("foo-1", false);
-    h.record(&b, 0, &usage(1, 100, 9));
+    h.record(&b, 0, &usage(1, 100, 9), None);
     for _ in 0..7 {
-        h.record(&b, 0, &usage(1, 1, 1));
+        h.record(&b, 0, &usage(1, 1, 1), None);
     }
     let mut killed = usage(1, 1, 9);
     killed.oom_killed = true;
-    h.record(&b, 0, &killed);
+    h.record(&b, 0, &killed, None);
     let e = h.expect(&build("foo-bar-1", false));
     assert_eq!((e.level, gib(e)), (Level::Prefix, 9.0));
 }
@@ -279,16 +281,16 @@ fn the_smallest_success_covering_a_kill_stays() {
     let mut h = History::default();
     let b = build("foo-1", false);
     for gib in [20, 10] {
-        h.record(&b, 0, &usage(1, 1, gib));
+        h.record(&b, 0, &usage(1, 1, gib), None);
     }
     for _ in 0..5 {
-        h.record(&b, 0, &usage(1, 1, 1));
+        h.record(&b, 0, &usage(1, 1, 1), None);
     }
     let mut killed = usage(1, 1, 9);
     killed.oom_killed = true;
-    h.record(&b, 0, &killed);
+    h.record(&b, 0, &killed, None);
     for _ in 0..2 {
-        h.record(&b, 0, &usage(1, 1, 1));
+        h.record(&b, 0, &usage(1, 1, 1), None);
     }
     assert_eq!(gib(h.expect(&b)), 10.0);
 }
@@ -299,10 +301,10 @@ fn the_smallest_success_covering_a_kill_stays() {
 fn unmeasured_runs_teach_nothing() {
     let mut h = History::default();
     let b = build("foo-1", false);
-    h.record(&b, 0, &usage(2, 10, 9));
+    h.record(&b, 0, &usage(2, 10, 9), None);
     let e = h.expect(&b);
     for _ in 0..WINDOW {
-        h.record(&b, 0, &BuildUsage::default());
+        h.record(&b, 0, &BuildUsage::default(), None);
     }
     assert_eq!(h.expect(&b), e);
 }
@@ -312,7 +314,7 @@ fn unmeasured_runs_teach_nothing() {
 fn a_run_without_cpu_time_used_no_core() {
     let mut h = History::default();
     let b = build("nap-1", false);
-    h.record(&b, 0, &usage(0, 10, 1));
+    h.record(&b, 0, &usage(0, 10, 1), None);
     let e = h.expect(&b);
     assert_eq!((e.demand.cores, e.secs), (0.0, Some(10.0)));
 }
@@ -327,7 +329,7 @@ fn a_run_without_running_time_teaches_no_timing() {
         let b = build(name, false);
         let mut u = usage(0, 0, 2);
         u.cpu_usec = cpu_usec;
-        h.record(&b, 0, &u);
+        h.record(&b, 0, &u, None);
         let e = h.expect(&b);
         assert_eq!((gib(e), e.demand.cores, e.secs), (2.0, 1.0, None), "{name}");
     }
@@ -341,7 +343,7 @@ fn frozen_time_is_not_running_time() {
     let b = build("foo-1", false);
     let mut u = usage(8, 1, 1);
     (u.wall_ms, u.frozen_ms) = (3000, 2000);
-    h.record(&b, 0, &u);
+    h.record(&b, 0, &u, None);
     let e = h.expect(&b);
     assert_eq!((e.demand.cores, e.secs), (8.0, Some(1.0)));
 }
@@ -354,19 +356,25 @@ fn an_unseen_key_falls_back_to_a_prefix_its_class_and_the_prior() {
     let unseen = build("app-grpc-store-clang-tidy-0.2.3", false);
     assert_eq!(h.expect(&unseen), Expected::prior(false));
     assert_eq!(gib(h.expect(&build("torch-2", true))), 38.5);
-    h.record(&build("app-util-2.36", false), 0, &usage(2, 10, 3));
+    h.record(&build("app-util-2.36", false), 0, &usage(2, 10, 3), None);
     // "app" is a prefix of both; "app-grpc-store" a longer one.
     let e = h.expect(&unseen);
     assert_eq!((e.level, gib(e)), (Level::Prefix, 3.0));
     // A stem is pooled under itself too: "app-grpc-store" pools its own
     // run and its asan build's, and is the longest prefix learned.
-    h.record(&build("app-grpc-store-0.2.3", false), 0, &usage(6, 10, 16));
+    h.record(
+        &build("app-grpc-store-0.2.3", false),
+        0,
+        &usage(6, 10, 16),
+        None,
+    );
     h.record(
         &build("app-grpc-store-asan-0.2.3", false),
         0,
         &usage(6, 10, 4),
+        None,
     );
-    h.record(&build("app-grpc-1", false), 0, &usage(6, 10, 32));
+    h.record(&build("app-grpc-1", false), 0, &usage(6, 10, 32), None);
     let e = h.expect(&unseen);
     assert_eq!((e.level, gib(e)), (Level::Prefix, 16.0), "longest prefix");
     // No prefix: the class of builds that do not declare big-parallel.
@@ -388,9 +396,9 @@ fn an_unseen_key_falls_back_to_a_prefix_its_class_and_the_prior() {
 #[test]
 fn a_prefix_keeps_the_last_window_of_runs() {
     let mut h = History::default();
-    h.record(&build("foo-bar-1", false), 0, &usage(1, 1, 9));
+    h.record(&build("foo-bar-1", false), 0, &usage(1, 1, 9), None);
     for _ in 0..WINDOW {
-        h.record(&build("foo-bar-1", false), 0, &usage(1, 1, 1));
+        h.record(&build("foo-bar-1", false), 0, &usage(1, 1, 1), None);
     }
     let e = h.expect(&build("foo-baz-1", false));
     assert_eq!((e.level, gib(e)), (Level::Prefix, 1.0));
@@ -401,12 +409,12 @@ fn a_prefix_keeps_the_last_window_of_runs() {
 fn a_class_expects_its_ninetieth_percentile_peak() {
     let mut h = History::default();
     for n in 1..=10 {
-        h.record(&build(&format!("k{n}-1"), false), 0, &usage(1, 1, n));
+        h.record(&build(&format!("k{n}-1"), false), 0, &usage(1, 1, n), None);
     }
     let e = h.expect(&build("unseen-1", false));
     assert_eq!((e.level, gib(e)), (Level::Class, 10.0));
     for n in 11..=20 {
-        h.record(&build(&format!("k{n}-1"), false), 0, &usage(1, 1, n));
+        h.record(&build(&format!("k{n}-1"), false), 0, &usage(1, 1, n), None);
     }
     assert_eq!(gib(h.expect(&build("unseen-1", false))), 19.0);
     // CLASS_WINDOW is 512: of 52 runs of 100 GiB, then 460 of 1 GiB, the
@@ -415,7 +423,12 @@ fn a_class_expects_its_ninetieth_percentile_peak() {
     let mut h = History::default();
     for n in 0..512 {
         let peak = if n < 52 { 100 } else { 1 };
-        h.record(&build(&format!("k{n}-1"), false), 0, &usage(1, 1, peak));
+        h.record(
+            &build(&format!("k{n}-1"), false),
+            0,
+            &usage(1, 1, peak),
+            None,
+        );
     }
     assert_eq!(gib(h.expect(&build("unseen-1", false))), 100.0);
 }
@@ -427,9 +440,9 @@ fn a_class_expects_its_ninetieth_percentile_peak() {
 #[test]
 fn a_class_moves_a_censored_peaks_weight_above_it() {
     let mut h = History::default();
-    h.record(&build("k0-1", false), 1, &usage(1, 1, 1));
+    h.record(&build("k0-1", false), 1, &usage(1, 1, 1), None);
     for n in 2..=11 {
-        h.record(&build(&format!("k{n}-1"), false), 0, &usage(1, 1, n));
+        h.record(&build(&format!("k{n}-1"), false), 0, &usage(1, 1, n), None);
     }
     let e = h.expect(&build("unseen-1", false));
     assert_eq!((e.level, gib(e)), (Level::Class, 11.0));
@@ -441,7 +454,7 @@ fn an_even_count_takes_the_midpoint() {
     let mut h = History::default();
     let b = build("foo-1", false);
     for (cores, secs) in [(2, 10), (4, 30)] {
-        h.record(&b, 0, &usage(cores, secs, 1));
+        h.record(&b, 0, &usage(cores, secs, 1), None);
     }
     let e = h.expect(&b);
     assert_eq!((e.demand.cores, e.secs), (3.0, Some(20.0)));
@@ -455,18 +468,18 @@ fn an_even_count_takes_the_midpoint() {
 fn a_read_holds_until_what_it_read_learns() {
     let mut h = History::default();
     let own = build("own-1", false);
-    h.record(&own, 0, &usage(1, 10, 1));
+    h.record(&own, 0, &usage(1, 10, 1), None);
     let (_, read_own) = h.read(&own);
     let (_, read_unseen) = h.read(&build("py-foo-1", false));
     let (_, read_lone) = h.read(&build("lone-1", true));
-    h.record(&build("other-1", false), 0, &usage(1, 10, 1));
+    h.record(&build("other-1", false), 0, &usage(1, 10, 1), None);
     assert!(h.fresh(&read_own), "another key's run");
     assert!(!h.fresh(&read_unseen), "a run of its class");
     assert!(h.fresh(&read_lone), "a run of another class");
     let (_, read_unseen) = h.read(&build("py-foo-1", false));
-    h.record(&build("py-bar-1", true), 0, &usage(1, 10, 1));
+    h.record(&build("py-bar-1", true), 0, &usage(1, 10, 1), None);
     assert!(!h.fresh(&read_unseen), "a sibling's run under its prefix");
-    h.record(&own, 0, &usage(1, 10, 2));
+    h.record(&own, 0, &usage(1, 10, 2), None);
     assert!(!h.fresh(&read_own), "its own key's run");
 }
 
@@ -522,7 +535,7 @@ fn a_fresh_read_is_never_stale() {
                 oom_killed: next(6) == 0,
                 ..BuildUsage::default()
             };
-            h.record(&of(i, d, src), i32::from(next(4) == 0), &u);
+            h.record(&of(i, d, src), i32::from(next(4) == 0), &u, None);
             for (j, dj, sj, e, r) in &reads {
                 if h.fresh(r) {
                     fresh += 1;

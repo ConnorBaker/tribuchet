@@ -86,6 +86,7 @@ async fn one_build_short_of_memory_gives_up_one_clientless_run() {
                 memory: gib * GIB,
             },
             secs: None,
+            unit_secs: None,
             level: Level::Key,
             oom: 0,
             below: 0.0,
@@ -99,7 +100,7 @@ async fn one_build_short_of_memory_gives_up_one_clientless_run() {
         peak_memory_bytes: 4 << 30,
         ..Default::default()
     };
-    (state.placement.lock().unwrap().history).record(&build_of(&q), 0, &u);
+    (state.placement.lock().unwrap().history).record(&build_of(&q), 0, &u, None);
     let _client = q.replay.subscribe().await;
     state.queue.lock().await.push_back(q);
     let (mut listed, mut gone, mut kept) = (Vec::new(), Vec::new(), Vec::new());
@@ -160,6 +161,7 @@ async fn a_build_waiting_for_a_slot_wants_no_memory_freed_too() {
                 memory: gib * GIB,
             },
             secs: None,
+            unit_secs: None,
             level: Level::Key,
             oom: 0,
             below: 0.0,
@@ -173,7 +175,7 @@ async fn a_build_waiting_for_a_slot_wants_no_memory_freed_too() {
         peak_memory_bytes: 2 << 30,
         ..Default::default()
     };
-    (state.placement.lock().unwrap().history).record(&build_of(&q), 0, &u);
+    (state.placement.lock().unwrap().history).record(&build_of(&q), 0, &u, None);
     let _client = q.replay.subscribe().await;
     state.queue.lock().await.push_back(q);
     let (mut listed, mut gone) = (Vec::new(), Vec::new());
@@ -231,7 +233,7 @@ async fn a_build_larger_than_every_worker_wants_a_clientless_run_given_up() {
         peak_memory_bytes: 16 << 30,
         ..Default::default()
     };
-    (state.placement.lock().unwrap().history).record(&build_of(&big), 0, &u);
+    (state.placement.lock().unwrap().history).record(&build_of(&big), 0, &u, None);
     let _client = big.replay.subscribe().await;
     state.queue.lock().await.push_back(big);
     let gone = named(0, "c-1");
@@ -278,6 +280,7 @@ async fn a_check_reads_what_a_queued_builds_key_learned_since() {
                 memory: gib * GIB,
             },
             secs: None,
+            unit_secs: None,
             level: Level::Key,
             oom: 0,
             below: 0.0,
@@ -293,9 +296,9 @@ async fn a_check_reads_what_a_queued_builds_key_learned_since() {
     let mut q = named(100, "q-1", 1.0);
     {
         let mut p = state.placement.lock().unwrap();
-        p.history.record(&build_of(&q), 0, &ran(1));
+        p.history.record(&build_of(&q), 0, &ran(1), None);
         p.refresh(&mut q);
-        p.history.record(&build_of(&q), 0, &ran(7));
+        p.history.record(&build_of(&q), 0, &ran(7), None);
     }
     let _client = q.replay.subscribe().await;
     state.queue.lock().await.push_back(q);

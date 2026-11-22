@@ -539,6 +539,7 @@ mod tests {
             expected: Expected::prior(false),
             expected_at: None,
             sources: None,
+            placed: Default::default(),
         }
     }
 

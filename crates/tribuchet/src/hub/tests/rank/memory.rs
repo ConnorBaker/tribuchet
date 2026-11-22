@@ -184,7 +184,7 @@ fn failed(state: &HubState, on: u64, j: &Job, gib: u64) {
         ..BuildUsage::default()
     };
     let mut p = state.placement.lock().unwrap();
-    p.history.record(&placement::build_of(j), 1, &usage);
+    p.history.record(&placement::build_of(j), 1, &usage, None);
     p.settled(on, &j.id);
 }
 
@@ -319,7 +319,7 @@ async fn a_key_whose_run_was_not_measured_still_holds() {
         let q = state.queue.lock().await;
         let mut p = state.placement.lock().unwrap();
         p.history
-            .record(&placement::build_of(&q[0]), 0, &BuildUsage::default());
+            .record(&placement::build_of(&q[0]), 0, &BuildUsage::default(), None);
     }
     assert!(state.take_job(&a_caps, Some(a.id)).await.is_some(), "first");
     let second = state.take_job(&a_caps, Some(a.id)).await;
@@ -358,7 +358,8 @@ async fn an_early_failure_neither_frees_nor_shrinks_its_key() {
     };
     {
         let mut p = state.placement.lock().unwrap();
-        p.history.record(&placement::build_of(&first), 1, &usage);
+        p.history
+            .record(&placement::build_of(&first), 1, &usage, None);
         p.settled(a.id, &first.id);
     }
     let second = state.take_job(&a_caps, Some(a.id)).await.expect("second");
@@ -534,7 +535,7 @@ async fn a_refresh_keeps_the_queue_in_due_order() {
         };
         let mut b = job(50, Arc::new(Replay::default()));
         b.req.outputs = [("out".to_owned(), out("b-1"))].into();
-        p.history.record(&placement::build_of(&b), 0, &u);
+        p.history.record(&placement::build_of(&b), 0, &u, None);
         p.downstream.learn("x86_64-linux/b", 1.0, [out("b-1")], &[]);
         p.downstream
             .learn("x86_64-linux/d", 1000.0, [out("d-1")], &[out("b-1")]);
