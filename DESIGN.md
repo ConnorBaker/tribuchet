@@ -489,10 +489,16 @@ worker's session lost, or waiting for an input) enters it anew: its wait
 toward `AGE` starts again with each loss. A worker that reported no
 memory keeps itself for none; largest means largest among the workers
 serving the build, so a larger worker of another system (an aarch64
-worker) changes nothing. What this guarantees is conditional: the kept
-build waits no longer than the runs on the kept worker take to end, as
-long as that worker keeps asking for work; and a wait for a run of a key
-to succeed (`Placement::held_for_key`) is not bounded by `AGE` at all.
+worker) changes nothing. A worker is kept as a scan of the queue reaches
+the build, so only the builds behind it in the queue's order are held to
+backfill there; one ahead of it, such as one queued later with a path
+longer by more than the difference (Order, below), may still take the
+kept worker, as in EASY, where the reservation binds only the jobs
+behind it. What this guarantees is conditional: the kept build waits no
+longer than the runs on the kept worker, those there and those of the
+builds ahead of it that take it, take to end, as long as that worker
+keeps asking for work; and a wait for a run of a key to succeed
+(`Placement::held_for_key`) is not bounded by `AGE` at all.
 
 What this leaves: a key's other builds wait, one run at a time, until a
 run of it succeeds. In the replay of the batch below, the r92-onnxruntime

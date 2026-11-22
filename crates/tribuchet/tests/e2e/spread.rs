@@ -36,6 +36,11 @@ fn launch(name: &str) {
 }
 
 // Its name has no `build_`, which the builds phase selects.
+/// Round 0 assumes the hub VM's worker has a little more memory than
+/// the worker VM's: an empty worker admits a build larger than every
+/// worker only if it is the largest (`Room::admits`), so `b` waits for
+/// `a`'s worker and learns from `a`. Equal, the idle one would take `b`
+/// first and `learned="prefix"` would fail with admission right.
 #[test]
 fn a_second_heavy_goes_to_the_other_worker() {
     succeed(
