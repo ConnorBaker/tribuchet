@@ -294,8 +294,9 @@ Nix had that input as it submitted (`hub/state/hold.rs`).
 ## Placement
 
 A queued build goes to the least full worker with an idle agent that
-serves it, by what it and the builds already there are expected to use
-against what the worker has (`hub/placement/rank.rs`). Fullness is the
+serves it and admits it for its memory, by what it and the builds
+already there are expected to use against what the worker has
+(`hub/placement/rank.rs`). Fullness is the
 larger of the expected cores of the worker's unsettled builds, this one
 counted, over its cores, and their expected memory over the memory its
 builds may use. Each worker reports both when it registers
@@ -321,14 +322,47 @@ registering again does not count them.
 
 What a build is expected to use comes from what builds of its key used
 on this farm (`hub/placement/history.rs`): its system and pname, the
-name up to its version or a hash. Each key keeps its last 8 runs that
-succeeded or were OOM-killed, as the workers measured them: the largest
-peak memory among them (an OOM-killed run's peak is a lower bound), and
-the medians of cores (CPU time over running time, frozen time not
-counted) and running time over the runs that succeeded. A failed run
-teaches nothing. A key with no run takes the longest dash-prefix of its
+name up to its version or a hash. Each key keeps its last 8 runs, as
+the workers measured them: the largest peak memory among them, and the
+medians of cores (CPU time over running time, frozen time not counted)
+and running time over the runs that succeeded. A run that did not
+succeed, failed or OOM-killed, teaches memory only, and no timing: its
+peak, cut short by the kill or the failure, is right-censored, a lower
+bound of what its build needed. It teaches its key, its pname's
+prefixes and its class like any run. A key's memory is its largest
+peak, censored or not: a bound of its own builds. A prefix's is the
+largest peak that succeeded, or with none, the largest: a pname's peak
+censored above its siblings' successes, a runaway's, bounds that pname,
+not another's guess, while a sibling of a killed build with nothing
+else to go on guesses no less than its peak. A class's is the 90th
+percentile of its peaks by the Kaplan-Meier estimator (Kaplan and
+Meier, 1958): a censored peak moves its weight to the peaks above it
+(a success first at a tie), and where censored peaks leave the quantile
+undefined, short of the 90th percentile at the last success, the 90th
+percentile of all its peaks, censored or not, and no lower than its
+largest peak that succeeded, which bounds it from
+below as each build needs at least its peak. At a key or a prefix, a
+censored peak no higher than one that succeeded in its window is not
+added (its kill still counted), which would push measured runs, and
+their timing, out of the window; the smallest such success moves to the
+newest place instead, so a peak no lower than the censored one stays as
+long as that run would have (`Runs::learn`). The class takes every run.
+A run that did not succeed is learned at its own peak, not at a guess of
+its build: being cut short bounds its own need, nothing else, and a run
+that reports no usage teaches nothing at all (a setup failure reports
+none, `fail_build` in `worker/session.rs`; an execution error or a lost
+agent connection reports it zeroed, `worker/resume/delivery.rs` and
+`worker/build/agent_exec.rs`). It
+reads nothing but the history, so the record's fold is the live history.
+A key with no run takes the longest dash-prefix of its
 pname that has one, then its class (its system and whether it declares
-`big-parallel`), then a fixed prior. A `big-parallel` declaration picks
+`big-parallel`), then a fixed prior. A key none of whose runs succeeded
+takes the guess of the first of its prefixes and class with a run that
+succeeded, else the prior, no lower than its own largest peak: its
+failures bound its need from below and say nothing of how far above,
+so neither they nor its kin's failures stand in for a measured need. A
+first run that fails early, at 200 MiB, of a key whose prior is
+38.5 GiB, leaves its next build at 38.5 GiB, not at 200 MiB. A `big-parallel` declaration picks
 the class (its runs, and the cores a key without a succeeded run takes)
 and the prior; nothing else. Placement ranks workers by memory and cores
 only. The running time goes into the path of the builds a key's builds
@@ -337,8 +371,11 @@ of a
 key's OOM kills and where an expectation came from are logged at
 dispatch; nothing ranks by them.
 A run with no running time (a worker can report none) teaches no timing.
-Keys are never dropped. A build's expectation is taken once, as it is
-first queued; a requeued build keeps it.
+Keys are never dropped. A build's expectation is taken as it is queued,
+and again each time a worker would take it, so that what a run of its
+key taught meanwhile counts. Its path (Order, below) is the one it was
+queued with, as a requeued build keeps it: the queue is kept in order
+by it, and a build is not moved in it.
 
 The history is the fold of the hub's build record (`hub/record.rs`), a
 SQLite database at [placement] `record`, by default
@@ -390,24 +427,190 @@ into the record once instead, by a command removed since, before the
 first hub that keeps a record started. Its rows are the record's first;
 those of builds queued before that journal began have no system.
 
-The worker that asks takes the first queued build it can, in the
-queue's order (Order, below), unless
-another connected worker that serves it has an idle agent (a free slot,
-not the one build a worker stages ahead while every slot is busy) and
-would be less full with it, or the asker has only that lookahead. That
-worker is woken, and takes it when it asks; the asker goes on to the
+A worker admits a build for its memory only (`Room::admits`): the
+expected memory of the builds it holds and of this one fits the memory its builds may use; or it
+holds nothing and is the largest of the workers serving the build: a
+build larger than all of them waits for that, bounded below
+(`Placement::waits`); it is not failed for its size. A
+worker that reported no memory admits any. Cores are not tested: a test
+of
+cores starved builds of many cores in the replay below, and the CPU
+arbiter shares cores instead. A build whose key has no run that
+succeeded and was measured (`History::ran`) waits while another build of
+its key is taken and not yet settled (`Placement::held_for_key`, from
+what each session holds, so a session that ends lets go of its builds'
+keys, and from what a take holds until it is dispatched or dropped): it
+is taken once that run ends, with what the run taught. A run that fails
+lets the next build of its key go, alone: the key's builds go one at a
+time until one succeeds. A key keeps its last 8 runs, so one whose
+only success leaves that window, pushed out by runs that failed above
+it, holds its builds one at a time again. A build waiting only for
+memory or for its key does not count as waiting for a slot when the
+clientless rule weighs giving up a build with no client
+(`state/clientless.rs`): one test decides both the take and that count
+(`Placement::waits`). A build short of memory at a worker only for the
+load of that worker's builds with no client wants them given up
+(`Placement::wants_memory`, `Room::freed`: a worker those builds alone
+hold is empty without them, so a build larger than every worker wants
+them given up too), as one ranked away from it for that load does: at
+one worker, the first by session id, so that one build gives up what one
+placement of it needs, not some at every worker. A build with no client
+that holds its key from a queued build with one is not given up for it:
+the run's end, which it reaches as any run does, ends that wait, and
+giving it up would teach the key only a failure. The hold begins as a worker takes the build, under
+the queue's lock, not at its dispatch after: another worker's take in
+between would find the key free.
+
+A build waiting for memory would wait while its worker kept taking the
+later builds that fit, and under a steady load never be taken. Once it
+has waited `AGE` (3000 s), the worker serving it that is expected to
+have room for it soonest is kept for it, as in EASY (Mu'alem and
+Feitelson, 2001; `Placement::waits`): by its builds' expected ends
+(dispatch and expected seconds, `Placement::frees`), enough of them for
+the build, or all of them for a build larger than every worker, its
+shadow start; of workers tied, the first by session id, so where no end
+is known the same worker is the one emptied. One build keeps one
+worker, and a worker is kept for one build, in a take and as well in a
+wait for a slot, which asks of each worker in turn. That worker takes a
+later build only as EASY's backfill (`Kept::backfills`): before the
+shadow start, and only one expected to end by it, or one that fits in
+the memory the kept build leaves beside it then; once the shadow start
+has passed, none. A worker whose runs' ends are not all known keeps
+itself and backfills nothing. Other workers take the later builds. The
+bound: a backfill admitted ends by the shadow start or leaves the kept
+build its memory, so the kept build waits past the shadow start only for
+runs already admitted that outlast their expected end, by as long as
+they outlast it; a backfill that runs three times its estimate delays it
+by that overrun and no more, as no new one is admitted after the start
+(tested: `a_backfill_that_overruns_delays_the_kept_build_by_its_overrun_alone`).
+An expected end is a median, not an upper bound, so such overruns are
+expected. A build that goes back to the queue (`HubState::requeue`: its
+worker's session lost, or waiting for an input) enters it anew: its wait
+toward `AGE` starts again with each loss. A worker that reported no
+memory keeps itself for none; largest means largest among the workers
+serving the build, so a larger worker of another system (an aarch64
+worker) changes nothing. What this guarantees is conditional: the kept
+build waits no longer than the runs on the kept worker take to end, as
+long as that worker keeps asking for work; and a wait for a run of a key
+to succeed (`Placement::held_for_key`) is not bounded by `AGE` at all.
+
+What this leaves: a key's other builds wait, one run at a time, until a
+run of it succeeds. In the replay of the batch below, the r92-onnxruntime
+builds, every one of whose runs failed, waited up to 24,237 s with this
+rule; where a failed run ends the hold instead (its guess still no lower
+than its peak), they waited up to 2,184 s, but two of them, guessed at
+the 27 GiB of a killed run and using 41 and 35 GiB, put a KVM host over
+its memory 1.15 % of the batch's window. A failed run's peak is a lower
+bound, and repeated kills at one peak never raise it. Nor does a success
+under a prefix lift its siblings' guess above it: a prefix whose
+measured success is small guesses small for an unseen sibling of a
+killed build (a build killed at 40 GiB and a 0.1 GiB success under one
+prefix leave its unseen siblings at about 0.1 GiB). A runaway's peak,
+failed or OOM-killed, is the memory guess of an unseen sibling under its
+prefix while no build under that prefix has succeeded
+(`Runs::expected`): a sibling then larger than every worker waits for
+the largest serving it to be empty, and keeps it after `AGE`. A build
+whose clients have all left keeps its worker until a take drops it. A
+run resumed by its worker (`take_job_by_key`) holds its key only from
+its dispatch; and after the hub restarts, runs still going count against
+no worker until each is dispatched again.
+
+Each scan of the queue (a take, a wait for a slot) reads the
+sessions' rooms, each locking its session's admission, once
+(`Placement::scan`), not once for each build it passes. A build's
+expectation is read from the history again only once an entry it read
+has learned a run since (`History::read`, `History::fresh`,
+`Job.expected_at`): a key with a timed success reads only itself, others
+also their prefixes and class, so those are re-read after any run of
+their class, and a queue full of them, as a batch of an unseen key's
+builds held for their key, gains least. A take and a resume by key each
+read it afresh first, whatever they then decide, and the clientless
+rule's check for each build it weighs. Whether it is held for its key is asked
+only where memory
+would let it in, or where it would keep a worker: a scan holds the
+queue's lock and the placement mutex, and a take that admits nothing
+scans the whole queue.
+
+A lost key's build (D4, `state/take.rs`) is not tested for memory: it
+runs alone, on a worker holding nothing, which `Placement::drain_for`
+drains for it without weighing memory; made to wait there for memory,
+a build larger than that worker would keep it empty and never run.
+Alone, it goes over that worker's memory only if it needs more than the
+worker has.
+
+The replays below are of a model of this code kept outside this
+repository (a Python simulator fed the hub's build record and journal),
+not of the code itself; their figures are the model's.
+
+In a replay of the hub's recorded placements of 2026-11-14 10:49:52Z to
+11-19 00:39Z, each run's memory growing to its peak over its running
+time (ramp): during the batch of 2026-11-18 (from 22:00Z), an unseen key
+guessed at 2-9 GiB that used 29-44 GiB per build, summed peaks were over
+each cloud worker's memory 15-24 % of the time with admission by slots
+alone (one's kernel killed 22 build processes), and none of the time
+with this admission. Admission is as safe with 2 slots on each KVM host
+as with 8 (over the week, no worker over its memory more than 0.13 % of
+the time in any row below), but with 2 the builds wait far longer than
+by slots (the last column): it is meant to come with 8 slots on each KVM
+host, which are set in each host's configuration, not here.
+
+What each part does, replayed on the batch (8 slots on each KVM host;
+192 KVM builds) and on the hub's trace of 2026-11-15..19 (372,982
+builds, 368,154 of them needing no KVM; 8 and 2 slots on each KVM host),
+KVM and other builds' wait:
+
+| rule | batch KVM p50 / p95 / max, s | week, 8 slots: KVM h; other h (≥ 600 s; max s) | week, 2 slots: other h (≥ 600 s) |
+|---|---|---|---|
+| by slots, as deployed | - | 25.6; 2.0 (0; 192) | 2.2 (0) |
+| admission, neither part | 2.9 / 175 / 24,229 | 41.0; 70.1 (60; 19,908) | 382 (590) |
+| reservations alone | 2.9 / 175 / 24,229 | 57.1; 156.4 (64; 20,075) | 3,257 (2,914) |
+| censored learning alone | 4.6 / 192 / 24,237 | 41.4; 63.5 (47; 19,832) | 358 (594) |
+| both (this) | 4.6 / 192 / 24,237 | 56.6; 140.0 (47; 19,980) | 3,330 (3,207) |
+| both, a kept worker backfilling nothing | 4.6 / 192 / 24,237 | 58.4; 205.1 (47; 19,980) | 8,172 (6,580) |
+| censored learning, a failed run ending the hold | 3.0 / 332 / 2,184 | 37.6; 65.3 (48; 5,577) | 290 (484) |
+| both, a failed run ending the hold | 4.7 / 368 / 2,184 | 57.2; 62.4 (48; 5,577) | 666 (1,125) |
+
+The longest waits are of keys whose runs failed, held one run at a time
+until one succeeds (r92-onnxruntime, none of whose runs succeeded).
+Between rows the batch's KVM p95 moves with where a few builds happen to
+be placed, not with what a rule does to those builds: a replay traced
+one such rise to three builds placed off one KVM host and a second
+onnxruntime build placed beside the first. Over the week the
+reservations, backfill included, cost the others 76.5 h of their 140.0 h
+wait with 8 slots (55 %, against censored learning alone), 15.2 h of
+the KVM builds', and 2,972 h of 3,330 h with 2 slots (89 %). Backfill
+cuts what a kept worker taking nothing cost (205.1 h, 141.6 h of it the
+reservations') by 65.1 h with 8 slots. The fits-beside clause of the backfill changed nothing with 8
+slots (140.0 h with it and without) and cut the others' wait with 2 by
+86 h (3,330 h against 3,416 h; that replay without it also predates the
+fallback's floor at the largest success). The cost is the reservations with
+the hold until a success together: where a failed run ends the hold,
+the others waited 62.4 h with them and 65.3 h without; with the hold,
+140.0 h with them and 63.5 h without, as a failing key's builds, guessed
+large, keep workers one after another. They buy a bound on a build's
+wait for memory, not a measured gain: no replay starved a build without
+them. These replays hold each build's slot and expected memory from its
+dispatch for its recorded time to start, as the hub does from the take,
+so the figures at 2 slots carry that week's staging stalls.
+
+The worker that asks takes the first queued build it can and admits,
+in the queue's order (Order, below), unless another connected worker
+that serves it has an idle agent (a free slot, not the one build a
+worker stages ahead while every slot is busy), admits it, and would be
+less full with it, or the asker has only that lookahead. That worker is
+woken, and takes it when it asks; the asker goes on to the
 next build. A tie stays with the asker. A build is passed over for at
 most 2 s from the first time, then the next worker that asks takes it,
 so none waits on another worker's ask.
 
-Nothing holds a build back for memory. A dispatch whose worker's
-expected memory, this build counted, is more than the worker's memory
-is logged as such ("placed over predicted memory"), and its dispatch
-line carries the worker's expected load and size. Holding builds for
-memory was replayed on an earlier model of this code and left out: no
-build in the copy of the hub's journal the figures come from
-(`hub/placement/history.rs`) was OOM-killed, and the holds delayed the
-builds they held.
+A dispatch whose worker's expected memory, this build counted, is more
+than the worker's memory, as for a build larger than every worker, is
+logged as such ("placed over predicted memory"), and its dispatch line
+carries the worker's expected load and size. At the agents' slice cap
+nothing holds a build to its share: memory.oom.group is set only with
+`build-memory-max-bytes`, so the kernel kills single processes of any
+build in the slice, and growth that compresses swaps through zswap and
+is never killed.
 
 ### Order
 
@@ -469,7 +672,8 @@ smaller ones behind it fill a worker; that wait is admission's.
 clients still waiting for it, of the client's dominant share (Dominant
 Resource Fairness, Ghodsi et al., NSDI 2011), the larger of the expected
 cores and the expected memory that the builds placed and not settled
-hold for the client, over the connected workers' cores and memory (a
+hold for the client, other than the build itself, placed from its take
+(`Placement::share`), over the connected workers' cores and memory (a
 worker that reports none counts none). A placed build holds for the
 clients waiting for it as it is placed, each once, until it settles or
 its worker's session closes (kept as builds are placed and settle,

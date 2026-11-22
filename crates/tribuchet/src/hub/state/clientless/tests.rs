@@ -7,9 +7,13 @@ use std::time::Instant as Now;
 use super::*;
 use crate::hub::Admission;
 use crate::hub::losses::{self, Loss};
-use crate::hub::placement::Size;
-use crate::hub::tests::job;
+use crate::hub::placement::{Demand, Expected, Level, Size, build_of};
+use crate::hub::tests::{H, job};
+use crate::proto::BuildUsage;
 use Queued::{Clientless, Held, Waiting};
+
+#[path = "tests/memory.rs"]
+mod memory;
 
 /// A worker's size, which the decider here does not read.
 const SIZE: Size = Size {
@@ -246,4 +250,101 @@ async fn a_resume_keeps_the_run_and_the_absence() {
     let _fresh = state.list_dispatch(&j, 3);
     let fresh = state.dispatched.lock().unwrap()[&j.id].started;
     assert_ne!(fresh, started);
+}
+
+/// A queued build waits for a slot only where one lets it in (waits):
+/// none is given up for a build short of memory or held for its key. One
+/// short only for a clientless run's load wants that run given up
+/// (wants_memory), unless held, as no memory freed lets it run. Each row:
+/// the queued build's GiB (None: an unseen key, its twin running), the
+/// clientless run's and the run with a client's on an 8 GiB worker, a
+/// free slot, given up.
+#[tokio::test(start_paused = true)]
+async fn a_build_waits_for_a_slot_only_where_one_lets_it_in() {
+    const GIB: f64 = 1_073_741_824.0;
+    let rows: [(&str, Option<u64>, f64, f64, bool, bool); 5] = [
+        ("fits", Some(1), 1.0, 5.0, false, true),
+        ("short of memory", Some(4), 1.0, 6.0, false, false),
+        ("held for its key", None, 1.0, 1.0, false, false),
+        (
+            "held, short for the clientless load",
+            None,
+            5.0,
+            2.0,
+            true,
+            false,
+        ),
+        (
+            "short for the clientless load",
+            Some(4),
+            4.0,
+            2.0,
+            true,
+            true,
+        ),
+    ];
+    for (row, queued, clientless, with_client, free, given_up) in rows {
+        let state = Arc::new(HubState::for_test(Duration::from_secs(30)));
+        state.deciding.store(true, Ordering::Relaxed);
+        let caps = WorkerCaps {
+            name: "w0".into(),
+            connected_at: Now::now(),
+            systems: [("x86_64-linux".to_owned(), HashSet::new())].into(),
+            max_jobs: 2,
+        };
+        state.worker_caps.lock().unwrap().insert(0, caps);
+        let admission = Admission {
+            free: u32::from(free),
+            ..Default::default()
+        };
+        let size = Size {
+            cores: 4.0,
+            memory: Some(8.0 * GIB),
+        };
+        let admission = Arc::new(StdMutex::new(admission));
+        state.placement.lock().unwrap().open(0, admission, size);
+        let named = |n: usize, name: &str, gib: f64| {
+            let mut j = job(n, Arc::new(Replay::default()));
+            j.req.outputs = [("out".to_owned(), format!("/nix/store/{H}-{name}"))].into();
+            j.expected = Expected {
+                demand: Demand {
+                    cores: 1.0,
+                    memory: gib * GIB,
+                },
+                secs: None,
+                level: Level::Key,
+                oom: 0,
+                below: 0.0,
+            };
+            j
+        };
+        let q = named(100, "q-1", queued.unwrap_or(1) as f64);
+        if let Some(gib) = queued {
+            let u = BuildUsage {
+                wall_ms: 1000,
+                cpu_usec: 1_000_000,
+                peak_memory_bytes: gib << 30,
+                ..Default::default()
+            };
+            (state.placement.lock().unwrap().history).record(&build_of(&q), 0, &u);
+        } else {
+            let twin = named(101, "q-1", 1.0);
+            state.placement.lock().unwrap().dispatched(0, &twin, false);
+        }
+        let _client = q.replay.subscribe().await;
+        state.queue.lock().await.push_back(q);
+        let (gone, here) = (named(0, "c-1", clientless), named(1, "f-1", with_client));
+        let gone_client = gone.replay.subscribe().await;
+        let _here_client = here.replay.subscribe().await;
+        let mut listed = Vec::new();
+        for j in [&gone, &here] {
+            listed.push(state.list_dispatch(j, 0));
+            state.placement.lock().unwrap().dispatched(0, j, false);
+        }
+        drop(gone_client);
+        gone.replay.checked(false, Instant::now());
+        tokio::time::advance(FLOOR + Duration::from_secs(1)).await;
+        state.give_up_clientless().await;
+        assert_eq!(state.given_up(&gone.id).is_cancelled(), given_up, "{row}");
+    }
 }

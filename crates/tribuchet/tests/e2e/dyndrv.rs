@@ -70,19 +70,21 @@ fn capacity() -> usize {
 }
 
 /// Fill the capacity of the worker that serves builds now with builds
-/// sleeping `secs`, each named `name-N`; returns once all are dispatched.
+/// sleeping `secs`, each named `name-nN`; returns once all are dispatched.
+/// Each is its own key (pname `name-nN`): builds of one unseen key go one
+/// at a time (Placement::held_for_key), which would leave agents free.
 fn load(name: &str, secs: u32) {
     let slots = capacity();
     for n in 0..slots {
         submit(
-            &format!("{name}-{n}"),
+            &format!("{name}-n{n}"),
             &format!(
-                "nix-build /etc/tt/load.nix --argstr name {name}-{n} --argstr seconds {secs} --no-out-link"
+                "nix-build /etc/tt/load.nix --argstr name {name}-n{n} --argstr seconds {secs} --no-out-link"
             ),
         );
     }
     for n in 0..slots {
-        let drv = format!("{name}-{n}");
+        let drv = format!("{name}-n{n}");
         wait_until_succeeds(
             Node::Hub,
             &format!(
@@ -91,6 +93,11 @@ fn load(name: &str, secs: u32) {
             ),
             120,
         );
+    }
+    // All run at once: none has ended by the time the last is dispatched
+    // (submit's unit writes its status as it ends).
+    for n in 0..slots {
+        succeed(Node::Hub, &format!("test ! -e /tmp/{name}-n{n}.rc"));
     }
 }
 
@@ -220,7 +227,7 @@ fn step8() {
     // The worker VM's agents free again (its worker adopted load-a's runs
     // across the restart): both producers of b find them free.
     for n in 0..capacity() {
-        assert_eq!(ended(&format!("load-a-{n}"), 300), "0", "load-a-{n}");
+        assert_eq!(ended(&format!("load-a-n{n}"), 300), "0", "load-a-n{n}");
     }
     // The hub's agents busy while both producers of b are first
     // dispatched: they go to the worker VM's, and reach no attach.
@@ -229,7 +236,7 @@ fn step8() {
     declared_after(|| drop(succeed(Node::Worker, "systemctl start tribuchet-worker")));
     placed_alike("b", "worker");
     for n in 0..capacity() {
-        assert_eq!(ended(&format!("load-b-{n}"), 900), "0", "load-b-{n}");
+        assert_eq!(ended(&format!("load-b-n{n}"), 900), "0", "load-b-n{n}");
     }
 }
 

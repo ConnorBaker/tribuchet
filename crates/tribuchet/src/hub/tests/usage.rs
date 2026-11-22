@@ -73,8 +73,9 @@ async fn a_builder_exiting_with_the_decline_code_is_not_a_decline() {
 /// What a build's run used is learned, here an OOM-killed run's peak: the
 /// next build of its pname, submitted as the attach program does, is
 /// dispatched expecting it, where the first had only the prior. A failed
-/// run that was not OOM-killed teaches nothing: the next build of its
-/// pname takes its prefix's, `tt`.
+/// run that was not OOM-killed teaches its key too, as a lower bound: the
+/// next build of its pname expects its peak from its key, not its
+/// prefix's guess (`tt`).
 #[tokio::test]
 async fn a_run_teaches_the_next_dispatch_of_its_pname() {
     let log = Captured;
@@ -122,7 +123,9 @@ async fn a_run_teaches_the_next_dispatch_of_its_pname() {
         assert!(second.contains(field), "{field} missing from {second}");
     }
     let failed = log.line(r#"drv="tt-fail-3.0" resumed"#);
-    assert!(failed.contains(r#"learned="prefix""#), "{failed}");
+    for field in [r#"learned="key""#, "expect_mem=5368709120"] {
+        assert!(failed.contains(field), "{field} missing from {failed}");
+    }
 }
 
 /// A build that ran and the usage it reported, to learn from.
@@ -433,4 +436,31 @@ async fn the_dispatch_row_holds_the_dispatch_lines_values() {
     }
     assert_eq!(compared, 19, "columns compared");
     drop(workers);
+}
+
+/// The history a hub learned from runs that did not succeed is the fold
+/// of its record too: their bound is what history expected when it
+/// learned them, not what the build was expected to use when queued.
+#[test]
+fn history_after_a_failed_run_equals_its_fold() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("record.sqlite");
+    let state = HubState::for_test(Duration::from_secs(30));
+    let writer = open_record(&state, &path);
+    // Queued expecting 3 GiB; history expects 4 when its runs end.
+    let (mut queued, _) = run_of("tt-x-1.0", 1);
+    queued.expected.demand.memory = f64::from(3u32 << 30);
+    let (ok, ok_usage) = run_of("tt-x-1.0", 4);
+    learn(&state, &ok, 0, &ok_usage);
+    let (_, mut killed) = run_of("tt-x-1.0", 2);
+    killed.oom_killed = true;
+    for (exit_code, usage) in [(1, run_of("tt-x-1.0", 1).1), (0, killed)] {
+        learn(&state, &queued, exit_code, &usage);
+    }
+    let learned = state.placement.lock().unwrap().history.entries();
+    record::close(&state, writer);
+    let restarted = HubState::for_test(Duration::from_secs(30));
+    let _writer = open_record(&restarted, &path);
+    let folded = restarted.placement.lock().unwrap().history.entries();
+    assert_eq!(folded, learned);
 }

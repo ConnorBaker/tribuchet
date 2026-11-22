@@ -11,6 +11,7 @@ use tonic::Streaming;
 
 use super::super::caps::CapsGuard;
 use super::super::losses::Run;
+use super::super::placement::Size;
 use super::super::relay::verify_set_for_test as verify;
 use super::super::state::WorkerCaps;
 use super::super::submit::dedupe_key;
@@ -528,3 +529,38 @@ async fn a_handoff_expired_is_settled_as_a_loss() {
 
 #[path = "relay_tests.rs"]
 mod relay;
+
+/// A relayed producer whose run is lost, taken afresh by a worker with a
+/// placement session: the take commits it there (its key's hold and its
+/// clients' charge, state/take.rs), and the loss settles it with no fresh
+/// run (lost_relayed, losses::cannot), which ends both (HubState::finish):
+/// the session holds nothing of it, no client is charged for it, and the
+/// next build of its key is not held for it.
+#[tokio::test]
+async fn a_relayed_producer_lost_at_a_fresh_take_leaves_no_hold_or_charge() {
+    let state = Arc::new(HubState::for_test(Duration::ZERO));
+    let w1 = worker(&state, "w1", &[]);
+    let (tx, mut events) = submit_open(&state, producer_request(Some(false))).await;
+    let first = state.take_job(&w1.caps, None).await.expect("not queued");
+    relay_started(&first, &tx, &mut events).await;
+    let said = vec![started(&first)];
+    assert_eq!(assignments(&dispatch(&state, first, w1, said).await), 1);
+    let back = worker(&state, "w1", &[]);
+    let size = Size {
+        cores: 4.0,
+        memory: None,
+    };
+    let admission = Arc::new(Mutex::new(Admission::default()));
+    (state.placement.lock().unwrap()).open(back.id, admission, size);
+    let before = state.placement.lock().unwrap().charges.clients();
+    let taken = state.take_job(&back.caps, Some(back.id)).await;
+    assert!(taken.is_none(), "a relayed producer was run afresh");
+    let p = state.placement.lock().unwrap();
+    assert!(p.sessions[&back.id].committed.is_empty(), "still committed");
+    assert_eq!(p.charges.clients(), before, "a client still charged");
+    let mut next = job(1, Arc::new(Replay::default()));
+    next.req = producer_request(Some(false));
+    assert!(!p.held_for_key(&next), "its key still held");
+    drop(p);
+    drop(tx);
+}

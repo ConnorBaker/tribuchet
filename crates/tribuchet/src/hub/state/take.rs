@@ -125,8 +125,13 @@ impl HubState {
                 // worker included: a fresh take would count the loss its
                 // Resumed is about to clear.
                 let workers = self.worker_caps.lock().unwrap();
+                let mut placement = self.placement.lock().unwrap();
+                let mut scan = placement.scan();
                 let (now, mut left) = (Instant::now(), Vec::new());
                 let pos = queue.iter_mut().position(|j| {
+                    // Afresh, whichever way it goes: a run of its key may
+                    // have ended since it queued.
+                    placement.refresh(j);
                     let unfit = !caps.serves(&j.req.system, &j.features) || j.replay.held();
                     if unfit || j.kept(&workers, &holding) {
                         return false;
@@ -141,6 +146,9 @@ impl HubState {
                     let (system, features, first) =
                         (&j.req.system, &j.features, j.deferred.is_none());
                     let serves = |id| workers.get(&id).is_some_and(|c| c.serves(system, features));
+                    if placement.waits(j, asker, serves, &mut scan) {
+                        return false;
+                    }
                     let demand = j.expected.demand;
                     let to = (rooms.as_mut())
                         .and_then(|r| r.passes(demand, &mut j.deferred, serves, now));
@@ -152,7 +160,13 @@ impl HubState {
                     }
                     to.is_none()
                 });
-                (pos.and_then(|p| queue.remove(p)), left)
+                let taken = pos.and_then(|p| queue.remove(p));
+                // Its key's hold begins here, under the queue's lock, not at
+                // the dispatch: another take may come between (held_for_key).
+                if let (Some(j), Some(at)) = (&taken, asker) {
+                    placement.dispatched(at, j, false);
+                }
+                (taken, left)
             };
             if let Some(id) = asker {
                 self.placement.lock().unwrap().drain_for(id, wants_room);
@@ -226,8 +240,10 @@ impl HubState {
             let mut holding = self.holding.lock().unwrap();
             let held = holding.get_mut(&worker)?;
             let pos = queue.iter().position(|j| held.holds(&j.key))?;
-            let job = queue.remove(pos)?;
+            let mut job = queue.remove(pos)?;
             held.taken.insert(job.key.clone());
+            // Afresh: its worker's room counts what it is expected to use.
+            self.placement.lock().unwrap().refresh(&mut job);
             job
         };
         // Held by a worker other than the one that lost it: a run that
