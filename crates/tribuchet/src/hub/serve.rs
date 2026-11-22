@@ -303,17 +303,21 @@ mod tests {
     }
 
     /// How a hub's notifications are read: until `enough` holds of them,
-    /// the hub exits, or `quiet` ends the wait.
+    /// the hub exits, or `quiet` ends the wait. A hub that blocks where no
+    /// test expects it (not in the FIFO's open) spends no CPU and sends
+    /// nothing, and is waited for to the test runner's timeout: no count
+    /// of polls or CPU tells it from a lawful hub that sleeps or waits on
+    /// slow I/O.
     enum Quiet {
-        /// Never: only `enough` or the hub's exit ends it.
-        Never,
         /// After the hub has spent this much CPU since the last one, or
         /// since it started: a hub working without asking. A freeze
         /// spends none.
         Cpu(Duration),
         /// This long after the hub is first seen waiting in the open of
-        /// the FIFO at the record's path: a hang. A hub not seen there in
-        /// 30 s is given up on, which can only fail the test.
+        /// the FIFO at the record's path: a hang. A hub that spends 10 s
+        /// of CPU and is not seen there is working elsewhere, and given up
+        /// on, which can only fail the test; a frozen or slow one is
+        /// waited for.
         InOpen(Duration),
     }
 
@@ -336,26 +340,39 @@ mod tests {
         Duration::from_millis(10 * (tick(11) + tick(12)))
     }
 
+    /// Where each of the hub's threads waits (its wchan).
+    fn wchans(pid: u32) -> Vec<String> {
+        let tasks = fs::read_dir(format!("/proc/{pid}/task"))
+            .into_iter()
+            .flatten();
+        let wchan = |t: fs::DirEntry| fs::read_to_string(t.path().join("wchan")).ok();
+        tasks.flatten().filter_map(wchan).collect()
+    }
+
     /// Whether a thread of the hub waits in the open of a FIFO for a
     /// writer (the kernel's `wait_for_partner`). Nothing opens one: a
     /// writer would let the hub read the FIFO as an empty record.
     fn in_fifo_open(pid: u32) -> bool {
-        fs::read_dir(format!("/proc/{pid}/task")).is_ok_and(|tasks| {
-            tasks.flatten().any(|t| {
-                fs::read_to_string(t.path().join("wchan")).is_ok_and(|w| w == "wait_for_partner")
-            })
-        })
+        wchans(pid).iter().any(|w| w == "wait_for_partner")
     }
 
-    /// The notifications a hub sends as it starts on the record `make`
-    /// leaves at the path it is given, read as `quiet` says, and whether
-    /// whether it exited or still waits in the open of a FIFO. The socket's read timeout is only how often the hub
-    /// is looked at. The hub is killed after.
+    /// What a hub did as it started: the notifications it sent, whether
+    /// it exited, and whether it still waits in the open of a FIFO.
+    struct Started {
+        seen: Vec<String>,
+        exited: bool,
+        in_open: bool,
+    }
+
+    /// What a hub does as it starts on the record `make` leaves at the
+    /// path it is given, its notifications read as `quiet` says. The
+    /// socket's read timeout is only how often the hub is looked at. The
+    /// hub is killed after.
     fn notifications(
         make: impl FnOnce(&Path),
         enough: impl Fn(&[String]) -> bool,
         quiet: &Quiet,
-    ) -> (Vec<String>, bool, bool) {
+    ) -> Started {
         let dir = tempfile::tempdir().unwrap();
         let at = |name: &str| dir.path().join(name).display().to_string();
         let record = dir.path().join("record.sqlite");
@@ -382,7 +399,7 @@ mod tests {
             .spawn()
             .unwrap();
         let (mut seen, mut buf, mut exited) = (Vec::new(), [0; 256], false);
-        let (mut spent, mut held, start) = (Duration::ZERO, None::<Instant>, Instant::now());
+        let (mut spent, mut held) = (Duration::ZERO, None::<Instant>);
         while !enough(&seen) {
             if let Quiet::InOpen(_) = quiet
                 && held.is_none()
@@ -399,13 +416,14 @@ mod tests {
                 Err(_) if exited => break,
                 Err(_) => {
                     exited = hub.try_wait().unwrap().is_some();
-                    let over = match (quiet, &held) {
-                        (Quiet::Cpu(q), _) => cpu(hub.id()) - spent >= *q,
-                        (Quiet::InOpen(q), Some(since)) => since.elapsed() >= *q,
-                        (Quiet::InOpen(_), None) => start.elapsed() >= Duration::from_secs(30),
-                        _ => false,
-                    };
-                    if over && !exited {
+                    // Once reaped, its /proc entry is gone: no CPU to read.
+                    let over = !exited
+                        && match (quiet, &held) {
+                            (Quiet::Cpu(q), _) => cpu(hub.id()).saturating_sub(spent) >= *q,
+                            (Quiet::InOpen(q), Some(since)) => since.elapsed() >= *q,
+                            (Quiet::InOpen(_), None) => cpu(hub.id()) >= Duration::from_secs(10),
+                        };
+                    if over {
                         break;
                     }
                 }
@@ -414,19 +432,28 @@ mod tests {
         let in_open = in_fifo_open(hub.id());
         let _ = hub.kill();
         let _ = hub.wait();
-        (seen, exited, in_open)
+        Started {
+            seen,
+            exited,
+            in_open,
+        }
     }
 
     const EXTEND: &str = "EXTEND_TIMEOUT_USEC=300000\n";
 
     /// A hub asks systemd to extend its start timeout as it opens its
     /// record, before it says it is ready (or exits after, as where no
-    /// nixbld group exists).
+    /// nixbld group exists). One that spends 10 s of CPU between
+    /// notifications, ready or not, fails it.
     #[test]
     fn a_starting_hub_extends_its_start_timeout() {
         let ready = |seen: &[String]| seen.iter().any(|m| m.contains("READY=1"));
-        let (seen, ..) = notifications(|_| {}, ready, &Quiet::Never);
-        assert!(seen.first().is_some_and(|m| m.contains(EXTEND)), "{seen:?}");
+        let s = notifications(|_| {}, ready, &Quiet::Cpu(Duration::from_secs(10)));
+        assert!(
+            s.seen.first().is_some_and(|m| m.contains(EXTEND)),
+            "{:?}",
+            s.seen
+        );
     }
 
     /// A hub whose record's open hangs (in the open of a FIFO no one
@@ -440,9 +467,9 @@ mod tests {
         let fifo = |path: &Path| nix::unistd::mkfifo(path, nix::sys::stat::Mode::S_IRWXU).unwrap();
         let two = |seen: &[String]| seen.len() > 1;
         let wait = Quiet::InOpen(Duration::from_secs(2));
-        let (seen, exited, in_open) = notifications(fifo, two, &wait);
+        let s = notifications(fifo, two, &wait);
         assert_eq!(
-            (seen, exited, in_open),
+            (s.seen, s.exited, s.in_open),
             (vec![EXTEND.to_owned()], false, true)
         );
     }
@@ -467,7 +494,7 @@ mod tests {
             .unwrap();
         };
         let three = |seen: &[String]| seen.len() >= 3;
-        let (seen, ..) = notifications(endless, three, &Quiet::Cpu(Duration::from_secs(2)));
-        assert_eq!(seen, [EXTEND; 3]);
+        let s = notifications(endless, three, &Quiet::Cpu(Duration::from_secs(2)));
+        assert_eq!(s.seen, [EXTEND; 3]);
     }
 }

@@ -12,6 +12,10 @@
 //!   ms on only (a worker that changes), the factors then traced;
 //! - TRIBUCHET_REPLAY_QUIET=all: every run taught as quiet (an ablation).
 //!
+//! The record must be migrated, every result with its `taught` row (a hub
+//! that writes it gives them as it takes it): a result without one folds
+//! untaught, and speed would learn nothing. It refuses one that is not.
+//!
 //! `cargo test --release -p tribuchet --bin tribuchet -- --ignored --exact
 //! hub::record::replay::replay --nocapture`
 
@@ -98,6 +102,14 @@ fn replay() {
     let mut latest: HashMap<String, (u64, Latest)> = HashMap::new();
     let mut diffs: Vec<(String, String, f64, f64)> = Vec::new();
     let conn = reader(Path::new(&path)).unwrap();
+    let untaught = "SELECT count(*) FROM result r \
+        WHERE NOT EXISTS (SELECT 1 FROM taught t WHERE t.result = r.rowid)";
+    let untaught: i64 = (conn.query_row(untaught, [], |r| r.get(0)))
+        .expect("a record without the taught table: let a hub take it first");
+    assert_eq!(
+        untaught, 0,
+        "results without a taught row: let a hub take it first"
+    );
     each_run(&conn, |mut run| {
         if skip.is_some_and(|(a, b)| (a..b).contains(&run.at_ms)) {
             return;

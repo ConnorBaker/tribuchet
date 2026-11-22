@@ -489,16 +489,18 @@ with two departures, each chosen by a replay of the record (below):
   that is not compared, as when it is offline, or online with runs
   never quiet, ages none of its pairs itself, but the others'
   comparisons age them: it loses its factor, and relearns it when it is
-  compared again. On the replay below, the worker that halves is away
-  from 34.1 to 43.6 h and reads 0.95x by 37.0 h (0.94x at a window of
-  300; decayed only when compared, it kept 1.95x); back, it reads 1.37
-  to 1.77x until 50.0 h and 2.0x or more from 50.7 h, 1,546 of its
-  taught runs after it returned. A test pins it: a worker at 2x, away
-  while two others are compared 15,000 rounds, reads within 2 % of 1,
-  and within 5 % of 2x again after 20 rounds with each. A pair ages by its
-  own workers' comparisons, not the farm's: c and d, compared with each
-  other once per 1,000 comparisons of others, keep their comparisons
-  (aged by every comparison, c at 2x d read 1.73x).
+  compared again. On the replay below, the worker that halves has no
+  result between 34.05 h (its last before) and 41.46 h (its first
+  after); the trace, sampled every 5,000 runs, reads it 2.05x at
+  34.1 h, then 1.91, 1.68, 1.23 and 1.00x, and 0.95x at 37.0 h (0.94x
+  at a window of 300; decayed only when compared, it kept 1.95x); back,
+  1.54x at 43.6 h, 1.37 to 1.77x until 50.0 h, and 2.06x at 50.7 h,
+  1,546 of its taught runs after it returned. A test pins it: a worker
+  at 2x, away while two others are compared 15,000 rounds, reads within
+  2 % of 1, and within 5 % of 2x again after 20 rounds with each. A
+  pair ages by its own workers' comparisons, not the farm's: c and d,
+  compared with each other once per 1,000 comparisons of others, keep
+  their comparisons (aged by every comparison, c at 2x d read 1.73x).
 
 A prior pulls each ln s toward 0 with the weight of 1.17 comparisons
 (`PRIOR`): one comparison's variance over the prior's, a prior of 0.25
@@ -563,12 +565,15 @@ the fold of the earlier join did: the replays below are figure for
 figure alike.
 
 The replays are of a snapshot of the farm hub's record (its last
-result 2026-11-20 01:53 UTC), not committed, by the replay tool
+result 2026-11-20 01:53 UTC, taken by a hub so that every result has
+its `taught` row: the tool refuses a record that has not been), not
+committed, by the replay tool
 `hub/record/replay.rs`: an ignored test that predicts each run by the
 fold before it is learned, with speed and without (its settings and
 command in its header). Those marked (knobs) ran it with `PRIOR`,
 `WINDOW` and `BOUND` read from the environment by a patch to
-`speed.rs` and the tool, not committed (sha256
+`speed.rs` and the tool, not committed (`knobs9.patch`, kept with this
+change's review evidence, sha256
 92d46ed1e554cacbb7342a299075024c36436392cec3e9a8dd4b69859de4df33),
 which turns each into a `LazyLock` of `SPEED_PRIOR`, `SPEED_WINDOW` or
 `SPEED_BOUND`; at the committed values it replays the same, figure for
@@ -587,9 +592,10 @@ to 19 (a KVM queueing anomaly), 1,328,851 succeeded runs:
 - A worker whose times halve from 2026-11-10: relative to the workers
   that did not change, its factor reaches 1.92x in 0.3 h (1,526 of its
   taught runs) and 1.97x in 1.0 h; sampled every 5,000 runs after, it
-  lies between 1.37x and 2.15x while it ran, and 0.95x to 1.23x while
-  it was away (34.1 to 43.6 h), to the record's end, at 241.8 h, where
-  it is 1.76x. The cut per run is 11.41 %.
+  lies between 1.37x and 2.15x while it ran, and 0.95x to 2.05x at the
+  samples from 34.1 to 43.6 h, around its results' gap from 34.05 to
+  41.46 h, to the record's end, at 241.8 h, where it is 1.76x. The cut
+  per run is 11.41 %.
 - (knobs) Windows of 30, 100, 300, 1,000, 3,000 and 10,000, and none,
   cut 3.13, 3.72, 3.87, 3.91, 3.83, 3.71 and 3.24 % on the record, and
   10.59, 11.24, 11.39, 11.41, 11.28, 10.99 and 6.36 % with the worker
