@@ -18,6 +18,7 @@ fn a_report_lists_the_runs_held_but_not_those_dropped() -> Result<()> {
             outputs,
             dir,
             finished_at,
+            handoff_expired: false,
         };
         Some(Arc::new(fin))
     };

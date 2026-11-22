@@ -1,6 +1,7 @@
 //! The record's open, writer and close.
 
 use std::fs;
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::thread;
 use std::time::Duration;
@@ -8,7 +9,10 @@ use std::time::Duration;
 use rusqlite::config::DbConfig;
 
 use super::*;
+
 use crate::hub::metrics;
+use crate::hub::producer::drv_path_row;
+use crate::hub::tests::{H, job};
 use crate::testlog::Captured;
 
 /// A reader of the record at `path`, as another process would open it,
@@ -316,4 +320,32 @@ fn a_record_from_before_profiles_gains_their_table() {
     shut(opened);
     assert_eq!(rows(&path, "profile"), 1);
     assert!(known(&reader(&path)).unwrap());
+}
+
+/// R1: a producer's drvPath row is recorded in a new record and in one
+/// made before the drv_path table was (its schema alone).
+#[test]
+fn a_drv_path_row_is_recorded_in_a_record_of_either_age() {
+    for old in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record.sqlite");
+        if old {
+            Connection::open(&path)
+                .unwrap()
+                .execute_batch(SCHEMA)
+                .unwrap();
+        }
+        let state = HubState::for_test(Duration::from_secs(30));
+        let writer = open(&path).install(&state);
+        let mut j = job(1, Arc::default());
+        j.req.drv_path = Some(format!("/nix/store/{H}-p.drv"));
+        let row = drv_path_row(&j).expect("no row");
+        let placement = state.placement.lock().unwrap();
+        placement.record.as_ref().expect("not recording").send(row);
+        drop(placement);
+        close(&state, writer);
+        let sql = "SELECT count(*) FROM drv_path";
+        let n = reader(&path).query_row(sql, [], |r| r.get::<_, i64>(0));
+        assert_eq!(n.ok(), Some(1), "old {old}: the drv_path rows");
+    }
 }

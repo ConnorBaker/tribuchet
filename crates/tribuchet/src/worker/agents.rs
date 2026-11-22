@@ -9,7 +9,7 @@ use std::fs;
 use std::io;
 use std::time::Duration;
 
-use std::os::fd::AsRawFd;
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 
@@ -139,6 +139,8 @@ pub(super) struct AgentBuild {
     /// The build's cgroup.freeze, write-only, where it has a cgroup: the
     /// arbiter's to freeze and thaw it with while the lease lasts.
     pub(super) freeze: Option<fs::File>,
+    /// A producer's listener (StartReply.rpc_listener), the last fd.
+    pub(super) listener: Option<OwnedFd>,
 }
 
 impl AgentBuild {
@@ -160,11 +162,14 @@ impl AgentBuild {
         let reply::Reply::Start(reply) = reply else {
             return Err(err_msg(format!("unexpected agent reply {reply:?}")));
         };
+        let mut fds = fds;
+        let listener = if reply.rpc_listener { fds.pop() } else { None };
         Ok(Self {
             conn,
             pid: reply.pid,
             scratch_dir: PathBuf::from(reply.scratch_dir),
             freeze: fds.into_iter().next().map(fs::File::from),
+            listener,
         })
     }
 
@@ -192,6 +197,7 @@ impl AgentBuild {
             pid: reply.pid,
             scratch_dir: PathBuf::from(reply.scratch_dir),
             freeze: fds.into_iter().next().map(fs::File::from),
+            listener: None,
         };
         Ok((build, reply.exit_code))
     }
@@ -364,6 +370,7 @@ pub(super) mod tests {
             profile: String::new(),
             sandbox_json: None,
             outputs,
+            rpc_socket: None,
             memory_max_bytes: None,
         }
     }

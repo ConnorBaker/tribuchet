@@ -62,6 +62,10 @@ pub struct BuildJson {
     /// connection running it.
     #[serde(default)]
     pub client: Option<String>,
+    /// The derivation's store path, where Nix writes it: for logging and
+    /// the hub's record only (DESIGN.md, R1).
+    #[serde(default)]
+    pub drv_path: Option<String>,
 }
 
 impl BuildJson {

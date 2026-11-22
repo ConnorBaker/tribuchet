@@ -73,9 +73,27 @@ pub(super) struct Client {
     pub(super) id: sem::Client,
     /// Whether its own Nix can build the key (canLocal).
     pub(super) can_local: bool,
+    /// Whether it can once a run of the key reached it (producer::can_local).
+    pub(super) relayed: bool,
     /// Who it is, as its request names it (BuildRequest.client): what a
     /// fair share is kept for (placement/objective.rs).
     pub(super) owner: Option<Arc<str>>,
+}
+
+/// What tells the core a client's Nix no longer builds its key (Bound).
+pub(super) struct Bind {
+    shadow: Option<Arc<Shadow>>,
+    key: sem::Key,
+    client: sem::Client,
+}
+
+impl Bind {
+    /// The core's Bound.
+    pub(super) fn bound(&self) {
+        let Some(s) = &self.shadow else { return };
+        let (key, client) = (self.key, self.client);
+        s.with(|m| _ = m.feed("bound", &[], vec![Event::Bound { key, client }]));
+    }
 }
 
 impl Drop for Client {
@@ -97,6 +115,22 @@ impl Client {
         self
     }
 
+    /// It, whose Nix builds the key once a run reached it only if `relayed`.
+    pub(super) fn relayed(mut self, relayed: bool) -> Self {
+        self.relayed = self.can_local && relayed;
+        self
+    }
+
+    /// What tells the core its Nix no longer builds the key.
+    pub(super) fn bind(&self) -> Bind {
+        let shadow = self.shadow.clone();
+        Bind {
+            shadow,
+            key: self.key,
+            client: self.id,
+        }
+    }
+
     pub(super) fn untracked(can_local: bool) -> Self {
         let (shadow, key, id) = (None, 0, 0);
         Self {
@@ -104,6 +138,7 @@ impl Client {
             key,
             id,
             can_local,
+            relayed: can_local,
             owner: None,
         }
     }
@@ -186,7 +221,10 @@ impl Mirror {
             .filter_map(|run| self.hub.runs.get(run).map(|r| r.key))
             .collect();
         match *ev {
-            Event::Submit { key, .. } | Event::Leave { key, .. } | Event::Place { key, .. } => {
+            Event::Submit { key, .. }
+            | Event::Leave { key, .. }
+            | Event::Bound { key, .. }
+            | Event::Place { key, .. } => {
                 keys.push(key);
             }
             Event::Adopt { key, .. } | Event::Defer { key, .. } | Event::Refuse { key } => {

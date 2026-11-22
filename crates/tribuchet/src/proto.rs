@@ -24,6 +24,19 @@ pub const DECLINE_EXIT_CODE: i32 = 222;
 /// prefix keeps it apart from those a derivation names for itself.
 pub const NETWORK: &str = "tribuchet-network";
 
+/// Nix's system feature of a dynamic-derivation producer: its builder
+/// gets a socket to the client's store (NIX_REMOTE), through which it adds
+/// objects and submits its outputs. Advertised only by a worker that hands
+/// that socket's listener to attach on the same host (DESIGN.md).
+pub const BUILDER_RPC: &str = "builder-rpc-v0";
+
+/// Whether a build with `features` (its requiredSystemFeatures) is a
+/// producer (DD1): attach, the hub and the worker all ask this. Never told
+/// by NIX_REMOTE, which a recursive-nix build has too.
+pub fn producer(features: &[String]) -> bool {
+    features.iter().any(|f| f == BUILDER_RPC)
+}
+
 /// Cap on a single NAR transfer in either direction, enforced by both
 /// hub and worker; a `truncate -s 1P $out` build would otherwise tie
 /// up the peer and fill its disk.
@@ -55,5 +68,19 @@ impl TmpDirArchive {
             zstd_chunk: Vec::new(),
             eof: true,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A producer by its features only: NIX_REMOTE in its env says nothing.
+    #[test]
+    fn a_producer_is_told_by_its_features() {
+        let f = |fs: &[&str]| producer(&fs.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>());
+        assert!(f(&["ca-derivations", BUILDER_RPC]));
+        assert!(!f(&["recursive-nix"]));
+        assert!(!f(&[]));
     }
 }

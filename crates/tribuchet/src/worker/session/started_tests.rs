@@ -2,16 +2,19 @@
 //! run it resumed is finished.
 
 use std::iter;
+use std::path::PathBuf;
 
 use tokio_stream::wrappers::TcpListenerStream;
 use tonic::transport::Server;
 
 use super::*;
 use crate::hub::msg_name;
+use crate::proto::BUILDER_RPC;
 use crate::proto::worker_hub_server::WorkerHubServer;
 use crate::proto::{HeldRun, RunId};
 use crate::slowlink;
 use crate::worker::build::tests::base_assignment;
+use crate::worker::handoff::Handoffs;
 use crate::worker::resume::{FinishedBuild, Usage};
 
 /// A build staged at once says it started after its Need, and its run
@@ -81,6 +84,7 @@ async fn a_session_resuming_a_finished_result_says_so_and_releases_it() -> Resul
         outputs: vec![],
         dir: b1.clone(),
         finished_at: Instant::now(),
+        handoff_expired: false,
     };
     let [held, lost] = [1, 2].map(|seq| RunId { epoch: 7, seq });
     let ids = ("old".into(), Some(held));
@@ -144,5 +148,98 @@ async fn a_session_resuming_a_finished_result_says_so_and_releases_it() -> Resul
     assert!(ctx.lost.lock().unwrap().is_empty(), "a lost run kept");
     let released = ctx.resumable.lock().unwrap()["test-key"].released;
     assert!(released.is_some(), "not released");
+    Ok(())
+}
+
+/// A producer's assignment as the hub sends it: builder-rpc-v0, its
+/// NIX_REMOTE in its tmp dir, and a handoff token.
+fn producer_assignment() -> BuildAssignment {
+    let mut a = base_assignment();
+    a.required_features = vec![BUILDER_RPC.into()];
+    (a.env).insert("NIX_REMOTE".into(), "unix:///build/.nix-socket".into());
+    a.handoff_token = vec![9; 16];
+    a
+}
+
+/// Launch `a` on `ctx`, whose agent is down: what the run sends, and its dir.
+async fn launch(
+    ctx: &Arc<WorkerCtx>,
+    a: BuildAssignment,
+) -> Result<(mpsc::Receiver<WorkerMessage>, PathBuf)> {
+    let build = ActiveBuild::new(a, ctx.clone(), mpsc::unbounded_channel().0)?;
+    let (id, dir) = (build.assignment.build_id.clone(), build.dir.clone());
+    let (out_tx, out_rx) = mpsc::channel(8);
+    let env = LaunchEnv {
+        ctx,
+        out_tx: &out_tx,
+        build_timeout: Duration::from_secs(60),
+        assignments: AtomicU64::default(),
+    };
+    let mut active = HashMap::from([(id.clone(), build)]);
+    let need = Need {
+        build_id: id.clone(),
+        ..Need::default()
+    };
+    let staged = Ok((Some(need), StagingStatus::Ready));
+    advance_staging(&mut active, &mut VecDeque::new(), &id, staged, &env).await?;
+    Ok((out_rx, dir))
+}
+
+/// The next message of `rx` that `pick` takes, within 10 s.
+async fn next<T>(
+    rx: &mut mpsc::Receiver<WorkerMessage>,
+    pick: impl Fn(worker_message::Msg) -> Option<T>,
+) -> T {
+    loop {
+        let m = tokio::time::timeout(Duration::from_secs(10), rx.recv()).await;
+        if let Some(t) = m.expect("no such message").unwrap().msg.and_then(&pick) {
+            return t;
+        }
+    }
+}
+
+/// DD10, DD12: a producer handed a worker that serves no handoff socket
+/// runs nowhere: its result is a handoff expiry, a loss for the hub, not
+/// a build failure.
+#[tokio::test]
+async fn a_producer_on_a_worker_without_a_handoff_socket_is_an_expiry() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let ctx = WorkerCtx::for_test(dir.path(), 1, vec![dir.path().join("down.sock")])?;
+    let (mut rx, _) = launch(&ctx, producer_assignment()).await?;
+    let result = next(&mut rx, |m| match m {
+        worker_message::Msg::Result(r) => Some(r),
+        _ => None,
+    })
+    .await;
+    assert!(result.handoff_expired, "not an expiry: {:?}", result.error);
+    Ok(())
+}
+
+/// DD10: the worker expects a producer's run before it says Started, from
+/// which the hub tells attach: while the agent has not started the builder
+/// (here it is down), the run is expected, not lapsed, so attach's request
+/// would wait for its listener.
+#[tokio::test]
+async fn a_producer_is_expected_before_it_is_said_started() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut ctx = WorkerCtx::for_test(dir.path(), 1, vec![dir.path().join("down.sock")])?;
+    let handoffs = Arc::new(Handoffs::default());
+    Arc::get_mut(&mut ctx).unwrap().handoffs = Some(handoffs.clone());
+    let (mut rx, run_dir) = launch(&ctx, producer_assignment()).await?;
+    next(&mut rx, |m| {
+        matches!(m, worker_message::Msg::Started(_)).then_some(())
+    })
+    .await;
+    let expected = !handoffs.lapsed("test-key", &run_dir);
+    // Cancelled, so that it ends instead of waiting for its agent, and
+    // woken as a session's cancel wakes it (handle_cancel), before any
+    // assertion: a run still waiting would hold the runtime's drop.
+    ctx.cancelled.lock().unwrap().insert("test-key".into());
+    ctx.agents.wake();
+    next(&mut rx, |m| {
+        matches!(m, worker_message::Msg::Result(_)).then_some(())
+    })
+    .await;
+    assert!(expected, "said Started before the run was expected");
     Ok(())
 }

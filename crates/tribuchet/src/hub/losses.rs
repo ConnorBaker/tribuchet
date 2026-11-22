@@ -10,7 +10,8 @@
 //! - Transport evidence, all else: the session died while the build was
 //!   staged, before the worker answered its assignment, while its run
 //!   was resumed, or while its finished result was delivered; the worker
-//!   dropped the result (ResultGone); or the run's worker, not back
+//!   dropped the result (ResultGone); a producer's listener reached no
+//!   attach (handoff_expired, DD10); or the run's worker, not back
 //!   within its grace or with another worker holding the build, may
 //!   still run it. That says how the farm moves the build, not what the
 //!   build does, so it never fails it. Each session's end counts once.
@@ -19,6 +20,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use super::metrics::Metrics;
+use super::producer;
 use super::state::{Holding, HubState, Job, WorkerCaps};
 use crate::proto::{RunId, attach_event};
 
@@ -46,6 +48,9 @@ pub(super) struct Dispatch {
     pub(super) resumed: bool,
     /// The run it assigned.
     pub(super) run: Option<RunId>,
+    /// A producer's run ended as no attach fetched its listener
+    /// (handoff_expired): how the farm moved it, not what it does.
+    pub(super) expired: bool,
 }
 
 /// How far the build's run is known to have got, across dispatches.
@@ -137,7 +142,13 @@ pub(super) async fn lost(
         job = count(state, job, Charge::Genuine).await?;
     }
     let run = dispatch.run(before);
+    if gone && run == Run::Started {
+        // A relayed producer's run ended: settled here (DD8a).
+        job = producer::lost_relayed(state, job, "gone").await?;
+    }
     let charge = match run {
+        // A producer's listener that reached no attach (DD10).
+        _ if dispatch.expired => Some(Charge::Transport),
         // Its worker says it no longer has the run (Unlisted).
         Run::Started if gone => Some(Charge::Genuine),
         // Its worker likely runs it still; the next dispatch settles that.
@@ -241,7 +252,12 @@ pub(super) async fn decline(state: &HubState, job: &Job, point: &str) -> Option<
 /// clients waiting as that is decided are answered: the build is unlisted
 /// in the same step, so a client after starts a build of its own.
 pub(super) async fn hub_cannot(state: &HubState, job: Job, point: &str, err: String) {
-    let local = !job.req.fixed_output;
+    cannot(state, job, (point, true), err).await;
+}
+
+/// `hub_cannot`, declining no client unless `local`.
+pub(super) async fn cannot(state: &HubState, job: Job, (point, local): (&str, bool), err: String) {
+    let local = local && !job.req.fixed_output;
     if local {
         job.restart_outputs().await;
     }

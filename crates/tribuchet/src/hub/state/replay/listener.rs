@@ -9,7 +9,7 @@ use tonic::Status;
 
 use super::Replay;
 use crate::hub::semantics as sem;
-use crate::hub::shadow::Client;
+use crate::hub::shadow::{Bind, Client};
 use crate::proto::AttachEvent;
 
 /// One client of the build, as the hub answers it.
@@ -17,6 +17,10 @@ pub(super) struct Listener {
     tx: mpsc::WeakSender<Result<AttachEvent, Status>>,
     /// Its own Nix can build the key (canLocal).
     can_local: bool,
+    /// Whether it can once a run of the key reached it (Client::relayed).
+    relayed: bool,
+    /// What tells the core it no longer can.
+    bind: Bind,
     /// Its number in the shadow's log (Client::id).
     id: sem::Client,
     /// Where in the log it was declined (Defer), once it was.
@@ -36,6 +40,8 @@ impl Listener {
         let listener = Self {
             tx: tx.downgrade(),
             can_local: client.can_local,
+            relayed: client.relayed,
+            bind: client.bind(),
             id: client.id,
             declined: declined.clone(),
             owner: client.owner.clone(),
@@ -47,9 +53,37 @@ impl Listener {
     fn waits(&self) -> bool {
         self.declined.get().is_none() && self.tx.upgrade().is_some_and(|tx| !tx.is_closed())
     }
+
+    /// A run of the key reached it: its own Nix builds the key from now on
+    /// only as `relayed` says (OQ1's fallback (a)), and the core is told.
+    pub(super) fn reached(&mut self) {
+        if self.can_local && !self.relayed {
+            self.can_local = false;
+            self.bind.bound();
+        }
+    }
 }
 
 impl Replay {
+    /// Whether a run of the build reached its client (DD8a), as `reached`
+    /// decides under the clients' lock: if so, each client's answer is
+    /// switched to what its Nix builds once so reached before the lock
+    /// goes, so no close or decline reads it in between.
+    pub(in crate::hub) fn reached_when(&self, reached: impl FnOnce() -> bool) -> bool {
+        let mut clients = self.clients.lock().unwrap();
+        let reached = reached();
+        if reached {
+            clients.iter_mut().for_each(Listener::reached);
+        }
+        reached
+    }
+
+    /// The clients' lock, held: no answer is decided or switched meanwhile.
+    #[cfg(test)]
+    pub(in crate::hub) fn hold_clients(&self) -> impl Sized + '_ {
+        self.clients.lock().unwrap()
+    }
+
     /// The clients still waiting, each by the name its request gave it;
     /// None for one whose request named none.
     pub(in crate::hub) fn owners(&self) -> Vec<Option<Arc<str>>> {

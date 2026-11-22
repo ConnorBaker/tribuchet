@@ -16,6 +16,10 @@ message Call {
     FinishRequest finish = 5;
     CleanupRequest cleanup = 6;
     ShutdownRequest shutdown = 7;
+    // On the worker's handoff socket, not an agent's: a producer's attach
+    // asking for its run's listener. Answered with `empty` and the
+    // listener attached, or an error.
+    HandoffRequest handoff = 8;
   }
 }
 
@@ -57,6 +61,10 @@ message StartRequest {
   repeated string outputs = 8;
   // memory.max for the build's cgroup. Unlimited when unset.
   optional uint64 memory_max_bytes = 9;
+  // A producer's (builder-rpc-v0): the basename of the socket its builder
+  // reaches as NIX_REMOTE, in the build's tmp dir. The agent makes it a
+  // listening socket and hands it over with StartReply.
+  optional string rpc_socket = 10;
 }
 
 // Attached fd 0, where the build has a cgroup, is a write-only handle on
@@ -67,6 +75,15 @@ message StartReply {
   int32 pid = 1;
   // The agent-owned scratch dir the build runs in (its cwd).
   string scratch_dir = 2;
+  // The attached fds hold the listener of StartRequest.rpc_socket, after
+  // the freeze handle where there is one. The agent keeps no copy.
+  bool rpc_listener = 3;
+}
+
+// A producer's attach asking the worker's handoff socket for its run's
+// listener, by the token the hub gave both.
+message HandoffRequest {
+  bytes token = 1;
 }
 
 // Sent on the Start/Adopt connection when the builder exits.

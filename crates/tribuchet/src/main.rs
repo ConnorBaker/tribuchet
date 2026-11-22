@@ -60,6 +60,11 @@ enum Command {
         /// Hub unix socket.
         #[arg(long, default_value = "/run/tribuchet/hub.sock")]
         socket: PathBuf,
+        /// The handoff socket of the worker on this host, which hands a
+        /// dynamic-derivation producer's listener on; without it no
+        /// producer is built through the hub.
+        #[arg(long)]
+        handoff_socket: Option<PathBuf>,
     },
     /// Retire a worker that is not connected: the hub no longer knows it,
     /// and refuses a build only it served to a client whose Nix cannot
@@ -169,7 +174,11 @@ fn run() -> Result<(), Error> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Attach { build_json, socket } => attach::run(&build_json, &socket),
+        Command::Attach {
+            build_json,
+            socket,
+            handoff_socket,
+        } => attach::run(&build_json, &socket, handoff_socket.as_deref()),
         Command::Decommission { worker, socket } => hub::decommission(&socket, &worker),
         Command::Hub { config } => {
             let cfg: config::HubConfig = config::load(&config)?;

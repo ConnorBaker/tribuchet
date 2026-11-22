@@ -277,6 +277,15 @@ pub struct WorkerConfig {
     #[serde(default)]
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     pub agent_uid_base: Option<u32>,
+    /// Where to serve dynamic-derivation producers' listeners to attach
+    /// on this host (worker/handoff.rs). Only the worker beside the hub
+    /// sets it; it alone then advertises builder-rpc-v0.
+    #[serde(default)]
+    pub handoff_socket: Option<PathBuf>,
+    /// The group that socket is given to: the build users', which attach
+    /// runs as. Unset, the worker's own.
+    #[serde(default)]
+    pub handoff_gid: Option<u32>,
 }
 
 impl WorkerConfig {

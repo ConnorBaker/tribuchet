@@ -3,6 +3,7 @@
 
 use super::*;
 use crate::proto::Resumed;
+use crate::worker::handoff::EXPIRED;
 
 /// An entry for "k" in b1 for the session "old": running, held for its
 /// agent, or finished with this error.
@@ -113,6 +114,7 @@ fn ended(dir: &Path, error: &str) -> FinishedBuild {
         outputs: vec![],
         dir: dir.to_owned(),
         finished_at: Instant::now(),
+        handoff_expired: error == EXPIRED,
     }
 }
 
@@ -564,5 +566,30 @@ fn a_delivery_leaves_a_new_runs_entry_alone() -> Result<()> {
     anew_rx.close();
     until("the new run's delivery ended", || second.is_finished());
     assert!(marked, "the delivery before unmarked the new run's");
+    Ok(())
+}
+
+/// DD10: a run killed because its listener reached no attach in time is
+/// delivered `handoff_expired`, which the hub settles as a loss; a run
+/// ending with any other error, or none, is delivered as a result.
+#[test]
+fn a_run_whose_listener_reached_no_attach_is_delivered_handoff_expired() -> Result<()> {
+    for (error, expired) in [(EXPIRED, true), ("", false), ("builder failed", false)] {
+        let dir = tempfile::tempdir()?;
+        let ctx = WorkerCtx::for_test(dir.path(), 4, vec![])?;
+        let b1 = dir.path().join("builds/b1");
+        fs::create_dir_all(&b1)?;
+        let fin = Some(ended(&b1, error));
+        ResumableBuild::insert(&ctx, "k".into(), "x".into(), b1, fin);
+        let (s1, mut s1_rx) = tokio::sync::mpsc::channel(16);
+        ctx.resumable.lock().unwrap().get_mut("k").unwrap().out_tx = Some(s1);
+        let c = ctx.clone();
+        bounded("delivered", move || try_deliver(&c, "k", None));
+        let sent = s1_rx.try_recv().ok().and_then(|m| m.msg);
+        let Some(worker_message::Msg::Result(r)) = sent else {
+            panic!("{error:?}: no result sent: {sent:?}");
+        };
+        assert_eq!(r.handoff_expired, expired, "{error:?}: handoff_expired");
+    }
     Ok(())
 }

@@ -42,6 +42,7 @@ fn finished(dir: &Path) -> FinishedBuild {
         outputs: vec![],
         dir: dir.to_owned(),
         finished_at: Instant::now(),
+        handoff_expired: false,
     }
 }
 

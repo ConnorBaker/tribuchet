@@ -52,6 +52,12 @@ pub enum Event {
         key: Key,
         client: Client,
     },
+    /// `client`'s own Nix no longer builds `key`: a run of it reached the
+    /// client, whose Nix did not say it can (OQ1's fallback (a)).
+    Bound {
+        key: Key,
+        client: Client,
+    },
     /// A worker (re)connects and lists every run it holds and was not told
     /// to drop, so the farm's own cancel is never taken for a loss (§7).
     Register {
@@ -290,6 +296,12 @@ pub fn step(hub: &mut Hub, ev: Event) -> Vec<Command> {
             b.clients.insert(client, can_local);
         }
         Event::Leave { key, client } => hub.leave(key, client),
+        Event::Bound { key, client } => {
+            let b = hub.builds.get_mut(&key);
+            if let Some(can_local) = b.and_then(|b| b.clients.get_mut(&client)) {
+                *can_local = false;
+            }
+        }
         Event::Register {
             worker,
             serves,
