@@ -136,6 +136,11 @@ pub(super) fn mean(samples: &VecDeque<u32>) -> f64 {
 #[cfg(test)]
 mod tests {
     #[cfg(target_os = "linux")]
+    use std::sync::mpsc;
+    #[cfg(target_os = "linux")]
+    use std::thread;
+
+    #[cfg(target_os = "linux")]
     use rustix::thread::gettid;
 
     use super::*;
@@ -204,5 +209,33 @@ mod tests {
         fs::create_dir(dir.path().join("sub")).unwrap();
         fs::write(dir.path().join("sub/cgroup.threads"), &me).unwrap();
         assert_eq!(runnable_threads(dir.path()), 2);
+    }
+
+    /// A thread asleep (state S, blocked on a channel) is listed and not
+    /// counted: only a thread in state R is runnable, not every thread
+    /// of the cgroup. The count follows the thread's state as /proc
+    /// reports it once it is asleep, not a wait of some length.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn runnable_threads_does_not_count_a_sleeping_thread() {
+        let (tid_tx, tid_rx) = mpsc::channel();
+        let (wake_tx, wake_rx) = mpsc::channel::<()>();
+        let sleeper = thread::spawn(move || {
+            tid_tx.send(gettid().as_raw_nonzero().to_string()).unwrap();
+            let _ = wake_rx.recv();
+        });
+        let tid = tid_rx.recv().unwrap();
+        // Bounded by yields, not time: an unreadable /proc fails here.
+        let asleep = (0..1_000_000).any(|_| {
+            thread::yield_now();
+            thread_state(&tid) == Some('S')
+        });
+        assert!(asleep, "/proc/{tid}/stat never read state S");
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("cgroup.threads"), format!("{tid}\n")).unwrap();
+        let runnable = runnable_threads(dir.path());
+        drop(wake_tx);
+        sleeper.join().unwrap();
+        assert_eq!(runnable, 0, "a sleeping thread counted as runnable");
     }
 }
