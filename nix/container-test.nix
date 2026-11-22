@@ -115,13 +115,17 @@
         hub.succeed("systemctl start tribuchet-hub.socket")
         hub.succeed("systemctl start tribuchet-hub")
         worker.succeed("systemctl start podman-worker")
+        # Journal checks count with `grep -c`, which reads the whole stream:
+        # `grep -q` exits at its first match, and while journalctl still
+        # writes, it gets SIGPIPE, which the driver's `set -o pipefail`
+        # turns into the check's failure though the line is there.
         hub.wait_until_succeeds(
-            "journalctl -u tribuchet-hub | grep -q 'worker registered'"
+            "[ $(journalctl -u tribuchet-hub | grep -c 'worker registered') -gt 0 ]"
         )
 
     with subtest("agents run under their own uids"):
         worker.wait_until_succeeds(
-            "journalctl -u podman-worker | grep 'spawned build agents' | grep -q 'uid_isolation=true'"
+            "[ $(journalctl -u podman-worker | grep 'spawned build agents' | grep -c 'uid_isolation=true') -gt 0 ]"
         )
 
     with subtest("single-uid build"):
@@ -134,14 +138,19 @@
     # worker that serves it is away.
     with subtest("a build with network is not sent to a worker without network"):
         worker.succeed(
-            "journalctl -u podman-worker | grep 'resolved sandbox defaults' | grep -q 'fod_isolation=false'"
+            "[ $(journalctl -u podman-worker | grep 'resolved sandbox defaults' | grep -c 'fod_isolation=false') -gt 0 ]"
         )
         hub.succeed(
             "systemd-run --unit=fod -p StandardOutput=append:/root/fod.log"
             " -p StandardError=append:/root/fod.log nix-build /etc/tt/fod.nix --no-out-link"
         )
         hub.wait_until_succeeds("! systemctl is-active --quiet fod", timeout=120)
-        worker.fail("journalctl -u podman-worker | grep -q 'refusing a build with network'")
+        # No refusal line: the journal read whole first, so that neither
+        # SIGPIPE (as `fail` of a `grep -q` pipeline could) nor journalctl
+        # failing passes the check.
+        worker.succeed(
+            "j=$(journalctl -u podman-worker) && ! grep -q 'refusing a build with network' <<<\"$j\""
+        )
         hub.succeed(
             "grep -qF 'no worker this hub knows builds x86_64-linux [tribuchet-network]'"
             " /root/fod.log"

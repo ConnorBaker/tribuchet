@@ -428,10 +428,12 @@ in
             "systemctl is-active tribuchet-agent@1.socket && systemctl is-active tribuchet-agent@${toString agents}.socket"
         )
         worker.fail("systemctl is-active tribuchet-agent@${toString (agents + 1)}.socket")
+        # `grep -c`, not `grep -q`: an early exit would SIGPIPE journalctl
+        # and, under the driver's pipefail, fail on a line that is there.
         hub.wait_until_succeeds(
-            "journalctl -u tribuchet-hub | grep -q 'worker registered'"
+            "[ $(journalctl -u tribuchet-hub | grep -c 'worker registered') -gt 0 ]"
         )
-        ${lib.optionalString auto ''hub.wait_until_succeeds("printf 'GET /workers HTTP/1.0\\r\\n\\r\\n' | socat - TCP:127.0.0.1:9437 | grep -q '\"max_jobs\": ${toString cores},'", timeout=60)''}
+        ${lib.optionalString auto ''hub.wait_until_succeeds("[ $(printf 'GET /workers HTTP/1.0\\r\\n\\r\\n' | socat - TCP:127.0.0.1:9437 | grep -c '\"max_jobs\": ${toString cores},') -gt 0 ]", timeout=60)''}
         # The startup sweep activates every agent. Idle ones exit again so
         # they do not pin the binary they were started with.
         worker.wait_until_succeeds(
