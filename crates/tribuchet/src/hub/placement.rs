@@ -253,12 +253,13 @@ impl Placement {
         }
     }
 
-    /// `job`'s expected running seconds on worker `worker` (by name):
-    /// its expectation's, on a worker of speed factor 1, over the
-    /// worker's factor (speed.rs). For a decider weighing finish times;
-    /// none reads it yet, but the dispatch log line.
+    /// `job`'s expected running seconds on worker `worker` (by name),
+    /// read from the history now (History::secs_on), not from the
+    /// expectation the job keeps: a refit since that was read counts. For
+    /// a decider weighing finish times; none reads it yet, but the
+    /// dispatch log line.
     pub(super) fn secs_on(&self, job: &Job, worker: &str) -> Option<f64> {
-        job.expected.secs_on(self.history.speed(worker))
+        self.history.secs_on(&build_of(job), worker)
     }
 
     /// Learn from a finished run of `job`, and append it to the record,
@@ -272,7 +273,9 @@ impl Placement {
         let on = (rest.worker.as_deref()).map(|worker| On { worker, taught });
         self.history.record(&build, exit_code, u, on);
         if let Some(key) = key_of(job).filter(|_| exit_code == 0 && !u.oom_killed) {
-            let secs = self.history.expect(&build).secs.unwrap_or(0.0);
+            // A path's seconds are the build's, on a worker of factor 1,
+            // not those of the workers its runs happened to take.
+            let secs = self.history.unit_secs(&build).unwrap_or(0.0);
             let outputs = job.req.outputs.values().cloned();
             (self.downstream).learn(&key, secs, outputs, &job.req.input_paths);
         }

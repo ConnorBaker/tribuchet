@@ -53,7 +53,9 @@
 //!
 //! A build's running seconds on a worker of speed factor 1 (speed.rs)
 //! are the median of each run's times its worker's factor; it is
-//! expected to run them over a worker's factor there (Expected::secs_on).
+//! expected to run them over a worker's factor there (History::secs_on),
+//! both read from the history when asked, not kept with an expectation:
+//! a refit changes them without changing anything an expectation read.
 
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
@@ -116,27 +118,21 @@ impl Level {
 
 /// A build's expected demand, its running seconds where a run of its
 /// level succeeded (the median as they ran, which the dispatch row
-/// records, and on a worker of speed factor 1), the level, the OOM kills
-/// among the runs of the entry it came from (its sources', its key's, a
-/// prefix's or its class's), and the running seconds learned to follow it
+/// records; those on a worker of speed factor 1 are read from the history
+/// when asked, History::unit_secs), the level, the OOM kills among the
+/// runs of the entry it came from (its sources', its key's, a prefix's or
+/// its class's), and the running seconds learned to follow it
 /// (placement/downstream.rs).
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(in crate::hub) struct Expected {
     pub(in crate::hub) demand: Demand,
     pub(in crate::hub) secs: Option<f64>,
-    pub(in crate::hub) unit_secs: Option<f64>,
     pub(in crate::hub) level: Level,
     pub(in crate::hub) oom: u32,
     pub(in crate::hub) below: f64,
 }
 
 impl Expected {
-    /// Its running seconds on a worker of speed factor `speed`
-    /// (History::speed), where a run of its level succeeded.
-    pub(in crate::hub) fn secs_on(&self, speed: f64) -> Option<f64> {
-        self.unit_secs.map(|s| s / speed)
-    }
-
     /// The guess with nothing learned: one core and 1 GiB, or for a
     /// build that declares big-parallel the median of the 33 such builds
     /// the hub ran on 2026-10-15..25, 17.8 cores and 38.5 GiB.
@@ -148,7 +144,6 @@ impl Expected {
                 memory: gib * GIB,
             },
             secs: None,
-            unit_secs: None,
             level: Level::Prior,
             oom: 0,
             below: 0.0,
@@ -258,18 +253,37 @@ impl History {
     /// guess of the levels below, no lower than its largest peak: a failed
     /// run bounds its own build's need from below and says nothing of how
     /// far above, so no failure stands in for a measured need.
-    #[allow(clippy::cast_precision_loss)]
     pub(in crate::hub) fn expect(&self, b: &Build) -> Expected {
+        self.expect_from(b).0
+    }
+
+    /// `b`'s running seconds on worker `name`: on a worker of factor 1
+    /// (unit_secs) over `name`'s factor, where a run of its level
+    /// succeeded.
+    pub(in crate::hub) fn secs_on(&self, b: &Build, name: &str) -> Option<f64> {
+        Some(self.unit_secs(b)? / self.speed(name))
+    }
+
+    /// `b`'s running seconds on a worker of speed factor 1: the median of
+    /// each run's seconds times its worker's factor, over the runs its
+    /// expectation's seconds are the median of (expect), with the factors
+    /// as they are now, so a refit since `b` was read counts.
+    pub(in crate::hub) fn unit_secs(&self, b: &Build) -> Option<f64> {
+        self.expect_from(b).1?.unit_secs(&self.speed)
+    }
+
+    /// `b`'s expectation (expect), and the runs its seconds came from.
+    #[allow(clippy::cast_precision_loss)]
+    fn expect_from<'a>(&'a self, b: &Build) -> (Expected, Option<&'a Runs>) {
         let class = self.classes.get(&format!("{}/{}", b.system, b.declared));
         let prior = Expected::prior(b.declared);
-        let speed = &self.speed;
         let fallback = class
-            .and_then(|c| c.timing(speed))
+            .and_then(|c| c.timing())
             .map_or(prior.demand.cores, |t| t.0);
         let sources = Self::sources_of(b).and_then(|s| self.sources.get(&s));
         if let Some(e) = sources
-            .filter(|r| r.timing(speed).is_some())
-            .and_then(|r| r.expected(Level::Source, fallback, speed))
+            .filter(|r| r.timing().is_some())
+            .and_then(|r| Some((r.expected(Level::Source, fallback)?, Some(r))))
         {
             return e;
         }
@@ -285,15 +299,12 @@ impl History {
                 (self.prefixes.get(&format!("{}/{pre}", b.system))).filter(measured)
             })
         };
-        let e = succeeded
-            .and_then(|r| r.expected(Level::Key, fallback, speed))
-            .or_else(|| by_prefix()?.expected(Level::Prefix, fallback, speed))
-            .or_else(|| {
-                class
-                    .filter(measured)?
-                    .expected(Level::Class, fallback, speed)
-            })
-            .unwrap_or(prior);
+        let at = |r: &'a Runs, level| Some((r.expected(level, fallback)?, Some(r)));
+        let (e, from) = succeeded
+            .and_then(|r| at(r, Level::Key))
+            .or_else(|| at(by_prefix()?, Level::Prefix))
+            .or_else(|| at(class.filter(measured)?, Level::Class))
+            .unwrap_or((prior, None));
         let e = match failed.and_then(|r| Some((r.runs.iter().map(|r| r.0).max()?, r.oom))) {
             Some((peak, oom)) => Expected {
                 demand: Demand {
@@ -306,7 +317,7 @@ impl History {
             },
             None => e,
         };
-        match sources.and_then(|r| r.runs.iter().map(|r| r.0).max()) {
+        let e = match sources.and_then(|r| r.runs.iter().map(|r| r.0).max()) {
             Some(peak) => Expected {
                 demand: Demand {
                     memory: e.demand.memory.max(peak as f64),
@@ -315,7 +326,8 @@ impl History {
                 ..e
             },
             None => e,
-        }
+        };
+        (e, from)
     }
 
     /// `b`'s expectation, and what it read: its sources, if it has them;
@@ -328,14 +340,14 @@ impl History {
         let sources = Self::sources_of(b);
         let mut entries: Vec<u64> = sources.iter().map(|s| entry(3, s)).collect();
         let runs = sources.as_ref().and_then(|s| self.sources.get(s));
-        if runs.is_some_and(|r| r.timing(&self.speed).is_some()) {
+        if runs.is_some_and(|r| r.timing().is_some()) {
             return (e, Read { at, entries });
         }
         let stem = b.name.map(stem);
         let key = Self::key_of(b);
         let runs = key.as_ref().and_then(|k| self.keys.get(k));
-        let own = (runs.filter(|r| r.runs.iter().any(|r| r.3)))
-            .is_some_and(|r| r.timing(&self.speed).is_some());
+        let own =
+            (runs.filter(|r| r.runs.iter().any(|r| r.3))).is_some_and(|r| r.timing().is_some());
         entries.extend(key.iter().map(|k| entry(0, k)));
         if !own {
             let pres = stem.as_deref().into_iter().flat_map(prefixes);

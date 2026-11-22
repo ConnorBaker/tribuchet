@@ -1,6 +1,6 @@
 //! A tool, not a check (ignored, it asserts nothing): a replay of a build
 //! record by the fold (each_run). Each succeeded run is predicted before
-//! it is learned, with worker speed (Expected::secs_on) and without
+//! it is learned, with worker speed (History::secs_on) and without
 //! (every run a factor-1 worker's), and the log errors are summed,
 //! overall, for quiet runs and per worker; then one comparison's
 //! deviation from the fit, by the runs' length. Its settings, from the
@@ -155,15 +155,15 @@ fn replay() {
         let secs = u.wall_ms.saturating_sub(u.frozen_ms) as f64 / 1000.0;
         let scored = run.exit_code == 0 && !u.oom_killed && secs > 0.0 && u.peak_memory_bytes > 0;
         if let (Some(on), Some(name), true) = (run.on, run.build.name, scored) {
-            let ew = with.expect(&run.build).secs_on(with.speed(on.worker));
-            let ea = every.expect(&run.build).secs_on(every.speed(on.worker));
+            let ew = with.secs_on(&run.build, on.worker);
+            let ea = every.secs_on(&run.build, on.worker);
             if let (Some(pw), Some(pa)) = (ew, ea) {
                 q_vs_every_all.add(secs, [pw, pa]);
                 if on.taught {
                     q_vs_every_quiet.add(secs, [pw, pa]);
                 }
             }
-            if let (Some(pw), Some(po)) = (ew, without.expect(&run.build).secs_on(1.0)) {
+            if let (Some(pw), Some(po)) = (ew, without.secs_on(&run.build, on.worker)) {
                 all.add(secs, [pw, po]);
                 workers
                     .entry(on.worker.to_owned())

@@ -363,3 +363,84 @@ fn in_flight(demand: placement::Demand) -> placement::Placed {
         ends: None,
     }
 }
+
+/// A job's seconds on a worker are read from the history when asked
+/// (History::secs_on), not kept with the expectation it read: wa and wb
+/// run k alike; a job of k is read; then j's runs, wb 4x faster, refit
+/// the factors without a run of k, and the read is still fresh. Its
+/// seconds on wb change with the refit, to what the history says now.
+#[test]
+fn a_refit_counts_in_a_read_expectation() {
+    let state = HubState::for_test(Duration::from_secs(30));
+    let run = |name: &str, worker: &str, ms: u64| {
+        let (mut j, mut usage) = run_of(name, 1);
+        j.placed = placement::Teaching { quiet: true };
+        usage.wall_ms = ms;
+        let rest = record::Rest::of(&j, worker);
+        state.placement.lock().unwrap().learn(&j, 0, &usage, rest);
+    };
+    for _ in 0..50 {
+        run("k-1", "wa", 100_000);
+        run("k-1", "wb", 100_000);
+    }
+    let (mut q, _) = run_of("k-1", 1);
+    let p = state.placement.lock().unwrap();
+    p.refresh(&mut q);
+    let before = p.secs_on(&q, "wb").unwrap();
+    drop(p);
+    for _ in 0..500 {
+        run("j-1", "wa", 100_000);
+        run("j-1", "wb", 25_000);
+    }
+    let p = state.placement.lock().unwrap();
+    let read = q.expected_at.as_ref().unwrap();
+    assert!(p.history.fresh(read), "no run of k since it was read");
+    let after = p.secs_on(&q, "wb").unwrap();
+    let b = placement::build_of(&q);
+    let now = p.history.unit_secs(&b).unwrap() / p.history.speed("wb");
+    assert!((after - now).abs() < 1e-9, "{after} against {now}");
+    assert!(after < 0.8 * before, "wb's seconds {before} then {after}");
+}
+
+/// What follows a build is learned in seconds on a worker of factor 1
+/// (History::unit_secs), not as its dependant happened to run: wb runs
+/// 2x wa (learned from k's runs); d, made from a's output, runs 50 s on
+/// wb or 100 s on wa, and below(a) is d's seconds on a worker of factor
+/// 1 (between the 50 and 100 it ran) and the same either way (within
+/// 1 %, the fitted ratio's shortfall of 2x), where as d ran it was 50 or
+/// 100.
+#[test]
+fn a_path_is_the_builds_not_its_workers() {
+    let below = |worker: &str, ms: u64| {
+        let state = HubState::for_test(Duration::from_secs(30));
+        let run = |name: &str, inputs: &[String], worker: &str, ms: u64| {
+            let (mut j, mut usage) = run_of(name, 1);
+            j.req.input_paths = inputs.to_vec();
+            j.placed = placement::Teaching { quiet: true };
+            usage.wall_ms = ms;
+            let rest = record::Rest::of(&j, worker);
+            state.placement.lock().unwrap().learn(&j, 0, &usage, rest);
+        };
+        for _ in 0..500 {
+            run("k-1", &[], "wa", 100_000);
+            run("k-1", &[], "wb", 50_000);
+        }
+        run("a-1", &[], "wa", 10_000);
+        let made = run_of("a-1", 1).0.req.outputs["out"].clone();
+        run("d-1", &[made], worker, ms);
+        let p = state.placement.lock().unwrap();
+        let unit = (p.history).unit_secs(&placement::build_of(&run_of("d-1", 1).0));
+        let below = p.downstream.below("x86_64-linux/a");
+        assert!(
+            (below - unit.unwrap()).abs() < 1e-9,
+            "{below} against {unit:?}"
+        );
+        below
+    };
+    let (fast, slow) = (below("wb", 50_000), below("wa", 100_000));
+    assert!(fast > 50.0 && fast < 100.0, "below a: {fast}");
+    assert!(
+        (fast / slow - 1.0).abs() < 0.01,
+        "{fast} on wb, {slow} on wa"
+    );
+}

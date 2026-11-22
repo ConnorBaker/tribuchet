@@ -94,14 +94,21 @@ impl Runs {
         }
     }
 
-    /// Medians over the runs that succeeded, if one did, of cores,
-    /// running seconds, and those times their worker's factor in `speed`.
-    pub(super) fn timing(&self, speed: &Speed) -> Option<(f64, f64, f64)> {
-        let timed = |r: &Run| r.timed().map(|(c, s)| (c, s, s * speed.of(r.4)));
-        let timed: Vec<(f64, f64, f64)> = self.runs.iter().filter_map(timed).collect();
+    /// Medians of cores and running seconds over the runs that
+    /// succeeded, if one did.
+    pub(super) fn timing(&self) -> Option<(f64, f64)> {
+        let timed: Vec<(f64, f64)> = self.runs.iter().filter_map(|r| r.timed()).collect();
         let cores = median(timed.iter().map(|t| t.0).collect())?;
         let secs = median(timed.iter().map(|t| t.1).collect())?;
-        Some((cores, secs, median(timed.iter().map(|t| t.2).collect())?))
+        Some((cores, secs))
+    }
+
+    /// The median over the runs that succeeded of each one's running
+    /// seconds times its worker's factor in `speed`: the seconds on a
+    /// worker of factor 1, read with the factors as they are now.
+    pub(super) fn unit_secs(&self, speed: &Speed) -> Option<f64> {
+        let unit = |r: &Run| r.timed().map(|(_, s)| s * speed.of(r.4));
+        median(self.runs.iter().filter_map(unit).collect())
     }
 
     /// The peak `level` takes, cores and seconds; a level without a
@@ -112,7 +119,7 @@ impl Runs {
     /// its own bound, no other stem's guess, as a runaway's); a class, its
     /// 90th percentile (quantile).
     #[allow(clippy::cast_precision_loss)]
-    pub(super) fn expected(&self, level: Level, fallback: f64, speed: &Speed) -> Option<Expected> {
+    pub(super) fn expected(&self, level: Level, fallback: f64) -> Option<Expected> {
         let largest = |succeeded: bool| {
             (self.runs.iter().filter(|r| r.3 || !succeeded))
                 .map(|r| r.0)
@@ -123,16 +130,15 @@ impl Runs {
             Level::Prefix => largest(true).or_else(|| largest(false)),
             Level::Class | Level::Prior => quantile(&self.runs, 0.9),
         }?;
-        let (cores, secs, unit_secs) = self
-            .timing(speed)
-            .map_or((fallback, None, None), |(c, s, u)| (c, Some(s), Some(u)));
+        let (cores, secs) = self
+            .timing()
+            .map_or((fallback, None), |(c, s)| (c, Some(s)));
         Some(Expected {
             demand: Demand {
                 cores,
                 memory: peak as f64,
             },
             secs,
-            unit_secs,
             level,
             oom: self.oom,
             below: 0.0,

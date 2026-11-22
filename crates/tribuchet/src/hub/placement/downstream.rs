@@ -9,7 +9,8 @@
 //! (build.json's inputPaths). An input that is an output of one of the
 //! last WINDOW runs of a key here was made by that key (its own system
 //! and stem); each such key is then followed by this build's expected
-//! seconds and the chain that follows this build's key:
+//! seconds (on a worker of speed factor 1: History::unit_secs) and the
+//! chain that follows this build's key:
 //!
 //!   below(k) = max over builds d, finished since k's own last run, with an
 //!              input made by k, of secs(d) + below(key(d)), the chain

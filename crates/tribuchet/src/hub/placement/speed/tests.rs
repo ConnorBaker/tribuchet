@@ -269,17 +269,13 @@ fn a_build_runs_its_seconds_over_the_workers_factor() {
             }),
         );
     }
-    let e = h.expect(&build("only-1"));
-    let (on_a, on_b) = (
-        e.secs_on(h.speed("a")).unwrap(),
-        e.secs_on(h.speed("b")).unwrap(),
-    );
+    let b = build("only-1");
+    let (on_a, on_b) = (h.secs_on(&b, "a").unwrap(), h.secs_on(&b, "b").unwrap());
     assert!((on_a - 40.0).abs() < 0.5, "on a: {on_a}");
     assert!((on_b - 20.0).abs() < 0.5, "on b: {on_b}");
     // With no worker named, a run is a speed-1 worker's.
     h.record(&build("anon-1"), 0, &usage(40.0), None);
-    let e = h.expect(&build("anon-1"));
-    assert_eq!(e.secs_on(1.0), Some(40.0));
+    assert_eq!(h.secs_on(&build("anon-1"), "new"), Some(40.0));
 }
 
 /// A build's expectation keeps its seconds as its runs ran, which the
@@ -305,7 +301,7 @@ fn expected_secs_stay_as_the_runs_ran() {
     }
     let e = h.expect(&build("only-1"));
     assert_eq!(e.secs, Some(40.0));
-    let unit = e.unit_secs.unwrap();
+    let unit = h.unit_secs(&build("only-1")).unwrap();
     assert!((unit - 40.0 * h.speed("a")).abs() < 1e-9, "{unit}");
 }
 
@@ -511,4 +507,79 @@ fn a_worker_away_drifts_to_1_and_is_relearned() {
     alternate(&mut h, "bc-1", 100.0, b, c, 20);
     let back = ratio(&h, "a", "b");
     assert!((back / 2.0 - 1.0).abs() < 0.05, "back: {back}");
+}
+
+/// A run that did not succeed, failed or OOM-killed, is censored: it
+/// teaches memory (history.rs), and no speed comparison, though its
+/// dispatch was quiet. a and b compared alike; then 200 runs of b's at
+/// 4x, failed or killed, leave every factor as it was, where the same
+/// runs succeeded read b slower (1.33x, each comparison clamped).
+#[test]
+fn a_censored_run_teaches_no_speed() {
+    let mut base = History::default();
+    alternate(
+        &mut base,
+        "k-1",
+        100.0,
+        ("a", 1.0, true),
+        ("b", 1.0, true),
+        500,
+    );
+    let before = base.speeds();
+    let slow = |h: &mut History, exit_code: i32, oom: bool| {
+        for _ in 0..200 {
+            let mut u = usage(400.0);
+            u.oom_killed = oom;
+            for (worker, u) in [("a", usage(100.0)), ("b", u)] {
+                let on = Some(On {
+                    worker,
+                    taught: true,
+                });
+                h.record(&build("k-1"), exit_code, &u, on);
+            }
+        }
+    };
+    for (exit_code, oom) in [(1, false), (0, true)] {
+        let mut h = base.clone();
+        slow(&mut h, exit_code, oom);
+        let after: Vec<_> = (h.speeds().into_iter()).map(|(w, f, _)| (w, f)).collect();
+        let was: Vec<_> = (before.iter()).map(|(w, f, _)| (w.clone(), *f)).collect();
+        assert_eq!(after, was, "exit {exit_code}, killed {oom}");
+    }
+    let mut h = base.clone();
+    slow(&mut h, 0, false);
+    let r = ratio(&h, "a", "b");
+    assert!(r > 1.2, "succeeded, b read {r}x slower");
+}
+
+/// Runs are compared under history's key (history::key, system and
+/// stem): `tool-1.0` on a and `tool-2.0` on b, one stem, are compared,
+/// and read b 2x a; `foo-1` on a and `bar-1` on b, two stems, are not,
+/// and leave both at factor 1, though bar-1 takes half foo-1's time: a
+/// coarser key (the system alone) would compare them and read b 2x.
+#[test]
+fn runs_are_compared_under_historys_key() {
+    let mut h = History::default();
+    for _ in 0..500 {
+        for (worker, name, secs) in [("a", "tool-1.0", 100.0), ("b", "tool-2.0", 50.0)] {
+            let on = Some(On {
+                worker,
+                taught: true,
+            });
+            h.record(&build(name), 0, &usage(secs), on);
+        }
+    }
+    let r = ratio(&h, "b", "a");
+    assert!((r / 2.0 - 1.0).abs() < 0.02, "one stem: b read {r}x a");
+    let mut h = History::default();
+    for _ in 0..500 {
+        for (worker, name, secs) in [("a", "foo-1", 100.0), ("b", "bar-1", 50.0)] {
+            let on = Some(On {
+                worker,
+                taught: true,
+            });
+            h.record(&build(name), 0, &usage(secs), on);
+        }
+    }
+    assert_eq!((h.speed("a"), h.speed("b")), (1.0, 1.0), "two stems");
 }
