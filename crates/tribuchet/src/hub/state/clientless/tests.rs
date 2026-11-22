@@ -312,7 +312,6 @@ async fn a_build_waits_for_a_slot_only_where_one_lets_it_in() {
                     memory: gib * GIB,
                 },
                 secs: None,
-                unit_secs: None,
                 level: Level::Key,
                 oom: 0,
                 below: 0.0,

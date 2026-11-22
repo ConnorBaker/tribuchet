@@ -269,17 +269,13 @@ fn a_build_runs_its_seconds_over_the_workers_factor() {
             }),
         );
     }
-    let e = h.expect(&build("only-1"));
-    let (on_a, on_b) = (
-        e.secs_on(h.speed("a")).unwrap(),
-        e.secs_on(h.speed("b")).unwrap(),
-    );
+    let b = build("only-1");
+    let (on_a, on_b) = (h.secs_on(&b, "a").unwrap(), h.secs_on(&b, "b").unwrap());
     assert!((on_a - 40.0).abs() < 0.5, "on a: {on_a}");
     assert!((on_b - 20.0).abs() < 0.5, "on b: {on_b}");
     // With no worker named, a run is a speed-1 worker's.
     h.record(&build("anon-1"), 0, &usage(40.0), None);
-    let e = h.expect(&build("anon-1"));
-    assert_eq!(e.secs_on(1.0), Some(40.0));
+    assert_eq!(h.secs_on(&build("anon-1"), "new"), Some(40.0));
 }
 
 /// A build's expectation keeps its seconds as its runs ran, which the
@@ -305,7 +301,7 @@ fn expected_secs_stay_as_the_runs_ran() {
     }
     let e = h.expect(&build("only-1"));
     assert_eq!(e.secs, Some(40.0));
-    let unit = e.unit_secs.unwrap();
+    let unit = h.unit_secs(&build("only-1")).unwrap();
     assert!((unit - 40.0 * h.speed("a")).abs() < 1e-9, "{unit}");
 }
 

@@ -363,3 +363,41 @@ fn in_flight(demand: placement::Demand) -> placement::Placed {
         ends: None,
     }
 }
+
+/// A job's seconds on a worker are read from the history when asked
+/// (History::secs_on), not kept with the expectation it read: wa and wb
+/// run k alike; a job of k is read; then j's runs, wb 4x faster, refit
+/// the factors without a run of k, and the read is still fresh. Its
+/// seconds on wb change with the refit, to what the history says now.
+#[test]
+fn a_refit_counts_in_a_read_expectation() {
+    let state = HubState::for_test(Duration::from_secs(30));
+    let run = |name: &str, worker: &str, ms: u64| {
+        let (mut j, mut usage) = run_of(name, 1);
+        j.placed = placement::Teaching { quiet: true };
+        usage.wall_ms = ms;
+        let rest = record::Rest::of(&j, worker);
+        state.placement.lock().unwrap().learn(&j, 0, &usage, rest);
+    };
+    for _ in 0..50 {
+        run("k-1", "wa", 100_000);
+        run("k-1", "wb", 100_000);
+    }
+    let (mut q, _) = run_of("k-1", 1);
+    let p = state.placement.lock().unwrap();
+    p.refresh(&mut q);
+    let before = p.secs_on(&q, "wb").unwrap();
+    drop(p);
+    for _ in 0..500 {
+        run("j-1", "wa", 100_000);
+        run("j-1", "wb", 25_000);
+    }
+    let p = state.placement.lock().unwrap();
+    let read = q.expected_at.as_ref().unwrap();
+    assert!(p.history.fresh(read), "no run of k since it was read");
+    let after = p.secs_on(&q, "wb").unwrap();
+    let b = placement::build_of(&q);
+    let now = p.history.unit_secs(&b).unwrap() / p.history.speed("wb");
+    assert!((after - now).abs() < 1e-9, "{after} against {now}");
+    assert!(after < 0.8 * before, "wb's seconds {before} then {after}");
+}

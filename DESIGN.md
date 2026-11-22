@@ -941,16 +941,24 @@ O(workers^2) a taught run; renewing it every run costs 42 % more on the
 record and 14.5x on the 60-worker one (above).
 
 A build's expectation keeps its median running seconds as they ran
-(`Expected::secs`, the dispatch row's `expect_secs`), and adds those of
-a worker of factor 1 (`Expected::unit_secs`): the median over its
-level's succeeded runs of each one's running time times its worker's
-factor. On worker w it is expected to run them over w's factor:
+(`Expected::secs`, the dispatch row's `expect_secs`). Its seconds on a
+worker of factor 1 are the median over the same runs of each one's
+running time times its worker's factor, and on worker w it is expected
+to run them over w's factor. These are read from the history when
+asked, not kept with the expectation a job holds: a job's expectation
+is read again only once something it read learns a run
+(`History::fresh`), and a refit changes the factors without that, so a
+kept value would be stale. Fold and live read them alike, from the
+same history.
 
 - `History::speed(worker) -> f64`: worker's factor, 1 if never compared;
-- `Expected::secs_on(speed) -> Option<f64>`: the build's seconds on a
-  worker of that factor, where a run of its level succeeded;
-- `Placement::secs_on(job, worker) -> Option<f64>`: the two composed,
-  for a decider weighing when a build would finish on each worker.
+- `History::unit_secs(build) -> Option<f64>`: its seconds on a worker
+  of factor 1, where a run of its level succeeded;
+- `History::secs_on(build, worker)` and `Placement::secs_on(job,
+  worker) -> Option<f64>`: the two composed, for a decider weighing when
+  a build would finish on each worker. A test reads a job, refits the
+  factors with another key's runs, the read still fresh, and its
+  seconds on a worker change to what the history says.
 
 No decider reads them yet: the dispatch log line adds the worker's
 `speed` and `expect_secs_on`, and "build record folded" lists every
