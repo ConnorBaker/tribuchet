@@ -230,7 +230,7 @@ async fn each_client_of_a_build_is_its_owner() {
 
 /// A run teaches what follows them the keys of its inputs' builds, each
 /// of its own system: a build of a key one depended on then expects the
-/// dependant's seconds below it; another system's build of that pname,
+/// dependant's seconds below it; another system's build of that stem,
 /// and a key only a failed run depended on, nothing.
 #[test]
 fn a_run_teaches_its_inputs_what_follows_them() {
@@ -254,7 +254,7 @@ fn a_run_teaches_its_inputs_what_follows_them() {
         j
     };
     // An input of the same name made by another derivation (another
-    // hash), not by a run here, teaches its pname nothing.
+    // hash), not by a run here, teaches its stem nothing.
     let libqux = built(11, "x86_64-linux", "libqux-1", vec![]);
     p.learn(&libqux, 0, &usage, Rest::of(&libqux, "w"));
     let other = format!("/nix/store/{}-libqux-1", "1".repeat(32));

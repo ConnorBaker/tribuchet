@@ -71,7 +71,7 @@ fn capacity() -> usize {
 
 /// Fill the capacity of the worker that serves builds now with builds
 /// sleeping `secs`, each named `name-nN`; returns once all are dispatched.
-/// Each is its own key (pname `name-nN`): builds of one unseen key go one
+/// Each is its own key (stem `name-nN`): builds of one unseen key go one
 /// at a time (Placement::held_for_key), which would leave agents free.
 fn load(name: &str, secs: u32) {
     let slots = capacity();

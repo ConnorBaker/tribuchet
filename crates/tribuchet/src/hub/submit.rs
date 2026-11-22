@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use prost::Message;
 use sha2::{Digest, Sha256};
+use tokio::sync::oneshot;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -16,6 +17,7 @@ use super::naming::drv_name;
 use super::placement::Expected;
 use super::placement::objective::enqueue;
 use super::producer;
+use super::sources;
 use super::state::{HubState, Inflight, Job, Replay, Servability, unserved};
 use crate::proto::{
     AttachEvent, BuildMessage, BuildRequest, DECLINE_EXIT_CODE, NETWORK, attach_event,
@@ -312,54 +314,94 @@ impl attach_hub_server::AttachHub for AttachSvc {
             let sys = (req.system.as_str(), features.as_slice());
             let client = asks(sys);
             let first = client.id;
-            let rx = replay.subscribe_as(client).await;
             let joined = replay.clone();
-            let mut job = Job {
-                id,
-                key,
-                req,
-                tmp_dir_pack,
-                features,
-                replay,
-                listing: Arc::new(Mutex::new(Some(listing))),
-                attempts: 0,
-                transport_losses: 0,
-                queued_at: Instant::now(),
-                loss: None,
-                deferred: None,
-                expected: Expected::prior(false),
-                expected_at: None,
-            };
-            self.state.placement.lock().unwrap().refresh(&mut job);
-            tracing::info!(
-                id = job.id,
-                key = job.key,
-                client = first,
-                system = job.req.system,
-                drv = drv_name(&job.req).unwrap_or_default(),
-                owner = job.req.client.as_deref().unwrap_or_default(),
-                drv_path = job.req.drv_path.as_deref().unwrap_or_default(),
-                "queueing build"
-            );
-            if let Some(row) = producer::drv_path_row(&job)
-                && let Some(record) = &self.state.placement.lock().unwrap().record
-            {
-                record.send(row);
-            }
-            Metrics::inc(&self.state.metrics.submitted);
-            enqueue(&mut *self.state.queue.lock().await, job);
-            self.state.notify.notify_waiters();
+            // Listed, the build is queued whatever becomes of this handler,
+            // as a client may join it from now on: the lookup and the push
+            // are a task, begun before this handler next yields, that no
+            // cancelled submission drops. It waits for this handler's
+            // subscription (or its end), so its push's check cannot end the
+            // build as clientless first. A joining submission looks nothing up.
+            let (subscribed, on_subscribed) = oneshot::channel::<()>();
+            let state = self.state.clone();
+            let listing = Arc::new(Mutex::new(Some(listing)));
+            tokio::spawn(async move {
+                let unqueued = Unqueued(Some((id.clone(), replay.clone())));
+                let _ = on_subscribed.await;
+                let sources = sources::of(&state.daemon_pool, &req).await;
+                let mut job = Job {
+                    id,
+                    key,
+                    req,
+                    tmp_dir_pack,
+                    features,
+                    replay,
+                    listing,
+                    attempts: 0,
+                    transport_losses: 0,
+                    queued_at: Instant::now(),
+                    loss: None,
+                    deferred: None,
+                    expected: Expected::prior(false),
+                    expected_at: None,
+                    sources,
+                };
+                state.placement.lock().unwrap().refresh(&mut job);
+                tracing::info!(
+                    id = job.id,
+                    key = job.key,
+                    client = first,
+                    system = job.req.system,
+                    drv = drv_name(&job.req).unwrap_or_default(),
+                    owner = job.req.client.as_deref().unwrap_or_default(),
+                    drv_path = job.req.drv_path.as_deref().unwrap_or_default(),
+                    "queueing build"
+                );
+                if let Some(row) = producer::drv_path_row(&job)
+                    && let Some(record) = &state.placement.lock().unwrap().record
+                {
+                    record.send(row);
+                }
+                Metrics::inc(&state.metrics.submitted);
+                enqueue(&mut *state.queue.lock().await, job);
+                unqueued.queued();
+                state.notify.notify_waiters();
+                // Close the check-then-queue race: the last capable worker
+                // may have disconnected (and swept the queue) between the
+                // capability check above and this push.
+                state.hold_unservable().await;
+            });
+            let rx = joined.subscribe_as(client).await;
+            let _ = subscribed.send(());
             break (rx, joined);
         };
         let (rx, replay) = rx;
         if is_producer {
             tokio::spawn(producer::relay_reader(inbound, replay, key_for_reader));
         }
-        // Close the check-then-queue race: the last capable worker may
-        // have disconnected (and swept the queue) between the capability
-        // check above and the push.
-        self.state.hold_unservable().await;
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+
+/// A listed build's replay, until its build is queued: should the task
+/// that queues it end first (a panic), the build ends, unlisted as its
+/// listing drops, so that no client waits on it forever.
+struct Unqueued(Option<(String, Arc<Replay>)>);
+
+impl Unqueued {
+    fn queued(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Unqueued {
+    fn drop(&mut self) {
+        let Some((id, replay)) = self.0.take() else {
+            return;
+        };
+        tracing::error!(id, "a listed build was never queued; ending it");
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move { replay.finish().await });
+        }
     }
 }
 

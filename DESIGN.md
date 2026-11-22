@@ -321,18 +321,30 @@ submitted again by its client and resumed by its worker; a worker
 registering again does not count them.
 
 What a build is expected to use comes from what builds of its key used
-on this farm (`hub/placement/history.rs`): its system and pname, the
-name up to its version or a hash. Each key keeps its last 8 runs, as
-the workers measured them: the largest peak memory among them, and the
-medians of cores (CPU time over running time, frozen time not counted)
+on this farm (`hub/placement/history.rs`): its system and stem, the
+name less its versions and hashes (`ghc-9.14.1-with-packages` is
+`ghc-with-packages`, not the compiler's `ghc`), and, within a stem, the
+content-addressed inputs it consumes (`hub/sources.rs`): its
+derivation's sources and the outputs of its input derivations that are
+content-addressed, which the hub's daemon names as the build is
+submitted (the derivation that has its output, that derivation's
+references, its input derivations' outputs, and their path info), as a
+digest. So the per-file builds that share a name, blob-deps' one per
+program file, each expect their own program's runs. A build whose
+daemon names none, or whose lookup fails or takes more than a minute
+(logged), has no sources key, and its run is learned by its stem
+alone: the next build of those sources is looked up anew. Only a build
+that will run is looked up; a submission that joins one in flight is
+not. Each key keeps its last 8 runs, as the workers measured them: the
+largest peak memory among them, and the medians of cores (CPU time over running time, frozen time not counted)
 and running time over the runs that succeeded. A run that did not
 succeed, failed or OOM-killed, teaches memory only, and no timing: its
 peak, cut short by the kill or the failure, is right-censored, a lower
-bound of what its build needed. It teaches its key, its pname's
-prefixes and its class like any run. A key's memory is its largest
-peak, censored or not: a bound of its own builds. A prefix's is the
-largest peak that succeeded, or with none, the largest: a pname's peak
-censored above its siblings' successes, a runaway's, bounds that pname,
+bound of what its build needed. It teaches its sources, its key, its
+stem's prefixes and its class like any run. Sources' and a key's memory
+is their largest peak, censored or not: a bound of their own builds. A prefix's is the
+largest peak that succeeded, or with none, the largest: a stem's peak
+censored above its siblings' successes, a runaway's, bounds that stem,
 not another's guess, while a sibling of a killed build with nothing
 else to go on guesses no less than its peak. A class's is the 90th
 percentile of its peaks by the Kaplan-Meier estimator (Kaplan and
@@ -354,8 +366,11 @@ none, `fail_build` in `worker/session.rs`; an execution error or a lost
 agent connection reports it zeroed, `worker/resume/delivery.rs` and
 `worker/build/agent_exec.rs`). It
 reads nothing but the history, so the record's fold is the live history.
-A key with no run takes the longest dash-prefix of its
-pname that has one, then its class (its system and whether it declares
+A build takes the runs of its sources, if one of them
+succeeded with running time; sources none of whose runs did give no
+timing, but their largest peak is a lower bound on the memory expected.
+Else, a key with no run takes the longest dash-prefix of its
+stem that has one, then its class (its system and whether it declares
 `big-parallel`), then a fixed prior. A key none of whose runs succeeded
 takes the guess of the first of its prefixes and class with a run that
 succeeded, else the prior, no lower than its own largest peak: its
@@ -385,6 +400,11 @@ only copy. It has two tables, appended to and never changed: `result`,
 a row per worker result that carries usage (the "build usage" line's
 fields, and whether the build declares `big-parallel`), and `dispatch`,
 a row per dispatch (the "dispatching build" line's values, unrounded).
+A record gains tables as a hub that writes them opens it: `profile`, a
+row per result whose usage had a profile, and `source`, a row per result
+of a build with sources, its digest, both by the result's `at_ms` and
+`id` (the fold reads a result's sources from it), and `drv_path`
+(below).
 Other processes may query it while the hub runs (`sqlite3 -readonly`):
 it is in WAL mode, where readers and the one writer do not wait for each
 other. As the hub starts, before it serves, it folds every `result`
@@ -417,7 +437,13 @@ byte for byte as it is. A missing record, and its directory, are
 created. The hub serves either way: placement then falls back on its
 priors, and builds are not held for the record. The fold's cost at
 start is measured, not bounded: 338,559 rows, 116 MB, took 249 ms of
-CPU (release build, one run, 2026-11-08).
+CPU (release build, one run, 2026-11-08). With the stem and a `source`
+row for each of 1,345,937 of a record's 1,559,881 results, its fold
+ran 38.5 billion user-space instructions and peaked at 68 MB, against
+22.6 billion and 27 MB without the table and 21.5 billion and 25 MB by
+the commit before them (perf, one CPU, two runs each, 2026-11-21, on
+the tree before memory admission); an index on `source (at_ms, id)`
+took 5.7 billion off it, and is not kept.
 
 The record replaces `placement-history.json` ([placement] `history`),
 which nothing reads now: a hub.toml that still sets `history` fails to
@@ -665,7 +691,7 @@ came less than `path(c) - path(b)` seconds after b
 (`a_later_build_passes_only_within_its_path_difference`). No stream of
 later builds keeps b waiting: one that arrives more than the longest
 path the hub has learned after b goes behind it. The bound is as long as
-the longest `below` learned, which pname keys joining chains
+the longest `below` learned, which stem keys joining chains
 overestimate; the hub exports by system the `below` of each key
 something was learned to follow, a minute to a day
 (`tribuchet_hub_below_seconds`), so that it can be watched. A build no asking
@@ -708,11 +734,11 @@ of which is k; one that would come back to k counts d alone. While none
 has finished since k's last run, what the runs before left stands:
 `below` follows a key's latest run, not the longest any of its runs
 started (a key that runs often, as `source` does, keeps its latest).
-Keys are pnames and inputs are closures, so keys can name each other;
+Keys are stems and inputs are closures, so keys can name each other;
 every `below` is the learned seconds of a chain of distinct keys, and a
 cycle cannot add to it. A chain of n builds is learned over at most n -
 1 runs of it. Below a key no run has followed, `below` is 0, and so is
-the path of its builds. Pname keys also
+the path of its builds. Stem keys also
 join chains no one build is on: if one build of b follows a and another
 build of b is followed by c, `below(a)` counts b then c, longer than any
 chain one run went down. Never learned, and counted only as a run
@@ -739,8 +765,8 @@ parent's (hidepid). An attach whose parent exited before it read it is
 named, by its new parent (init, or a subreaper): it is charged as that
 client, shared with every other such attach.
 
-*Keys are pnames.* `below` is kept per history key, as the history keeps
-seconds, so builds of one pname share it: every fetchFromGitHub source is
+*Keys are stems.* `below` is kept per history key, as the history keeps
+seconds, so builds of one stem share it: every fetchFromGitHub source is
 named `source`. A build is known as its key's producer by its outputs,
 of every output name, not by the input's name.
 

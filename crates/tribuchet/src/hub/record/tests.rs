@@ -41,6 +41,7 @@ fn result(id: &str, at_ms: i64) -> Row {
         system: "x86_64-linux",
         name: Some("foo-1"),
         declared: false,
+        sources: None,
     };
     let usage = BuildUsage {
         wall_ms: 1000,

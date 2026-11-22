@@ -8,6 +8,7 @@ fn build(name: &str, declared: bool) -> Build<'_> {
         system: "x86_64-linux",
         name: Some(name),
         declared,
+        sources: None,
     }
 }
 
@@ -27,42 +28,12 @@ fn gib(e: Expected) -> f64 {
     e.demand.memory / GIB
 }
 
-#[test]
-fn pname_cuts_where_the_version_starts() {
-    assert_eq!(pname("nix-expr-2.36.0pre"), "nix-expr");
-    assert_eq!(pname("python3.14-torch-2.9.1"), "python3.14-torch");
-    assert_eq!(
-        pname("content-observation.json"),
-        "content-observation.json"
-    );
-    assert_eq!(pname("cuda13.4-libnvshmem-3.4"), "cuda13.4-libnvshmem");
-    // A hash ends it too; a word with a digit not.
-    assert_eq!(pname("tu-bbed23782ae68907"), "tu");
-    assert_eq!(pname("jctrim-rel-f8bdb806db3a"), "jctrim-rel");
-    assert_eq!(
-        pname("cargo-package-chacha20-0.9"),
-        "cargo-package-chacha20"
-    );
-    assert_eq!(pname("python3.13-secp256k1-0.14"), "python3.13-secp256k1");
-    assert_eq!(pname("x-goldres2"), "x-goldres2");
-    assert_eq!(
-        pname("python3.14-jax-cuda13-plugin-0.7"),
-        "python3.14-jax-cuda13-plugin"
-    );
-    assert_eq!(pname("jca-mut-s1"), "jca-mut-s1");
-    assert_eq!(
-        pname("server-aarch64-unknown-linux-gnu-0.1"),
-        "server-aarch64-unknown-linux-gnu"
-    );
-    assert_eq!(pname("tu-Bbed23782ae68907"), "tu-Bbed23782ae68907");
-    assert_eq!(pname("tu-bbedabcd"), "tu-bbedabcd");
-    assert_eq!(pname("tu-bbed2378"), "tu");
-    assert_eq!(pname("tu-bbed237"), "tu-bbed237");
-}
+#[path = "tests/keys.rs"]
+mod keys;
 
 /// Memory is the largest peak of the key's last WINDOW runs; cores and
 /// seconds the medians of those that succeeded. Another version of the
-/// same pname shares them.
+/// same stem shares them.
 #[test]
 fn a_key_expects_its_largest_recent_peak_and_median_timing() {
     let mut h = History::default();
@@ -375,7 +346,7 @@ fn frozen_time_is_not_running_time() {
     assert_eq!((e.demand.cores, e.secs), (8.0, Some(1.0)));
 }
 
-/// A key with no run takes the longest learned dash-prefix of its pname,
+/// A key with no run takes the longest learned dash-prefix of its stem,
 /// then its class (system and declaration), then the prior.
 #[test]
 fn an_unseen_key_falls_back_to_a_prefix_its_class_and_the_prior() {
@@ -387,7 +358,7 @@ fn an_unseen_key_falls_back_to_a_prefix_its_class_and_the_prior() {
     // "app" is a prefix of both; "app-grpc-store" a longer one.
     let e = h.expect(&unseen);
     assert_eq!((e.level, gib(e)), (Level::Prefix, 3.0));
-    // A pname is pooled under itself too: "app-grpc-store" pools its own
+    // A stem is pooled under itself too: "app-grpc-store" pools its own
     // run and its asan build's, and is the longest prefix learned.
     h.record(&build("app-grpc-store-0.2.3", false), 0, &usage(6, 10, 16));
     h.record(
@@ -406,6 +377,7 @@ fn an_unseen_key_falls_back_to_a_prefix_its_class_and_the_prior() {
     // A build whose name could not be read takes its class.
     let nameless = Build {
         name: None,
+        sources: Some("s"),
         ..build("", false)
     };
     assert_eq!(h.expect(&nameless).level, Level::Class);
@@ -499,8 +471,9 @@ fn a_read_holds_until_what_it_read_learns() {
 }
 
 /// A read still fresh is the expectation itself: random runs over names
-/// that share prefixes, both classes and every outcome (success, failure,
-/// OOM kill, unmeasured, no running time), and after each run every read
+/// that share prefixes, both classes, sources or none, and every outcome
+/// (success, failure, OOM kill, unmeasured, no running time), and after
+/// each run every read
 /// the history holds fresh equals a fresh expectation. A seeded generator:
 /// the same runs each time.
 #[test]
@@ -524,15 +497,21 @@ fn a_fresh_read_is_never_stale() {
             .wrapping_add(1_442_695_040_888_963_407);
         (seed >> 33) % n
     };
+    let sources = [None, Some("s"), Some("t")];
+    let of = |i: usize, d: bool, s: usize| Build {
+        sources: sources[s],
+        ..build(names[i], d)
+    };
     let (mut fresh, mut stale) = (0u64, Vec::new());
     for _ in 0..300 {
         let mut h = History::default();
-        let mut reads: Vec<(usize, bool, Expected, Read)> = Vec::new();
+        let mut reads: Vec<(usize, bool, usize, Expected, Read)> = Vec::new();
         for _ in 0..120 {
             let (i, d) = (next(names.len() as u64) as usize, next(2) == 1);
+            let src = next(sources.len() as u64) as usize;
             if next(3) == 0 {
-                let (e, r) = h.read(&build(names[i], d));
-                reads.push((i, d, e, r));
+                let (e, r) = h.read(&of(i, d, src));
+                reads.push((i, d, src, e, r));
                 continue;
             }
             let (peak, secs, cores) = ((1 + next(40)) << 28, next(4), 1 + next(8));
@@ -543,13 +522,13 @@ fn a_fresh_read_is_never_stale() {
                 oom_killed: next(6) == 0,
                 ..BuildUsage::default()
             };
-            h.record(&build(names[i], d), i32::from(next(4) == 0), &u);
-            for (j, dj, e, r) in &reads {
+            h.record(&of(i, d, src), i32::from(next(4) == 0), &u);
+            for (j, dj, sj, e, r) in &reads {
                 if h.fresh(r) {
                     fresh += 1;
-                    let now = h.expect(&build(names[*j], *dj));
+                    let now = h.expect(&of(*j, *dj, *sj));
                     if now != *e {
-                        stale.push((names[*j], *dj, *e, now));
+                        stale.push((names[*j], *dj, sources[*sj], *e, now));
                     }
                 }
             }
