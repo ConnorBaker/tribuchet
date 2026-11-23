@@ -246,6 +246,7 @@ Set `metrics-listen = "127.0.0.1:7438"` in `hub.toml` and the hub serves
 | `tribuchet_system_slots` | gauge | system | build slots of connected workers. A worker serving several systems counts in each. Free slots are `slots - running` |
 | `tribuchet_workers_connected` | gauge | | workers with an open session |
 | `tribuchet_workers_for_system` | gauge | system | connected workers advertising a system |
+| `tribuchet_workers_without_agents` | gauge | | connected workers that reach no build agent (no slot): the hub places them no new build, and their builds not started wait for an agent |
 | `tribuchet_queue_seconds` | histogram | system | time a build waited for a worker, per attempt. Its `_count` is the number of dispatches |
 | `tribuchet_build_seconds` | histogram | system | wall time of a build on its worker |
 | `tribuchet_build_cpu_seconds` | histogram | system | CPU time of a build |
@@ -255,7 +256,8 @@ Set `metrics-listen = "127.0.0.1:7438"` in `hub.toml` and the hub serves
 
 `GET /workers` on the same port lists the connected workers as indented
 JSON, sorted by name, with `name`, `systems` and their features, `max_jobs`
-and `connected_seconds`.
+(as the worker's last heartbeat said: a slot per build agent it reaches,
+at most its max-jobs; 0 when it reaches none) and `connected_seconds`.
 
 ## Fixed-output network policy
 

@@ -230,10 +230,17 @@ impl ActiveBuild {
     }
 
     /// No agent is free or reachable: say so, here and to the client,
-    /// once to each session that holds the build while it waits.
-    fn tell_waiting(&self) {
+    /// once to each session that holds the build while it waits; here,
+    /// which of the two (agent_wait, of `slots`).
+    pub(super) fn tell_waiting(&self) {
         let a = &self.assignment;
-        tracing::warn!(id = a.build_id, "no build agent free or reachable; waiting");
+        let room = self.ctx.agents.room();
+        tracing::warn!(
+            id = a.build_id,
+            slots = room.capacity,
+            agent_wait = room.wait(false),
+            "no build agent free or reachable; waiting"
+        );
         self.ctx.wait_for_agent(&a.dedupe_key, true);
     }
 

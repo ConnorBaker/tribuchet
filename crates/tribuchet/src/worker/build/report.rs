@@ -1,6 +1,7 @@
 //! A build not started yet says where it stands, once per
 //! crate::report::REPORT, as the hub's does (hub/relay/staging/report.rs):
-//! what the worker still waits on. Staged, it waits for a slot.
+//! what the worker still waits on. Staged, it waits for a slot: for an
+//! agent free, or for one to answer (agent_wait, of `slots`).
 
 use super::ActiveBuild;
 
@@ -10,6 +11,7 @@ impl ActiveBuild {
         let Some(staging_s) = self.report.due() else {
             return;
         };
+        let room = self.ctx.agents.room();
         tracing::info!(
             id = self.assignment.build_id,
             staging_s,
@@ -20,6 +22,8 @@ impl ActiveBuild {
             importing = self.imports.len(),
             waits = self.waits.len(),
             needs_outstanding = self.needs_outstanding,
+            slots = room.capacity,
+            agent_wait = room.wait(self.lease.is_some()),
             "build not started"
         );
     }

@@ -51,6 +51,17 @@ pub(super) struct Room {
 }
 
 impl Room {
+    /// What a build not started waits for in an agent (agent_wait= in the
+    /// worker's lines): "unreachable" with no agent up, "busy" with every
+    /// one up leased, else "no", as for a build that holds one (`holds`).
+    pub(super) fn wait(self, holds: bool) -> &'static str {
+        match (holds, self.capacity, self.free) {
+            (false, 0, _) => "unreachable",
+            (false, _, 0) => "busy",
+            _ => "no",
+        }
+    }
+
     /// What to ask the hub for: the free slots, and one build staged ahead
     /// when `lookahead` (every build holds a lease), not with no agent up.
     pub(super) fn request(self, lookahead: bool, assignments: u64) -> RequestJob {
