@@ -12,6 +12,7 @@ use futures_util::FutureExt;
 use super::tests::base_assignment;
 use super::*;
 use crate::proto::{CancelBuild, WorkerMessage, worker_message};
+use crate::testlog::Captured;
 use crate::worker::hostname;
 use crate::worker::resume::ResumableBuild;
 use crate::worker::session::handle_cancel;
@@ -241,6 +242,34 @@ fn every_wait_is_told_as_the_table_says() -> Result<()> {
             want(new_told, &again.build_id, "w-new"),
             "row {row}: new session"
         );
+    }
+    Ok(())
+}
+
+/// The wait's line says which wait it is: for the one agent leased by
+/// another build, busy; for it down, unreachable. The incident's line
+/// said "free or reachable" of every socket dead.
+#[tokio::test]
+async fn the_wait_line_says_whether_the_agent_is_busy_or_unreachable() -> Result<()> {
+    for (down, slots, want) in [(false, 1, "busy"), (true, 0, "unreachable")] {
+        let log = Captured;
+        let _guard = log.install();
+        let dir = tempfile::tempdir()?;
+        let (out_tx, _out_rx) = mpsc::channel(8);
+        let (ctx, build, _woken) = waiting_build(dir.path(), base_assignment(), &out_tx)?;
+        // Held to the end, as another build's lease.
+        let other = if down {
+            assert!(ctx.agents.mark_down(&dir.path().join("down.sock")));
+            None
+        } else {
+            ctx.agents.lease()
+        };
+        assert_eq!(other.is_some(), !down);
+        build.tell_waiting();
+        let line = log.line("no build agent free or reachable");
+        for field in [format!("slots={slots}"), format!(r#"agent_wait="{want}""#)] {
+            assert!(line.contains(&field), "{field} in {line}");
+        }
     }
     Ok(())
 }

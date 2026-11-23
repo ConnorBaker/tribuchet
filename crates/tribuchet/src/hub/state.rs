@@ -199,7 +199,10 @@ pub(super) struct WorkerCaps {
     /// system -> features the worker honors for it
     pub(super) systems: HashMap<String, HashSet<String>>,
     /// Advisory concurrent-build capacity, summed to size the
-    /// generated nix.conf max-jobs.
+    /// generated nix.conf max-jobs: as its last heartbeat said, a slot
+    /// per build agent it reaches, at most its max-jobs (Heartbeat); 0
+    /// when it reaches none, so it declares no capacity and is placed no
+    /// new build.
     pub(super) max_jobs: u32,
 }
 
@@ -244,6 +247,24 @@ pub(super) fn unserved(features: &[String]) -> bool {
 }
 
 impl HubState {
+    /// Worker session `session`'s slots, one per build agent it reaches
+    /// (WorkerCaps::max_jobs), and those free, as it last declared them
+    /// (Admission::idle): it can say no more of one build's wait. None once
+    /// it is gone.
+    pub(in crate::hub) fn agent_room(&self, session: u64) -> Option<(usize, usize)> {
+        let slots = self.worker_caps.lock().unwrap().get(&session)?.max_jobs;
+        let placement = self.placement.lock().unwrap();
+        let free = placement
+            .sessions
+            .get(&session)?
+            .admission
+            .lock()
+            .unwrap()
+            .idle();
+        let size = |n: u32| usize::try_from(n).unwrap_or(usize::MAX);
+        Some((size(slots), size(free)))
+    }
+
     pub(super) fn new(
         worker_grace: Duration,
         nix_config: Option<NixConfig>,

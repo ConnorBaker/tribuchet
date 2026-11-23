@@ -204,7 +204,8 @@ async fn a_staging_that_never_finishes_reports_where_it_stands() {
     need_all(&mut staging, &out_tx).await;
     staging.tasks.push(Box::pin(pending()));
     tokio::time::advance(REPORT).await;
-    staging.report_if_due();
+    // Its worker, session 2, is gone: not known to reach no agent.
+    staging.report_if_due(2);
     let line = log.line("build not started");
     for field in [
         r#"id="0000000000000000000000000000000c""#,
@@ -214,6 +215,8 @@ async fn a_staging_that_never_finishes_reports_where_it_stands() {
         "needs_received=1",
         "serving=true",
         "needs: 0,",
+        "slots=None",
+        r#"worker_agents="unknown""#,
     ] {
         assert!(line.contains(field), "{field} in {line}");
     }

@@ -132,7 +132,7 @@ pub(super) async fn run_job(
             }
             _ = abandon_check.tick() => {
                 if dispatch.reached < Run::Started {
-                    staging.report_if_due();
+                    staging.report_if_due(session);
                 }
                 if resumed_after.is_some_and(|n| state.unlisted(session, &job.key, n)) {
                     tracing::warn!(id = job.id, "the worker no longer lists the build it resumed");

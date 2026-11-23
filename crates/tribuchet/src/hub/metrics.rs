@@ -347,6 +347,7 @@ fn render_workers(out: &mut String, state: &HubState) {
         }
     }
     let connected = caps.len() as u64;
+    let agentless = caps.values().filter(|c| c.max_jobs == 0).count() as u64;
     drop(caps);
 
     metric(
@@ -355,6 +356,13 @@ fn render_workers(out: &mut String, state: &HubState) {
         "gauge",
         "Workers with an open session.",
         connected,
+    );
+    metric(
+        out,
+        "tribuchet_workers_without_agents",
+        "gauge",
+        "Connected workers that reach no build agent, so are placed no new build.",
+        agentless,
     );
     let _ = writeln!(
         out,
