@@ -230,6 +230,15 @@ Compared to the NixOS module the agents get no delegated cgroup, so
 volume is only a cache. The daemon garbage-collects it via the
 `min-free` and `max-free` settings baked into the image.
 
+A worker must share its build agents' network namespace and see their
+sockets at the paths they were bound by, or at symlinks to those: every
+10 s it sets aside an idle agent whose socket has no listening entry in
+its own /proc/net/unix, matched by resolving both paths. The image's
+spawned agents share it. A worker in a container of its own, given
+agents outside it (`agent-sockets`, `agent-sockets-dir`), would see none
+of their sockets listen; nor does it match a bind mount of their
+directory at another path, which resolving does not see through.
+
 ## Prometheus metrics
 
 Set `metrics-listen = "127.0.0.1:7438"` in `hub.toml` and the hub serves

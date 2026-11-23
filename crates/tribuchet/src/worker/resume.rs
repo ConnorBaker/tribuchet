@@ -15,6 +15,8 @@ use harmonia_store_remote::{DaemonClient, DaemonStore};
 
 use super::build::supervise_agent;
 use super::lease::Lease;
+#[cfg(target_os = "linux")]
+use super::listening::set_aside_unlistened;
 use super::logtail::LogTail;
 use super::{DaemonConn, WorkerCtx, agent_sockets_in, agents, msg, remove_build_dir, sandbox};
 use crate::errors::{Result, chain};
@@ -379,13 +381,15 @@ pub(super) fn spawn_agent_rescan(ctx: Arc<WorkerCtx>, dir: Option<PathBuf>) {
     });
 }
 
-fn rescan_agents(ctx: &Arc<WorkerCtx>, dir: Option<&Path>) {
+pub(super) fn rescan_agents(ctx: &Arc<WorkerCtx>, dir: Option<&Path>) {
     if let Some(dir) = dir {
         match agent_sockets_in(dir) {
             Ok(found) => ctx.agents.discover(found),
             Err(e) => tracing::warn!("agent-sockets-dir {}: {e}", dir.display()),
         }
     }
+    #[cfg(target_os = "linux")]
+    set_aside_unlistened(ctx);
     sweep_orphaned_agent_builds(ctx, ctx.agents.down_sockets());
 }
 

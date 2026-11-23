@@ -9,6 +9,10 @@
 //! (inputs are imported without signature checks).
 //!
 //! Runs up to `--max-jobs` builds concurrently over one hub session.
+//!
+//! It shares its network namespace with its build agents (their socket
+//! units' systemd, or itself, which spawns them): it sees their listening
+//! sockets in its /proc/net/unix (listening.rs).
 
 pub mod agent;
 #[cfg(target_os = "linux")]
@@ -24,6 +28,8 @@ mod handoff;
 #[cfg(test)]
 mod held_tests;
 mod lease;
+#[cfg(target_os = "linux")]
+mod listening;
 mod logtail;
 mod pins;
 mod resume;
