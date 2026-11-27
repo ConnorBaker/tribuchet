@@ -149,7 +149,7 @@ fn a_room_spoken_for_is_empty_no_more() {
         memory: 32.0 * GIB,
     };
     let now = Instant::now();
-    let passed = [(); 2].map(|()| rooms.passes(d, &mut None, |_| true, now));
+    let passed = [(); 2].map(|()| rooms.passes(d, &mut None, |_| true, |_| None, None, now));
     assert_eq!(passed, [Some(2), None]);
 }
 

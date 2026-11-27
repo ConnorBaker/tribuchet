@@ -293,10 +293,25 @@ Nix had that input as it submitted (`hub/state/hold.rs`).
 
 ## Placement
 
-A queued build goes to the least full worker with an idle agent that
-serves it and admits it for its memory, by what it and the builds
-already there are expected to use against what the worker has
-(`hub/placement/rank.rs`). Fullness is the
+A queued build goes to the worker with an idle agent that serves it,
+admits it for its memory, and where it would finish first: its
+seconds on a worker of factor 1 from its own runs (`History::own_secs`:
+its sources' or its key's runs, not a prefix's or class's guess, also
+where a key whose runs all failed is expected at its key's level)
+over the worker's factor (Worker speed), times one plus the worker's
+fullness with it; or the least full where those seconds, or the factor
+of any worker compared (one with an idle agent), are unknown: a worker
+never compared has no measured factor (`History::measured_speed`), not
+1 (`hub/placement/rank.rs`). A short build, under 10 s on a worker of
+factor 1 (`SHORT`), goes instead to the least full of the slowest
+workers compared, those within 1.1x of the slowest factor among them
+(`TIER`), where it fits their cores and memory (fullness at most 1),
+keeping the faster ones' agents for longer builds. Its log line says
+why a build was left to another worker: an idle agent, a fit, a slower
+tier, an earlier finish, or less full. Memory admission still only delays or
+redirects a build; seconds only order the workers that admit it.
+Fullness, by what it and the builds already there are expected to use
+against what the worker has, is the
 larger of the expected cores of the worker's unsettled builds, this one
 counted, over its cores, and their expected memory over the memory its
 builds may use. Each worker reports both when it registers
@@ -864,12 +879,12 @@ Taught from every run, contention reads as speed: on the replay below
 the compared workers' factors spread from 0.37 to 2.43, against 0.90 to
 1.18 taught from quiet runs (the replay of the 2026-11-20 snapshot,
 before `SHORTEST`). The rule assumes a decider that adds a
-worker's load to its speed, which none does yet: until one does,
-factors taught from every run predict running times better (1.79 % per
-run on the replay below), as those times include the load the dispatch
-did not see. The rule stays for what the factors are to be, a worker's
-speed; whether it still costs prediction once a decider reads load is
-an open question (Known limitations).
+worker's load to its speed, as the take now does by fullness (Placement):
+before it did, factors taught from every run predicted running times
+better (1.79 % per run on the replay below), as those times include
+the load the dispatch did not see. The rule stays for what the factors
+are to be, a worker's speed; whether it still costs prediction with
+the take's fullness is an open question (Known limitations).
 
 Two runs are compared only if their mean length, in ln, reaches 1 s
 (`SHORTEST`). A build that short takes a worker's fixed cost per build
@@ -878,8 +893,9 @@ longer builds. On the hub's record to 2026-11-27T08:29Z, of the same
 sources run quiet on two workers since 11-20, cloud worker C1 took 0.67x
 local worker L1's time below 0.1 s (13,713 sources, faster on 98.6 % of
 them), 0.80x from 0.1 to 1 s, 1.01x from 1 to 10 s, 1.12x from 10 to
-100 s and 1.39x from 100 s (22 sources); against local worker L2, 1.10x
-below 0.1 s and 1.70x from 100 s. The ratio still depends on length
+100 s and 1.39x from 100 s (22 sources); against local worker L2, the
+cloud workers C1-C3 took 1.08x-1.10x below 0.1 s, 1.23x-1.44x from 0.1
+to 10 s and 1.41x-1.70x from 100 s. The ratio still depends on length
 above the cut: the model's premise, one ratio per pair of workers,
 does not hold across lengths, and `SHORTEST` is a cut chosen by
 measurement, not a model of length. 92.6 % of the quiet x86 runs since
@@ -1028,13 +1044,61 @@ same history.
   factors with another key's runs, the read still fresh, and its
   seconds on a worker change to what the history says.
 
-No decider of a worker reads them yet: the dispatch log line adds the
+The take reads them (Placement): a build's `own_secs`, once, over each
+worker's measured factor, times one plus that worker's fullness. The
+dispatch log line adds the
 worker's `speed` and `expect_secs_on`, and "build record folded" lists
-every worker's factor and comparisons, for the placement solver to
-come. The queue's order reads them already, through a path's seconds
-at factor 1 (`unit_secs`, downstream.rs, objective.rs `path`).
-Contention is not in these figures: they are a quiet worker's, and a
-decider that counts a worker's queue or load adds it.
+every worker's factor and comparisons. The queue's order reads them
+too, through a path's seconds at factor 1 (`unit_secs`, downstream.rs,
+objective.rs `path`). Contention is not in these figures: they are a
+quiet worker's, and the take adds it as fullness.
+
+A build's own runs on each worker, its sources' median there, were
+tried in place of its seconds over the factor: they hold a program's
+ratio between workers where the pooled factors compress it (from 100 s
+the same sources ran 1.31x as long on a cloud worker as on local worker
+L1 from 2026-11-24 on, against factors 1.2x apart at the record's end).
+On the one-step replay below, under a first `TIER` that ignored fit,
+they chose worse than the factors (458.4 s on average against 440.0 s,
+the true times' 440.0 s); with `TIER` as it is, the factors chose
+within 1 s of the true times (517.1 s against 516.3 s). They are not
+used.
+
+On a one-step replay of the hub's journal from 2026-11-27 00:26Z to
+08:29Z (75 observations of 300 s or more, each placed alone, by the
+rule replayed, on the workers' real state at its dispatch, its time on
+each worker from the same sources run quiet, by length; a short build
+counts on the worker the rule gives it at its own dispatch, on that
+state), today's least full rule, replayed, ran them 614.0 s on average,
+21 over 600 s, 6 on the local workers L1 and L2; for 65 of those on a
+cloud worker both local workers' agents were held, with a short build
+among them. This rule: 517.1 s, 17 over 600 s, 47 on L1 or L2; by the
+true times, 516.3 s and 17. The score counts each observation alone:
+the contention among the 41 more on L1 or L2, and their agents' wait,
+is not in it. Least full with `TIER`: 555.1 s, 17. Finish without
+`TIER` (an earlier version): 601.3 s, 21. Of 325,308 builds under 10 s
+by their own runs, 47,665 ran on L1 or L2 as recorded, 17,322 by
+`TIER`; placements onto a worker committed past its cores fell from
+86,032 to 73,424. Seconds from a prefix's or class's guess, as a first
+version read them, classed 64 more builds short and changed no long
+observation's placement here; a build the hub has not seen is guessed
+by its class, whose median is a short build's on this farm. Cuts of
+1, 10, 60 and 300 s gave 536.2, 517.1, 510.8 and 500.8 s, 19, 17, 17
+and 17 over 600 s (of a version that read guesses); above 10 s the
+builds moved run longer on a cloud worker (Worker speed), a cost this
+replay does not count, so the cut is 10 s. The finish's weight, its
+seconds times one plus fullness, against times the larger of 1 and
+fullness: 517.1 s against 517.8 s, 17 over 600 s both; not chosen by
+measurement (Known limitations). The replay does not replay the
+queue, so waiting is not in it. An event replay of the whole queue
+(each build released at its recorded queueing, by the queue's order)
+did not reproduce the recorded placement (its least full waited 20.7 h
+against 235.5 h recorded, and put 18 long observations on L1 or L2
+against 6), so its figures are not counted. In one version of it,
+today's rule ran the observations 590.2 s on average, 17 over 600 s,
+waiting 20.7 h in all; this rule 552.9 s, 20 over 600 s, 21.1 h: the
+mean agrees with the one-step replay, the count over 600 s (3 of 75)
+does not.
 
 Both are folded from the record. A result row's run is on the worker it
 names, and teaches as its `taught` row says: the hub commits that row
@@ -1332,10 +1396,32 @@ deadline), DT16 (DD10's fresh), DT17 and DT20 (DD8a), DT19 (R1).
   speed). An open question for a later change: test the load over the
   run's whole lifetime, as the result arrives.
 * Speed's quiet rule assumes a decider that adds a worker's load to its
-  factor; until one does, factors taught from every run predict running
-  times better on the replay (Worker speed). An open question for when a
-  decider reads load: rerun that comparison with the decider's
-  prediction, load included, and keep the rule only if it still wins.
+  factor; before the take did (by fullness, Placement), factors taught
+  from every run predicted running times better on the replay (Worker
+  speed). Open: rerun that comparison with the take's prediction, its
+  seconds times one plus fullness, and keep the rule only if it still
+  wins.
+* The take's finish and `TIER` gain is shown by a one-step replay only,
+  without waiting or contention among the builds it moves; the event
+  replay that would show them does not reproduce the recorded
+  placement, and its count over 600 s disagrees (Placement).
+* While any worker compared for a build (one with an idle agent that
+  serves and admits it) has never been compared for speed, finish and
+  the short rule are off for that build: it goes to the least full. On
+  2026-11-27 the five workers serving x86 builds (the hub's record from
+  15:13Z back six hours; its farm file names five x86 machines) each
+  had a measured factor in a fold of the record to 08:29Z, so the rule
+  acts on today's farm. The seven x86 workers never compared there each
+  had hundreds to about 12,000 succeeded runs of 1 s or more, but none
+  quiet: they all stopped (the last on 2026-11-07 at 05:07:36Z) before
+  dispatches recorded load (the first quiet run, 05:40:52Z; Worker
+  speed). Since then every x86 worker that served has been compared.
+  A new worker gets a factor once one of its quiet runs and another
+  worker's of the same key average 1 s or more; until then each build
+  it could take is placed by fullness alone.
+* The finish's weight, seconds times one plus fullness, is not chosen
+  by measurement: times the larger of 1 and fullness placed alike on
+  the one-step replay (Placement).
 * Workers run up to `max-jobs` concurrent builds over one session.
 * The hub's tmp-dir tar and the worker's unpack walk their trees
   through directory fds with O_NOFOLLOW, but output packing (our NAR

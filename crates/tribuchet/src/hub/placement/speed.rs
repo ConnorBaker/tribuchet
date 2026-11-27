@@ -258,6 +258,13 @@ impl Speed {
         self.of(self.index.get(name).copied())
     }
 
+    /// Worker `name`'s factor where it took part in a comparison, else None.
+    pub(in crate::hub) fn measured(&self, name: &str) -> Option<f64> {
+        let w = *self.index.get(name)?;
+        let compared = self.compared.get(usize::from(w)).is_some_and(|&n| n > 0);
+        compared.then(|| self.of(Some(w)))
+    }
+
     /// Each worker's name, factor and comparisons' decayed weight, by name.
     pub(in crate::hub) fn factors(&self) -> Vec<(String, f64, f64)> {
         let mut n = vec![0.0; self.names.len()];
