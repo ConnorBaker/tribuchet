@@ -705,9 +705,13 @@ b's urgency is `wait(b) + path(b)`:
   revise a path, which is learned again at the next run of each
   dependant on it. A link is off a fresh read by as much as its
   workers' factors moved since it was learned, and no bound on that is
-  claimed: the compared workers' factors end the replay below within
-  0.90 to 1.18 of the typical worker's, an end state, not how far they
-  move over time. It is taken with the expectation, as b is first
+  claimed: the compared workers' factors end the replay of the record
+  to 2026-11-27 within 0.89 to 1.28 of the typical worker's (0.77 to
+  1.44 before `SHORTEST`), an end state, not how far they move over
+  time. So the factors already order the queue: at that end, before and
+  after `SHORTEST`, a link run on local worker L1 reads 1.40x as long (0.77 to
+  1.08), on local worker L2 0.89x, on a cloud worker 0.93x. What that does
+  to the queue's order is not measured. It is taken with the expectation, as b is first
   queued.
 - `wait(b)`: seconds since it last entered the queue; a requeued build
   enters it again and its wait starts over.
@@ -852,13 +856,54 @@ result arrives as if the run had started after it. On the record, 51
 of the 611 results of resumed dispatches would otherwise have taught.
 Taught from every run, contention reads as speed: on the replay below
 the compared workers' factors spread from 0.37 to 2.43, against 0.90 to
-1.18 taught from quiet runs. The rule assumes a decider that adds a
+1.18 taught from quiet runs (the replay of the 2026-11-20 snapshot,
+before `SHORTEST`). The rule assumes a decider that adds a
 worker's load to its speed, which none does yet: until one does,
 factors taught from every run predict running times better (1.79 % per
 run on the replay below), as those times include the load the dispatch
 did not see. The rule stays for what the factors are to be, a worker's
 speed; whether it still costs prediction once a decider reads load is
 an open question (Known limitations).
+
+Two runs are compared only if their mean length, in ln, reaches 1 s
+(`SHORTEST`). A build that short takes a worker's fixed cost per build
+more than its own work, and the workers' ratio there is not theirs on
+longer builds. On the hub's record to 2026-11-27T08:29Z, of the same
+sources run quiet on two workers since 11-20, cloud worker C1 took 0.67x
+local worker L1's time below 0.1 s (13,713 sources, faster on 98.6 % of
+them), 0.80x from 0.1 to 1 s, 1.01x from 1 to 10 s, 1.12x from 10 to
+100 s and 1.39x from 100 s (22 sources); against local worker L2, 1.10x
+below 0.1 s and 1.70x from 100 s. The ratio still depends on length
+above the cut: the model's premise, one ratio per pair of workers,
+does not hold across lengths, and `SHORTEST` is a cut chosen by
+measurement, not a model of length. 92.6 % of the quiet x86 runs since
+11-20 are under 1 s (1.3 % of their hours), and 96.5 % of the replay's
+comparisons are of runs whose shorter one is: taught from every
+length the factors were theirs. The cut is on the pair's mean, a
+length both runs share, so that which run was noisily short selects
+neither; cut by each run's own length, a worker's runs near the cut
+are kept only when slow, and the ratios pull toward 1
+(`the_cut_selects_no_run_by_its_noise`). On the record, by a mirror of
+this file in Python that reproduces the replay's factors to three
+places, cloud worker C1 over local worker L1 at the record's end reads 1.19x
+cut on the mean at 1 s, 1.09x cut on each run's own length; on the
+mean, cuts of 1, 3, 10 and 30 s read 1.18x to 1.19x (local worker L2
+over local worker L1 0.82x to 0.84x), and 0.3 s 1.27x and 0.93x.
+
+On the replay of that record (below), at its end: before the cut,
+local worker L1 0.77, the cloud workers 0.96 to 0.97, local worker L2 1.44, and
+a blob-deps observation of 541 s at factor 1 expected in 561 s on
+cloud worker C1 and 705 s on local worker L1, which ran it in 637 s and 376 s;
+with it, local worker L1 1.08, the cloud workers 0.89 to 0.90, local worker L2
+1.28, and the observation 548 s on cloud worker C1, 459 s on local worker L1
+and 385 s on local worker L2: the order of the measured runs, the spread
+still short of theirs (1.19x against 1.69x). The hub's logged
+factors at a dispatch are those of the record to then (replayed to
+2026-11-27T06:33:11Z, local worker L1 0.8720 before the cut, as logged), not
+these end-of-record ones. Per run the error rises (speed's cut over
+no speed goes from 1.89 % to -2.02 %; quiet runs 9.05 % to -7.53 %), as
+a short build is now expected at the longer ones' ratio; hour-weighted
+it falls (-0.32 % to 0.62 %; quiet -0.73 % to 1.09 %).
 
 Each run that teaches is compared with each other worker's latest such
 run of its key that came since this worker's previous run of it (ln t_a
@@ -893,8 +938,11 @@ each chosen by a replay of the record (below):
 
 - A comparison is clamped to within 0.5 in ln of the fit when it is made
   (`BOUND`). One comparison's deviation from the fit has a standard
-  deviation of 2.0 but a median of 0.17: runs timed at a millisecond,
-  and keys that pool unlike inputs. The clamp is not a Huber
+  deviation of 2.0 but a median of 0.17 on the 2026-11-20 snapshot,
+  before `SHORTEST`; of the comparisons of runs from 1 s on the record
+  to 2026-11-27, with it, 0.72 and 0.12: keys that pool unlike inputs
+  (`an_outlying_run_counts_as_a_bounded_deviation`, runs of 2 s, fails
+  with no clamp). The clamp is not a Huber
   M-estimate: a comparison is not revisited as the fit moves, so the
   factors depend on the order runs arrive in, which the fold keeps.
 - Each pair of workers' comparisons decay with a window of 1,000
@@ -924,8 +972,9 @@ each chosen by a replay of the record (below):
 
 A prior pulls each ln s toward 0 with the weight of 1.17 comparisons
 (`PRIOR`): one comparison's variance over the prior's, a prior of 0.25
-covering the compared workers' ln factors (0.90 to 1.18x: all within
-0.17 of 0).
+covering the compared workers' ln factors (0.90 to 1.18x on the
+2026-11-20 snapshot, all within 0.17 of 0; 0.89 to 1.28x with
+`SHORTEST` on the record to 2026-11-27, within 0.25).
 Clamped at `BOUND`, one comparison deviates from the fit with a standard
 deviation of 0.281 on the replay below; 1.17 is (0.27 / 0.25)^2 =
 1.1664, rounded, from 0.27, an earlier fit's deviation truncated; 1.22
@@ -973,9 +1022,11 @@ same history.
   factors with another key's runs, the read still fresh, and its
   seconds on a worker change to what the history says.
 
-No decider reads them yet: the dispatch log line adds the worker's
-`speed` and `expect_secs_on`, and "build record folded" lists every
-worker's factor and comparisons, for the placement solver to come.
+No decider of a worker reads them yet: the dispatch log line adds the
+worker's `speed` and `expect_secs_on`, and "build record folded" lists
+every worker's factor and comparisons, for the placement solver to
+come. The queue's order reads them already, through a path's seconds
+at factor 1 (`unit_secs`, downstream.rs, objective.rs `path`).
 Contention is not in these figures: they are a quiet worker's, and a
 decider that counts a worker's queue or load adds it.
 
@@ -1007,8 +1058,10 @@ which turns each into a `LazyLock` of `SPEED_PRIOR`, `SPEED_WINDOW` or
 `SPEED_BOUND`; at the committed values it replays the same, figure for
 figure. Some ran on the record before its migration,
 folded by a join to the dispatches: the eleven rerun on the migrated
-record replayed the same. From 2026-10-28 to 2026-11-20 less 2026-11-17
-to 19 (a KVM queueing anomaly), 1,328,851 succeeded runs:
+record replayed the same. The list below predates `SHORTEST`, whose
+comparisons included runs under 1 s, and its figures are stale under
+it; those after it are reruns with it. From 2026-10-28 to 2026-11-20
+less 2026-11-17 to 19 (a KVM queueing anomaly), 1,328,851 succeeded runs:
 
 - Mean |ln error| per run falls 3.91 % (3.74 % on the whole record);
   runs within 2x of their prediction are 88.16 % against 88.12 %.
@@ -1046,6 +1099,20 @@ to 19 (a KVM queueing anomaly), 1,328,851 succeeded runs:
   cost in prediction while no decider adds load. (With this round's
   window the comparison turned: with pairs decayed only when compared,
   at 300, the quiet rule's predicted quiet runs 3.47 % better.)
+
+With `SHORTEST`, on the record to 2026-11-27T08:29Z (7,519,880 runs):
+
+- With cloud workers C2's and C3's times divided by 1.5 and 2,
+  the fitted ratios to cloud worker C1 are 1.480 and 1.992, against 1.483
+  and 1.993 expected from their factors on the record.
+- local worker L1's times halved from 2026-11-23T00:00Z: relative to the
+  workers that did not change, it reads 1.05x at 6 h, 1.20x at 24 h and
+  1.56x at 48 h, first 1.8x at 73.5 h, and 1.94x at the record's end
+  (104.5 h). Without `SHORTEST` the same reads 1.09, 1.71 and 2.22x,
+  first 1.8x at 32.8 h. `WINDOW` counts comparisons, and 96.5 % of them
+  are gone: it now spans more of the record, and a changed worker is
+  relearned more slowly. `WINDOW` was not chosen again; the windows
+  above are stale.
 
 ## CPU arbitration
 

@@ -27,10 +27,10 @@
 //!
 //! Two departures from plain least squares, each chosen by a replay of
 //! the record (DESIGN.md, Worker speed). A comparison is clamped to
-//! within BOUND of the fit when it is made, so that a run timed at 1 ms
-//! or a key pooling unlike inputs moves the fit by a bounded step (the
-//! deviations' tails are heavy: a standard deviation of 2.0 in ln, a
-//! median of 0.17). Unlike a Huber M-estimate, a comparison is not
+//! within BOUND of the fit when it is made, so that a key pooling unlike
+//! inputs moves the fit by a bounded step (the deviations' tails are
+//! heavy: of runs from SHORTEST, a standard deviation of 0.73 in ln, a
+//! median of 0.13). Unlike a Huber M-estimate, a comparison is not
 //! revisited as the fit moves: the result depends on the runs' order,
 //! which the fold keeps. And each pair's comparisons decay with a window
 //! of WINDOW, counted in comparisons of either of its workers, so that a
@@ -43,10 +43,13 @@
 //! as many taught runs as there are workers, so its cost per run grows
 //! with the square of the workers, not their cube.
 //!
-//! A run teaches speed only if its dispatch was quiet (`Teaching`): it
-//! succeeded with running time, and its dispatch was quiet and not
-//! resumed, by the hub or by the worker's answer. The hub records the
-//! decision beside the result (record::TAUGHT). Quiet is tested once, when the build is dispatched, on what
+//! Two runs are compared only if their mean length reaches SHORTEST: a
+//! shorter build takes the worker's fixed cost per build, whose ratios
+//! are not the workers' on longer ones. A run teaches speed only if it
+//! succeeded with running time, and its dispatch was quiet (`Teaching`)
+//! and not resumed, by the hub or by the worker's answer. The hub records
+//! the decision beside the result (record::TAUGHT). Quiet is tested once,
+//! when the build is dispatched, on what
 //! the hub knows then: the expected cores of the builds committed to the
 //! worker, not what they used. Builds dispatched to the worker later,
 //! while the run goes on, are not seen, so a busy worker's runs teach
@@ -65,12 +68,21 @@ use std::sync::OnceLock;
 /// expected cores, not what they use: the threshold is applied to those.
 pub(in crate::hub) const QUIET: f64 = 0.25;
 
+/// The seconds two runs' geometric mean must reach to be compared: a
+/// build that short takes the worker's fixed cost per build more than its
+/// work, whose ratios are not the workers' on longer builds (the same
+/// sources ran on a cloud worker in 0.67x local worker L1's time below 0.1 s,
+/// 0.80x to 1 s, 1.01x to 10 s, 1.39x from 100 s: DESIGN.md). A cut by
+/// measurement, not a model of length; of the runs' mean, so as to select
+/// neither run by its noise.
+pub(in crate::hub) const SHORTEST: f64 = 1.0;
+
 /// The weight of the prior, in comparisons: one comparison's variance
 /// over the prior's, a prior of 0.25 covering the compared workers' ln
 /// factors. Clamped at BOUND, one deviates from the fit with a standard
-/// deviation of 0.281 in ln on the replay (DESIGN.md); 1.17 is
-/// (0.27 / 0.25)^2 = 1.1664, rounded, from an earlier fit's 0.27,
-/// truncated. 1.22 and 1.32 replay alike.
+/// deviation of 0.281 in ln on a replay before SHORTEST, 0.261 of runs
+/// from it (DESIGN.md); 1.17 is (0.27 / 0.25)^2 = 1.1664, rounded, from
+/// an earlier fit's 0.27, truncated. 1.22 and 1.32 replayed alike.
 const PRIOR: f64 = 1.17;
 
 /// How far from the fit a comparison counts, in ln: one beyond is
@@ -156,7 +168,8 @@ impl Speed {
     /// that came since w's previous one, so that each pair of runs is
     /// compared once, each comparison clamped to within BOUND of the fit.
     /// The fit is renewed once per as many runs as there are workers, so
-    /// that solving it costs O(workers^2) a run.
+    /// that solving it costs O(workers^2) a run. Two runs whose mean
+    /// length is below SHORTEST are not compared (SHORTEST).
     pub(super) fn learn(&mut self, key: &str, w: u16, secs: f64) {
         let t = secs.ln();
         // The fit as of before this run, as the hub may read it between.
@@ -176,7 +189,10 @@ impl Speed {
             Some(l) => (l.1, l.2) = (t, count),
             None => latest.push((w, t, count)),
         }
-        for (v, tv) in others {
+        for (v, tv) in others
+            .into_iter()
+            .filter(|o| (t + o.1) / 2.0 >= SHORTEST.ln())
+        {
             let (pair, diff) = if w < v {
                 ((w, v), t - tv)
             } else {

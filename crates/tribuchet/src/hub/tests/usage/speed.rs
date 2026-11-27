@@ -140,7 +140,9 @@ fn a_redelivered_result_teaches_nothing() {
         let (session, worker, ms) = [(1, "wa", 2), (2, "wb", 1)][n % 2];
         let (mut j, mut usage) = run_of("tt-redelivered-1.0", 1);
         j.id = format!("{n:032x}");
-        usage.wall_ms = ms;
+        // Reported in seconds, as a run shorter than SHORTEST teaches no
+        // speed; the sleeps keep the record's order in milliseconds.
+        usage.wall_ms = ms * 2000;
         j.placed = placement::dispatch(&state, (session, worker), &j, false, &admission);
         thread::sleep(Duration::from_millis(ms + 1));
         learn(&j, worker, &usage);
@@ -150,7 +152,7 @@ fn a_redelivered_result_teaches_nothing() {
             // failed (6 s apart at least on the farm's record).
             thread::sleep(Duration::from_millis(3));
             j.placed = placement::dispatch(&state, (session, worker), &j, true, &admission);
-            usage.wall_ms = 4;
+            usage.wall_ms = 4 * 2000;
             thread::sleep(Duration::from_millis(5));
             learn(&j, worker, &usage);
             state.placement.lock().unwrap().settled(session, &j.id);
@@ -163,8 +165,9 @@ fn a_redelivered_result_teaches_nothing() {
     let folded = restarted.placement.lock().unwrap().history.entries();
     assert_eq!(folded, learned);
     let (a, b) = (speed_of(&learned, "wa"), speed_of(&learned, "wb"));
-    // 2x, short of it by the prior: the redelivered results, at 4x, none.
-    assert!(b / a > 1.5 && b / a < 2.0, "wb {}x wa", b / a);
+    // 2x, short of it by the prior: the redelivered results, at 4x, none
+    // (taught, they read about 1.68x).
+    assert!(b / a > 1.9 && b / a < 2.0, "wb {}x wa", b / a);
 }
 
 /// A result learned after its worker's session closed and another
@@ -221,9 +224,11 @@ async fn wired(resumed: bool) -> [HashMap<String, (Vec<placement::Entry>, u32)>;
             w.send(worker_message::Msg::Resumed(resumed)).await;
         }
         tokio::time::sleep(Duration::from_millis(ms + 1)).await;
+        // Reported in seconds, as a run shorter than SHORTEST teaches no
+        // speed; the sleep keeps the record's order in milliseconds.
         let usage = BuildUsage {
-            wall_ms: ms,
-            cpu_usec: ms * 1000,
+            wall_ms: ms * 1000,
+            cpu_usec: ms * 1_000_000,
             peak_memory_bytes: 1 << 30,
             ..BuildUsage::default()
         };
@@ -307,7 +312,8 @@ fn an_undispatched_result_teaches_nothing() {
     let state = HubState::for_test(Duration::from_secs(30));
     let writer = open_record(&state, &path);
     for n in 0..40 {
-        let (worker, ms) = [("wa", 2_000), ("wb", 1_000)][n % 2];
+        // Seconds well above SHORTEST: undispatched, not short, teaches nothing.
+        let (worker, ms) = [("wa", 8_000), ("wb", 4_000)][n % 2];
         let (mut j, mut usage) = run_of("tt-undispatched-1.0", 1);
         j.id = format!("{n:032x}");
         usage.wall_ms = ms;
