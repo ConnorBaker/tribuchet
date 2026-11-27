@@ -1,5 +1,5 @@
-//! Taking a queued job: a fresh take, which a less full worker may be
-//! left, and a resume of a build a worker holds from before.
+//! Taking a queued job: a fresh take, which a better room (rank.rs) may
+//! be left, and a resume of a build a worker holds from before.
 
 use std::collections::HashSet;
 use std::time::Instant;
@@ -94,7 +94,7 @@ impl HubState {
 
     /// The first queued job, in the queue's order (placement/objective.rs),
     /// `caps`'s worker can take, as worker session
-    /// `asker`, if any: a build it passes over to a less full worker
+    /// `asker`, if any: a build it passes over to a better room
     /// (placement::Rooms) stays queued, the session it is left to woken.
     pub(in crate::hub) async fn take_job(
         &self,
@@ -150,13 +150,19 @@ impl HubState {
                         return false;
                     }
                     let demand = j.expected.demand;
+                    // Its seconds at factor 1 from its own runs, and each
+                    // room's worker's measured factor (rank.rs).
+                    let own = placement.own_secs(j);
+                    let speed =
+                        |id| (workers.get(&id)).and_then(|c| placement.measured_speed(&c.name));
                     let to = (rooms.as_mut())
-                        .and_then(|r| r.passes(demand, &mut j.deferred, serves, now));
+                        .and_then(|r| r.passes(demand, &mut j.deferred, serves, speed, own, now));
+                    let why = rooms.as_ref().map_or("", |r| r.why);
                     for s in rooms.iter_mut().flat_map(|r| r.wants.drain(..)) {
                         wanted.push((s, j.id.clone(), j.replay.clone()));
                     }
                     if let Some(to) = to.filter(|_| first) {
-                        left.push((j.id.clone(), workers.get(&to).map(|c| c.name.clone())));
+                        left.push((j.id.clone(), workers.get(&to).map(|c| c.name.clone()), why));
                     }
                     to.is_none()
                 });
@@ -176,12 +182,8 @@ impl HubState {
                     s.wants.insert(id, replay);
                 }
             }
-            for (id, to) in &left {
-                tracing::info!(
-                    id,
-                    to,
-                    "leaving a build to a less full worker with an idle agent"
-                );
+            for (id, to, why) in &left {
+                tracing::info!(id, to, why, "leaving a build to a better room");
             }
             if !left.is_empty() {
                 self.notify.notify_waiters();

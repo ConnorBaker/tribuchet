@@ -3,7 +3,7 @@
 //! are expected to use; what builds used, learned from their runs
 //! (history.rs), the fold of the build record (record.rs); and the
 //! dispatch's log line and record row. A queued build goes to the worker that asks for it unless
-//! another with an idle agent would be less full with it (rank.rs).
+//! another with an idle agent ranks better for it (rank.rs).
 
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -256,10 +256,21 @@ impl Placement {
     /// `job`'s expected running seconds on worker `worker` (by name),
     /// read from the history now (History::secs_on), not from the
     /// expectation the job keeps: a refit since that was read counts. For
-    /// a decider weighing finish times; none reads it yet, but the
-    /// dispatch log line.
+    /// the dispatch log line.
     pub(super) fn secs_on(&self, job: &Job, worker: &str) -> Option<f64> {
         self.history.secs_on(&build_of(job), worker)
+    }
+
+    /// `job`'s seconds on a worker of factor 1 from its own runs, read
+    /// now (History::own_secs): the take's, for finish and short (rank.rs).
+    pub(super) fn own_secs(&self, job: &Job) -> Option<f64> {
+        self.history.own_secs(&build_of(job))
+    }
+
+    /// Worker `worker`'s speed factor, None if never compared
+    /// (History::measured_speed).
+    pub(super) fn measured_speed(&self, worker: &str) -> Option<f64> {
+        self.history.measured_speed(worker)
     }
 
     /// Learn from a finished run of `job`, and append it to the record,

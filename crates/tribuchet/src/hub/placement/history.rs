@@ -59,7 +59,7 @@
 
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::iter;
+use std::{iter, ptr};
 
 use super::speed::Speed;
 use crate::proto::BuildUsage;
@@ -272,6 +272,21 @@ impl History {
         self.expect_from(b).1?.unit_secs(&self.speed)
     }
 
+    /// `b`'s unit_secs where its expectation's runs are its own, its
+    /// sources' or its key's; None where they are a prefix's or class's,
+    /// whatever the level says (a key whose runs all failed is at its
+    /// key's level with another's seconds), or none (the take's, rank.rs).
+    pub(in crate::hub) fn own_secs(&self, b: &Build) -> Option<f64> {
+        let runs = self.expect_from(b).1?;
+        let sources = Self::sources_of(b).and_then(|s| self.sources.get(&s));
+        let key = Self::key_of(b).and_then(|k| self.keys.get(&k));
+        [sources, key]
+            .into_iter()
+            .flatten()
+            .any(|r| ptr::eq(r, runs))
+            .then(|| runs.unit_secs(&self.speed))?
+    }
+
     /// `b`'s expectation (expect), and the runs its seconds came from.
     #[allow(clippy::cast_precision_loss)]
     fn expect_from<'a>(&'a self, b: &Build) -> (Expected, Option<&'a Runs>) {
@@ -367,6 +382,12 @@ impl History {
     /// Read by the dispatch log line only, so far.
     pub(in crate::hub) fn speed(&self, name: &str) -> f64 {
         self.speed.factor(name)
+    }
+
+    /// Worker `name`'s speed factor where it was compared, else None: a
+    /// never-compared worker's 1 is no measurement (the take's, rank.rs).
+    pub(in crate::hub) fn measured_speed(&self, name: &str) -> Option<f64> {
+        self.speed.measured(name)
     }
 
     /// Every worker's name, speed factor and comparisons' decayed weight.

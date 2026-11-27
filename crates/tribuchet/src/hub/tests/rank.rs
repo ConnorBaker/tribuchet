@@ -13,8 +13,10 @@ use placement::{Demand, Expected, GRACE, Level, Placed, Room, Rooms, Size};
 
 mod charges;
 mod clientless;
+mod finish;
 mod memory;
 mod reserve;
+mod short;
 
 const GIB: f64 = 1_073_741_824.0;
 
@@ -173,7 +175,14 @@ fn a_size_is_the_registered_cores_and_memory() {
     };
     let rooms = [(1, size(Some(4), 2, None)), (2, size(None, 0, None))].map(room);
     let mut rooms = Rooms::new(1, rooms.to_vec());
-    let got = rooms.passes(Demand::default(), &mut None, |_| true, Instant::now());
+    let got = rooms.passes(
+        Demand::default(),
+        &mut None,
+        |_| true,
+        |_| None,
+        None,
+        Instant::now(),
+    );
     assert_eq!(got, None, "an idle build passed to the worker of no cores");
 }
 
@@ -439,7 +448,7 @@ fn a_build_is_passed_over_within_grace_to_the_least_full_room() {
         let mut rooms = Rooms::new(1, [vec![mine], others].concat());
         for (n, want) in passes.into_iter().enumerate() {
             let mut since = first;
-            let got = rooms.passes(build, &mut since, |_| true, t0 + at);
+            let got = rooms.passes(build, &mut since, |_| true, |_| None, None, t0 + at);
             assert_eq!(got, want, "{row}, pass {n}");
             let kept = first.or(got.map(|_| t0 + at));
             assert_eq!(since, kept, "{row}, pass {n}: when first passed over");
@@ -496,7 +505,7 @@ fn fullness_weighs_size_and_memory_where_every_room_reported_it() {
     ];
     for (row, mine, other, want) in rows {
         let mut rooms = Rooms::new(1, vec![mine, other]);
-        let got = rooms.passes(build, &mut None, |_| true, Instant::now());
+        let got = rooms.passes(build, &mut None, |_| true, |_| None, None, Instant::now());
         assert_eq!(got, want, "{row}");
     }
 }
