@@ -5,6 +5,9 @@ use super::super::history::{Build, History, On};
 use super::*;
 use crate::proto::BuildUsage;
 
+#[path = "tests/length.rs"]
+mod length;
+
 fn build(name: &str) -> Build<'_> {
     Build {
         system: "x86_64-linux",
@@ -131,7 +134,7 @@ fn each_key_is_compared_with_itself() {
     alternate(
         &mut h,
         "short-1",
-        1.0,
+        2.0,
         ("a", 1.0, true),
         ("b", 1.5, true),
         1000,
@@ -381,14 +384,14 @@ fn an_unchanged_worker_reads_steady() {
 }
 
 /// A comparison far from the fit is clamped to BOUND from it: b as fast as
-/// a, one run in 50 of b's taking 1000x (a millisecond build timed at a
-/// second), reads within 3 % of a, not 0.87x.
+/// a, one run in 50 of b's taking 1000x (a key pooling unlike inputs),
+/// reads within 3 % of a, not 0.87x. Runs of 2 s, above SHORTEST.
 #[test]
 fn an_outlying_run_counts_as_a_bounded_deviation() {
     let mut h = History::default();
     for n in 0..2000u32 {
         let slow = if n % 50 == 49 { 1000.0 } else { 1.0 };
-        for (worker, secs) in [("a", 0.01), ("b", 0.01 * slow)] {
+        for (worker, secs) in [("a", 2.0), ("b", 2.0 * slow)] {
             let on = On {
                 worker,
                 taught: true,
